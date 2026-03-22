@@ -1,6 +1,46 @@
 const express = require('express');
+const apn = require('apn');
 const app = express();
 app.use(express.json());
+
+// APNs setup via environment variables
+let apnProvider = null;
+if (process.env.APNS_KEY_BASE64) {
+    const apnKey = Buffer.from(process.env.APNS_KEY_BASE64, 'base64').toString('utf8');
+    apnProvider = new apn.Provider({
+        token: {
+            key: apnKey,
+            keyId: process.env.APNS_KEY_ID,
+            teamId: process.env.APNS_TEAM_ID,
+        },
+        production: process.env.APNS_PRODUCTION === 'true'
+    });
+    console.log('APNs provider initialized');
+} else {
+    console.log('APNs not configured (no APNS_KEY_BASE64 env var)');
+}
+
+async function sendPushNotification(deviceToken, title, body) {
+    if (!apnProvider || !deviceToken) return;
+
+    const notification = new apn.Notification();
+    notification.expiry = Math.floor(Date.now() / 1000) + 3600;
+    notification.badge = 1;
+    notification.sound = 'default';
+    notification.alert = { title, body };
+    notification.topic = process.env.APNS_BUNDLE_ID || 'com.emotionlock.EmotionLock';
+
+    try {
+        const result = await apnProvider.send(notification, deviceToken);
+        if (result.failed.length > 0) {
+            console.log('Push failed:', result.failed[0].response);
+        } else {
+            console.log('Push sent successfully');
+        }
+    } catch (err) {
+        console.error('Push error:', err.message);
+    }
+}
 
 const userStates = {};
 
@@ -39,7 +79,9 @@ function initUser(userId) {
             emergencyUnlocked: false,
             emergencyTokens: DEFAULT_TOKENS,
             lastReset: new Date().toDateString(),
-            lastTokenReset: new Date().toISOString()
+            lastTokenReset: new Date().toISOString(),
+            deviceToken: null,
+            maxTrades: 1
         };
     }
 }
@@ -74,7 +116,19 @@ app.post('/webhook', (req, res) => {
 
     if (action === 'trade_closed') {
         user.tradesCount += 1;
-        console.log(`User ${userId}: trade closed. Total today: ${user.tradesCount}`);
+        const maxTrades = req.body.maxTrades || user.maxTrades || 1;
+        user.maxTrades = maxTrades;
+        console.log(`User ${userId}: trade closed. Total today: ${user.tradesCount}/${maxTrades}`);
+
+        // Send push notification when limit is reached
+        if (user.tradesCount >= maxTrades && !user.emergencyUnlocked) {
+            console.log(`User ${userId}: limit reached, sending push notification`);
+            sendPushNotification(
+                user.deviceToken,
+                '🔒 EmotionLock activated',
+                `You've reached your limit of ${maxTrades} trade${maxTrades > 1 ? 's' : ''} today. Trading apps are now blocked.`
+            );
+        }
     }
 
     res.json({
@@ -84,6 +138,20 @@ app.post('/webhook', (req, res) => {
         emergencyUnlocked: user.emergencyUnlocked,
         emergencyTokens: user.emergencyTokens
     });
+});
+
+// Register device token for push notifications
+app.post('/register-device/:userId', (req, res) => {
+    const { userId } = req.params;
+    const { deviceToken } = req.body;
+
+    if (!deviceToken) return res.status(400).json({ error: 'deviceToken is required' });
+
+    initUser(userId);
+    userStates[userId].deviceToken = deviceToken;
+    console.log(`User ${userId}: device token registered`);
+
+    res.json({ success: true });
 });
 
 // Status endpoint
