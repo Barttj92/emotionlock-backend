@@ -295,10 +295,18 @@ app.post('/activate', (req, res) => {
     if (!code) return res.status(404).json({ error: 'Invalid license code' });
 
     initUser(key);
+    userStates[key].licenseCode = key;
 
     if (!code.activated) {
         code.activated = true;
         code.activatedAt = new Date().toISOString();
+    }
+
+    // Apply any pending tokens that were purchased before activation
+    if (code.pendingTokens && code.pendingTokens > 0) {
+        userStates[key].emergencyTokens = (userStates[key].emergencyTokens || 0) + code.pendingTokens;
+        console.log(`Applied ${code.pendingTokens} pending tokens to newly activated license ${key}`);
+        code.pendingTokens = 0;
     }
 
     console.log(`License activated: ${key}`);
@@ -430,18 +438,48 @@ app.post('/register-device/:userId', (req, res) => {
     res.json({ success: true });
 });
 
-// Admin: generate license code (called by website after purchase)
+// Admin: generate (or register) license code (called by website after purchase)
 app.post('/admin/generate-code', (req, res) => {
     const adminKey = req.headers['x-admin-key'];
     if (!adminKey || adminKey !== process.env.ADMIN_KEY) {
         return res.status(401).json({ error: 'Unauthorized' });
     }
-    const code = 'EL-' +
-        Math.random().toString(36).substring(2, 6).toUpperCase() + '-' +
-        Math.random().toString(36).substring(2, 6).toUpperCase();
+    // Accept a custom code from the website, or generate one
+    let code = req.body && req.body.code;
+    if (!code) {
+        const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+        const rand = (n) => Array.from({ length: n }, () => chars[Math.floor(Math.random() * chars.length)]).join('');
+        code = `EL-${rand(4)}-${rand(4)}`;
+    }
     licenseCodes[code] = { activated: false };
-    console.log(`License code generated: ${code}`);
+    console.log(`License code registered: ${code}`);
     res.json({ success: true, code });
+});
+
+// Admin: add emergency tokens to a license (called by website after token purchase)
+app.post('/admin/add-tokens/:licenseCode', (req, res) => {
+    const adminKey = req.headers['x-admin-key'];
+    if (!adminKey || adminKey !== process.env.ADMIN_KEY) {
+        return res.status(401).json({ error: 'Unauthorized' });
+    }
+    const { licenseCode } = req.params;
+    const tokens = parseInt(req.body && req.body.tokens) || 3;
+
+    // Find the user who has this license code activated
+    const userId = Object.keys(userStates).find(id => userStates[id].licenseCode === licenseCode);
+    if (!userId) {
+        // License exists but no user has activated it yet — store tokens for when they do
+        if (!licenseCodes[licenseCode]) {
+            return res.status(404).json({ error: 'License code not found' });
+        }
+        licenseCodes[licenseCode].pendingTokens = (licenseCodes[licenseCode].pendingTokens || 0) + tokens;
+        console.log(`Stored ${tokens} pending tokens for unactivated license ${licenseCode}`);
+        return res.json({ success: true, pending: true });
+    }
+
+    userStates[userId].emergencyTokens = (userStates[userId].emergencyTokens || 0) + tokens;
+    console.log(`Added ${tokens} emergency tokens to user ${userId} (license ${licenseCode}). Total: ${userStates[userId].emergencyTokens}`);
+    res.json({ success: true, tokens: userStates[userId].emergencyTokens });
 });
 
 const PORT = process.env.PORT || 3000;
