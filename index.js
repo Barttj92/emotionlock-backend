@@ -4,24 +4,47 @@ app.use(express.json());
 
 const userStates = {};
 
-app.post('/webhook', (req, res) => {
-    const { userId, action, isWin } = req.body;
+const DEFAULT_TOKENS = 3;
 
-    if (!userId) {
-        return res.status(400).json({ error: 'userId is required' });
-    }
+// Check of het tijd is voor weekly token reset (zondag 22:00 UTC+1 = 21:00 UTC)
+function shouldResetWeeklyTokens(lastTokenReset) {
+    if (!lastTokenReset) return true;
+    
+    const now = new Date();
+    const last = new Date(lastTokenReset);
+    
+    // Zondag = 0 in JavaScript
+    const nowUTC1Hour = (now.getUTCHours() + 1) % 24;
+    const nowDay = now.getUTCDay();
+    
+    // Is het zondag na 22:00 UTC+1?
+    const isResetTime = nowDay === 0 && nowUTC1Hour >= 22;
+    
+    // Was de laatste reset voor deze zondag 22:00?
+    const lastResetDay = last.getUTCDay();
+    const lastResetHourUTC1 = (last.getUTCHours() + 1) % 24;
+    const wasBeforeReset = lastResetDay !== 0 || lastResetHourUTC1 < 22;
+    
+    // Reset als het reset tijd is EN de laatste reset voor deze reset tijd was
+    const daysDiff = Math.floor((now - last) / (1000 * 60 * 60 * 24));
+    
+    return isResetTime && daysDiff >= 1 && wasBeforeReset || daysDiff >= 7;
+}
 
+function initUser(userId) {
     if (!userStates[userId]) {
         userStates[userId] = {
             tradesCount: 0,
             isLocked: false,
             emergencyUnlocked: false,
-            lastReset: new Date().toDateString()
+            emergencyTokens: DEFAULT_TOKENS,
+            lastReset: new Date().toDateString(),
+            lastTokenReset: new Date().toISOString()
         };
     }
+}
 
-    const user = userStates[userId];
-
+function checkDailyReset(user) {
     const today = new Date().toDateString();
     if (user.lastReset !== today) {
         user.tradesCount = 0;
@@ -29,6 +52,25 @@ app.post('/webhook', (req, res) => {
         user.emergencyUnlocked = false;
         user.lastReset = today;
     }
+}
+
+function checkWeeklyTokenReset(user) {
+    if (shouldResetWeeklyTokens(user.lastTokenReset)) {
+        console.log('Weekly token reset uitgevoerd!');
+        user.emergencyTokens = DEFAULT_TOKENS;
+        user.lastTokenReset = new Date().toISOString();
+    }
+}
+
+// Webhook endpoint
+app.post('/webhook', (req, res) => {
+    const { userId, action, isWin } = req.body;
+    if (!userId) return res.status(400).json({ error: 'userId is required' });
+
+    initUser(userId);
+    const user = userStates[userId];
+    checkDailyReset(user);
+    checkWeeklyTokenReset(user);
 
     if (action === 'trade_closed') {
         user.tradesCount += 1;
@@ -39,65 +81,59 @@ app.post('/webhook', (req, res) => {
         success: true,
         tradesCount: user.tradesCount,
         isLocked: user.isLocked,
-        emergencyUnlocked: user.emergencyUnlocked
+        emergencyUnlocked: user.emergencyUnlocked,
+        emergencyTokens: user.emergencyTokens
     });
 });
 
+// Status endpoint
 app.get('/status/:userId', (req, res) => {
     const { userId } = req.params;
+    
+    initUser(userId);
     const user = userStates[userId];
-
-    if (!user) {
-        return res.json({ tradesCount: 0, isLocked: false, emergencyUnlocked: false });
-    }
-
-    const today = new Date().toDateString();
-    if (user.lastReset !== today) {
-        user.tradesCount = 0;
-        user.isLocked = false;
-        user.emergencyUnlocked = false;
-        user.lastReset = today;
-    }
+    checkDailyReset(user);
+    checkWeeklyTokenReset(user);
 
     res.json({
         tradesCount: user.tradesCount,
         isLocked: user.isLocked,
-        emergencyUnlocked: user.emergencyUnlocked
+        emergencyUnlocked: user.emergencyUnlocked,
+        emergencyTokens: user.emergencyTokens
     });
 });
 
+// Unlock endpoint
 app.post('/unlock/:userId', (req, res) => {
     const { userId } = req.params;
+    
+    initUser(userId);
+    const user = userStates[userId];
+    checkWeeklyTokenReset(user);
 
-    if (!userStates[userId]) {
-        userStates[userId] = {
-            tradesCount: 0,
-            isLocked: false,
-            emergencyUnlocked: true,
-            lastReset: new Date().toDateString()
-        };
-    } else {
-        userStates[userId].isLocked = false;
-        userStates[userId].emergencyUnlocked = true;
+    if (user.emergencyTokens <= 0) {
+        return res.status(400).json({ error: 'Geen tokens meer beschikbaar' });
     }
 
-    console.log(`User ${userId}: UNLOCKED via emergency token`);
-    res.json({ success: true, isLocked: false, emergencyUnlocked: true });
+    user.isLocked = false;
+    user.emergencyUnlocked = true;
+    user.emergencyTokens -= 1;
+
+    console.log(`User ${userId}: UNLOCKED via emergency token. Tokens over: ${user.emergencyTokens}`);
+    res.json({ 
+        success: true, 
+        isLocked: false, 
+        emergencyUnlocked: true,
+        emergencyTokens: user.emergencyTokens
+    });
 });
 
+// Lock endpoint
 app.post('/lock/:userId', (req, res) => {
     const { userId } = req.params;
-
-    if (!userStates[userId]) {
-        userStates[userId] = {
-            tradesCount: 0,
-            isLocked: true,
-            emergencyUnlocked: false,
-            lastReset: new Date().toDateString()
-        };
-    } else {
-        userStates[userId].isLocked = true;
-    }
+    
+    initUser(userId);
+    userStates[userId].isLocked = true;
 
     console.log(`User ${userId}: LOCKED`);
     res.json({ success: true, isLocked: true });
