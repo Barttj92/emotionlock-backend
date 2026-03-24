@@ -1,7 +1,32 @@
 const express = require('express');
 const apn = require('apn');
+const { createClient } = require('@supabase/supabase-js');
 const app = express();
 app.use(express.json());
+
+// =====================
+// Supabase setup
+// =====================
+const supabase = createClient(
+    process.env.SUPABASE_URL || 'https://ixlmaqkhgjgmijlbstia.supabase.co',
+    process.env.SUPABASE_SERVICE_ROLE_KEY
+);
+
+async function getStoredTokens(licenseCode) {
+    const { data } = await supabase
+        .from('purchases')
+        .select('emergency_tokens_remaining')
+        .eq('license_code', licenseCode)
+        .single();
+    return data?.emergency_tokens_remaining ?? null;
+}
+
+async function saveTokens(licenseCode, tokens) {
+    await supabase
+        .from('purchases')
+        .update({ emergency_tokens_remaining: tokens })
+        .eq('license_code', licenseCode);
+}
 
 // =====================
 // APNs setup
@@ -195,6 +220,10 @@ function checkWeeklyTokenReset(user) {
     if (shouldResetWeeklyTokens(user.lastTokenReset)) {
         user.emergencyTokens = DEFAULT_TOKENS;
         user.lastTokenReset = new Date().toISOString();
+        // Persist reset to Supabase (fire and forget)
+        if (user.licenseCode) {
+            saveTokens(user.licenseCode, DEFAULT_TOKENS).catch(() => {});
+        }
     }
 }
 
@@ -292,7 +321,7 @@ app.get('/', (req, res) => {
 });
 
 // Activate license code
-app.post('/activate', (req, res) => {
+app.post('/activate', async (req, res) => {
     const { licenseCode } = req.body;
     if (!licenseCode) return res.status(400).json({ error: 'licenseCode required' });
 
@@ -313,6 +342,16 @@ app.post('/activate', (req, res) => {
         userStates[key].emergencyTokens = (userStates[key].emergencyTokens || 0) + code.pendingTokens;
         console.log(`Applied ${code.pendingTokens} pending tokens to newly activated license ${key}`);
         code.pendingTokens = 0;
+    }
+
+    // Load persistent token count from Supabase (survives server restarts)
+    const storedTokens = await getStoredTokens(key);
+    if (storedTokens !== null) {
+        userStates[key].emergencyTokens = storedTokens;
+        console.log(`Restored ${storedTokens} tokens from Supabase for ${key}`);
+    } else {
+        // First time: save the default to Supabase
+        await saveTokens(key, userStates[key].emergencyTokens);
     }
 
     console.log(`License activated: ${key}`);
@@ -389,12 +428,23 @@ app.delete('/connect-mt5/:userId', async (req, res) => {
 });
 
 // Status endpoint
-app.get('/status/:userId', (req, res) => {
+app.get('/status/:userId', async (req, res) => {
     const { userId } = req.params;
+    const isNewUser = !userStates[userId];
     initUser(userId);
     const user = userStates[userId];
     checkDailyReset(user);
     checkWeeklyTokenReset(user);
+
+    // On server restart, reload persisted token count from Supabase
+    if (isNewUser) {
+        const storedTokens = await getStoredTokens(userId);
+        if (storedTokens !== null) {
+            user.emergencyTokens = storedTokens;
+            console.log(`Server restart: restored ${storedTokens} tokens for ${userId}`);
+        }
+    }
+
     res.json({
         tradesCount: user.tradesCount,
         isLocked: user.isLocked,
@@ -418,7 +468,7 @@ app.post('/settings/:userId', (req, res) => {
 });
 
 // Emergency unlock
-app.post('/unlock/:userId', (req, res) => {
+app.post('/unlock/:userId', async (req, res) => {
     const { userId } = req.params;
     initUser(userId);
     const user = userStates[userId];
@@ -429,6 +479,8 @@ app.post('/unlock/:userId', (req, res) => {
     user.isLocked = false;
     user.emergencyUnlocked = true;
     user.emergencyTokens -= 1;
+    // Persist new token count to Supabase so server restarts don't reset it
+    await saveTokens(userId, user.emergencyTokens);
     console.log(`User ${userId}: emergency unlock. Tokens left: ${user.emergencyTokens}`);
     res.json({ success: true, isLocked: false, emergencyUnlocked: true, emergencyTokens: user.emergencyTokens });
 });
