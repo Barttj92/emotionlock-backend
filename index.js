@@ -153,7 +153,7 @@ function initUser(userId) {
             lastReset: new Date().toDateString(),
             lastTokenReset: new Date().toISOString(),
             maxTrades: 1,
-            countWinningTrades: true,
+            countWinningTrades: false,
             deviceToken: null,
             metaApiAccountId: null,
             mt5Connected: false,
@@ -253,9 +253,15 @@ async function checkUserTrades(userId) {
             console.log(`User ${userId}: trade counted. Profit: ${deal.profit}. Total: ${user.tradesCount}/${user.maxTrades}`);
         }
 
-        if (newTradesDetected && user.tradesCount >= user.maxTrades && !user.isLocked && !user.emergencyUnlocked) {
+        // If a new trade came in after an emergency unlock, reset the emergency so locking can trigger again
+        if (newTradesDetected && user.emergencyUnlocked) {
+            user.emergencyUnlocked = false;
+            console.log(`User ${userId}: new trade after emergency unlock — resetting emergency state`);
+        }
+
+        if (newTradesDetected && user.tradesCount >= user.maxTrades && !user.isLocked) {
             user.isLocked = true;
-            console.log(`User ${userId}: trade limit reached, sending push`);
+            console.log(`User ${userId}: trade limit reached (${user.tradesCount}/${user.maxTrades}), sending push`);
             await sendPushNotification(
                 user.deviceToken,
                 '🔒 EmotionLock activated',
