@@ -461,10 +461,19 @@ app.get('/status/:userId', async (req, res) => {
 app.post('/settings/:userId', (req, res) => {
     const { userId } = req.params;
     const { maxTrades, countWinningTrades } = req.body;
-    if (!userStates[userId]) return res.status(404).json({ error: 'User not found' });
-    if (maxTrades !== undefined) userStates[userId].maxTrades = maxTrades;
-    if (countWinningTrades !== undefined) userStates[userId].countWinningTrades = countWinningTrades;
-    res.json({ success: true });
+    if (!userStates[userId]) {
+        initUser(userId);
+    }
+    const user = userStates[userId];
+    if (maxTrades !== undefined) user.maxTrades = maxTrades;
+    if (countWinningTrades !== undefined) user.countWinningTrades = countWinningTrades;
+
+    // Re-evaluate lock state: if trades >= new maxTrades and not emergency-unlocked → lock
+    if (user.tradesCount >= user.maxTrades && !user.emergencyUnlocked) {
+        user.isLocked = true;
+    }
+
+    res.json({ success: true, maxTrades: user.maxTrades, countWinningTrades: user.countWinningTrades, isLocked: user.isLocked });
 });
 
 // Emergency unlock
