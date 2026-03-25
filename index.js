@@ -505,6 +505,48 @@ app.post('/register-device/:userId', (req, res) => {
     res.json({ success: true });
 });
 
+// IAP: add tokens after Apple in-app purchase (called directly from the iOS app)
+// No admin key needed — userId comes from the app's own session
+app.post('/add-tokens-iap/:userId', async (req, res) => {
+    const userId = req.params.userId;
+    const tokens = parseInt(req.body && req.body.tokens) || 3;
+    const transactionId = req.body && req.body.transactionId;
+
+    if (!userId) return res.status(400).json({ error: 'Missing userId' });
+
+    // Idempotency: don't add tokens twice for same Apple transaction ID
+    if (transactionId) {
+        if (!processedIAPTransactions) global.processedIAPTransactions = new Set();
+        if (global.processedIAPTransactions.has(transactionId)) {
+            return res.json({ success: true, alreadyProcessed: true });
+        }
+        global.processedIAPTransactions.add(transactionId);
+    }
+
+    if (!userStates[userId]) initUser(userId);
+    userStates[userId].emergencyTokens = (userStates[userId].emergencyTokens || 0) + tokens;
+
+    // Persist to Supabase
+    try {
+        const { data: purchase } = await supabase
+            .from('purchases')
+            .select('emergency_tokens_remaining, emergency_tokens_purchased')
+            .eq('user_id', userId)
+            .single();
+        if (purchase) {
+            await supabase.from('purchases').update({
+                emergency_tokens_remaining: (purchase.emergency_tokens_remaining ?? 0) + tokens,
+                emergency_tokens_purchased: (purchase.emergency_tokens_purchased ?? 0) + tokens,
+            }).eq('user_id', userId);
+        }
+    } catch (e) {
+        console.error('IAP token persist error:', e);
+    }
+
+    console.log(`IAP: Added ${tokens} tokens to user ${userId}. Total: ${userStates[userId].emergencyTokens}`);
+    res.json({ success: true, tokens: userStates[userId].emergencyTokens });
+});
+
 // Admin: generate (or register) license code (called by website after purchase)
 app.post('/admin/generate-code', (req, res) => {
     const adminKey = req.headers['x-admin-key'];
