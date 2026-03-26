@@ -595,3 +595,206 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
     console.log(`EmotionLock backend running on port ${PORT}`);
 });
+
+// =====================
+// Scout Agents — scrape Reddit and X for marketing opportunities
+// =====================
+
+const SCOUT_SUBREDDITS = [
+    'Forex',
+    'Daytrading',
+    'algotrading',
+    'Trading',
+    'Futures',
+    'StockMarket',
+];
+
+const SCOUT_KEYWORDS = [
+    'revenge trading',
+    'overtrading',
+    'emotional',
+    'tilt',
+    'broke my rules',
+    'cant stop trading',
+    "can't stop trading",
+    'trading addiction',
+    'discipline',
+    'lost control',
+    'emotional trading',
+    'trading psychology',
+];
+
+async function redditScout() {
+    console.log('[Scout] Reddit scan starting...');
+    let totalFound = 0;
+
+    for (const sub of SCOUT_SUBREDDITS) {
+        try {
+            const url = `https://www.reddit.com/r/${sub}/new.json?limit=50`;
+            const res = await fetch(url, {
+                headers: { 'User-Agent': 'EmotionLock-Scout/1.0' },
+                signal: AbortSignal.timeout(10000),
+            });
+
+            if (!res.ok) {
+                console.log(`[Scout] Reddit r/${sub}: HTTP ${res.status}`);
+                continue;
+            }
+
+            const json = await res.json();
+            const posts = json?.data?.children ?? [];
+
+            for (const child of posts) {
+                const post = child.data;
+                const text = `${post.title ?? ''} ${post.selftext ?? ''}`.toLowerCase();
+
+                const matched = SCOUT_KEYWORDS.filter(kw => text.includes(kw.toLowerCase()));
+                if (matched.length === 0) continue;
+
+                const postUrl = `https://www.reddit.com${post.permalink}`;
+
+                // Check if already saved
+                const { data: existing } = await supabase
+                    .from('opportunities')
+                    .select('id')
+                    .eq('url', postUrl)
+                    .maybeSingle();
+
+                if (existing) continue;
+
+                await supabase.from('opportunities').insert({
+                    platform: 'reddit',
+                    author: post.author ?? 'unknown',
+                    content: `${post.title}\n\n${post.selftext ?? ''}`.slice(0, 2000),
+                    url: postUrl,
+                    engagement: (post.score ?? 0) + (post.num_comments ?? 0),
+                    keywords_matched: matched,
+                    status: 'new',
+                    subreddit: sub,
+                    found_at: new Date().toISOString(),
+                });
+
+                totalFound++;
+            }
+        } catch (err) {
+            console.error(`[Scout] Reddit r/${sub} error:`, err.message);
+        }
+    }
+
+    console.log(`[Scout] Reddit scan done. Found ${totalFound} new opportunities.`);
+    return totalFound;
+}
+
+async function twitterScout() {
+    // NOTE: Discord Scout requires being in servers manually.
+    // Add Discord opportunities manually or via a bot token in trading-focused servers.
+    const bearerToken = process.env.TWITTER_BEARER_TOKEN;
+    if (!bearerToken) {
+        console.log('[Scout] TWITTER_BEARER_TOKEN not set, skipping X scout.');
+        return 0;
+    }
+
+    console.log('[Scout] X/Twitter scan starting...');
+    let totalFound = 0;
+
+    try {
+        const query = SCOUT_KEYWORDS.slice(0, 5).map(kw => `"${kw}"`).join(' OR ');
+        const encodedQuery = encodeURIComponent(`(${query}) lang:en -is:retweet`);
+        const url = `https://api.twitter.com/2/tweets/search/recent?query=${encodedQuery}&max_results=20&tweet.fields=author_id,created_at,public_metrics,text&expansions=author_id&user.fields=username`;
+
+        const res = await fetch(url, {
+            headers: { 'Authorization': `Bearer ${bearerToken}` },
+            signal: AbortSignal.timeout(10000),
+        });
+
+        if (!res.ok) {
+            const errText = await res.text();
+            console.log(`[Scout] X API HTTP ${res.status}: ${errText.slice(0, 200)}`);
+            return 0;
+        }
+
+        const json = await res.json();
+        const tweets = json?.data ?? [];
+        const users = {};
+        for (const u of json?.includes?.users ?? []) {
+            users[u.id] = u.username;
+        }
+
+        for (const tweet of tweets) {
+            const text = tweet.text.toLowerCase();
+            const matched = SCOUT_KEYWORDS.filter(kw => text.includes(kw.toLowerCase()));
+            if (matched.length === 0) continue;
+
+            const username = users[tweet.author_id] ?? 'unknown';
+            const tweetUrl = `https://twitter.com/${username}/status/${tweet.id}`;
+
+            const { data: existing } = await supabase
+                .from('opportunities')
+                .select('id')
+                .eq('url', tweetUrl)
+                .maybeSingle();
+
+            if (existing) continue;
+
+            const metrics = tweet.public_metrics ?? {};
+            const engagement = (metrics.like_count ?? 0) + (metrics.retweet_count ?? 0) + (metrics.reply_count ?? 0);
+
+            await supabase.from('opportunities').insert({
+                platform: 'x',
+                author: username,
+                content: tweet.text.slice(0, 2000),
+                url: tweetUrl,
+                engagement,
+                keywords_matched: matched,
+                status: 'new',
+                subreddit: null,
+                found_at: new Date().toISOString(),
+            });
+
+            totalFound++;
+        }
+    } catch (err) {
+        console.error('[Scout] X error:', err.message);
+    }
+
+    console.log(`[Scout] X scan done. Found ${totalFound} new opportunities.`);
+    return totalFound;
+}
+
+// Reddit scout runs every 30 minutes
+setInterval(redditScout, 30 * 60 * 1000);
+
+// X scout runs every 15 minutes
+setInterval(twitterScout, 15 * 60 * 1000);
+
+// Run once on startup after a short delay
+setTimeout(async () => {
+    await redditScout();
+    await twitterScout();
+}, 15000);
+
+// Manual trigger endpoint (called by Vercel cron or admin)
+app.post('/scout/run', async (req, res) => {
+    const adminKey = req.headers['x-admin-key'];
+    if (!adminKey || adminKey !== process.env.ADMIN_KEY) {
+        return res.status(401).json({ error: 'Unauthorized' });
+    }
+    const [redditCount, twitterCount] = await Promise.all([redditScout(), twitterScout()]);
+    res.json({ success: true, reddit: redditCount, twitter: twitterCount });
+});
+
+// GET endpoint for scout status
+app.get('/scout/status', (req, res) => {
+    const adminKey = req.headers['x-admin-key'];
+    if (!adminKey || adminKey !== process.env.ADMIN_KEY) {
+        return res.status(401).json({ error: 'Unauthorized' });
+    }
+    res.json({
+        subreddits: SCOUT_SUBREDDITS,
+        keywords: SCOUT_KEYWORDS,
+        reddit_interval_minutes: 30,
+        twitter_interval_minutes: 15,
+        // Discord: requires manual setup in servers
+        discord_note: 'Discord requires joining servers manually and setting up a bot token.',
+    });
+});
