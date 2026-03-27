@@ -1,5 +1,6 @@
 const express = require('express');
-const apn = require('apn');
+let apn = null;
+try { apn = require('@parse/node-apn'); } catch (err) { console.error('apn module unavailable (push disabled):', err.message); }
 const { createClient } = require('@supabase/supabase-js');
 const app = express();
 app.use(express.json());
@@ -51,7 +52,7 @@ if (process.env.APNS_KEY_BASE64) {
 }
 
 async function sendPushNotification(deviceToken, title, body) {
-    if (!apnProvider || !deviceToken) return;
+    if (!apn || !apnProvider || !deviceToken) return;
     const notification = new apn.Notification();
     notification.expiry = Math.floor(Date.now() / 1000) + 3600;
     notification.badge = 1;

@@ -12,7 +12,7 @@
   "description": "",
   "dependencies": {
     "@supabase/supabase-js": "^2.100.0",
-    "apn": "^2.2.0",
+    "@parse/node-apn": "^6.1.0",
     "express": "^5.2.1"
   }
 }
