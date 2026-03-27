@@ -33,16 +33,21 @@ async function saveTokens(licenseCode, tokens) {
 // =====================
 let apnProvider = null;
 if (process.env.APNS_KEY_BASE64) {
-    const apnKey = Buffer.from(process.env.APNS_KEY_BASE64, 'base64').toString('utf8');
-    apnProvider = new apn.Provider({
-        token: {
-            key: apnKey,
-            keyId: process.env.APNS_KEY_ID,
-            teamId: process.env.APNS_TEAM_ID,
-        },
-        production: process.env.APNS_PRODUCTION === 'true'
-    });
-    console.log('APNs provider initialized');
+    try {
+        const apnKey = Buffer.from(process.env.APNS_KEY_BASE64, 'base64').toString('utf8');
+        apnProvider = new apn.Provider({
+            token: {
+                key: apnKey,
+                keyId: process.env.APNS_KEY_ID,
+                teamId: process.env.APNS_TEAM_ID,
+            },
+            production: process.env.APNS_PRODUCTION === 'true'
+        });
+        console.log('APNs provider initialized');
+    } catch (err) {
+        console.error('APNs provider init failed (push notifications disabled):', err.message);
+        apnProvider = null;
+    }
 }
 
 async function sendPushNotification(deviceToken, title, body) {
