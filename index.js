@@ -156,12 +156,15 @@ async function getDeals(accountId, region, fromTime, toTime) {
 // =====================
 const DEFAULT_TOKENS = 3;
 
-// In-memory store — in production: use a database
-const licenseCodes = {
-    'EL-BART-TEST': { activated: false },
-    'EL-TEST-0001': { activated: false },
-    'EL-TEST-0002': { activated: false },
-};
+// Validate license code against Supabase purchases table
+async function isValidLicenseCode(code) {
+    const { data } = await supabase
+        .from('purchases')
+        .select('license_code')
+        .eq('license_code', code)
+        .maybeSingle();
+    return !!data;
+}
 
 // =====================
 // User state
@@ -326,23 +329,13 @@ app.post('/activate', async (req, res) => {
     if (!licenseCode) return res.status(400).json({ error: 'licenseCode required' });
 
     const key = licenseCode.toUpperCase().trim();
-    const code = licenseCodes[key];
-    if (!code) return res.status(404).json({ error: 'Invalid license code' });
+
+    // Validate against Supabase — works after every server restart
+    const valid = await isValidLicenseCode(key);
+    if (!valid) return res.status(404).json({ error: 'Invalid license code' });
 
     initUser(key);
     userStates[key].licenseCode = key;
-
-    if (!code.activated) {
-        code.activated = true;
-        code.activatedAt = new Date().toISOString();
-    }
-
-    // Apply any pending tokens that were purchased before activation
-    if (code.pendingTokens && code.pendingTokens > 0) {
-        userStates[key].emergencyTokens = (userStates[key].emergencyTokens || 0) + code.pendingTokens;
-        console.log(`Applied ${code.pendingTokens} pending tokens to newly activated license ${key}`);
-        code.pendingTokens = 0;
-    }
 
     // Load persistent token count from Supabase (survives server restarts)
     const storedTokens = await getStoredTokens(key);
@@ -353,6 +346,23 @@ app.post('/activate', async (req, res) => {
         // First time: save the default to Supabase
         await saveTokens(key, userStates[key].emergencyTokens);
     }
+
+    // Restore MT5 connection from Supabase if available
+    const { data: purchase } = await supabase
+        .from('purchases')
+        .select('meta_api_account_id, mt5_server, mt5_login, max_trades, count_winning_trades')
+        .eq('license_code', key)
+        .maybeSingle();
+
+    if (purchase?.meta_api_account_id) {
+        userStates[key].metaApiAccountId = purchase.meta_api_account_id;
+        userStates[key].mt5Server = purchase.mt5_server;
+        userStates[key].mt5Login = purchase.mt5_login;
+        userStates[key].mt5Connected = true;
+        console.log(`Restored MT5 connection for ${key}: ${purchase.mt5_server}`);
+    }
+    if (purchase?.max_trades) userStates[key].maxTrades = purchase.max_trades;
+    if (purchase?.count_winning_trades !== undefined) userStates[key].countWinningTrades = purchase.count_winning_trades;
 
     console.log(`License activated: ${key}`);
     res.json({ success: true, userId: key });
@@ -391,6 +401,13 @@ app.post('/connect-mt5/:userId', async (req, res) => {
 
         await deployMetaApiAccount(account.id);
 
+        // Persist MT5 connection to Supabase so it survives server restarts
+        await supabase.from('purchases').update({
+            meta_api_account_id: account.id,
+            mt5_server: server,
+            mt5_login: String(login),
+        }).eq('license_code', userId);
+
         console.log(`MT5 connected for user ${userId}: ${server} #${login}`);
         res.json({
             success: true,
@@ -419,6 +436,14 @@ app.delete('/connect-mt5/:userId', async (req, res) => {
         user.mt5Connected = false;
         user.mt5Server = null;
         user.mt5Login = null;
+
+        // Clear MT5 from Supabase too
+        await supabase.from('purchases').update({
+            meta_api_account_id: null,
+            mt5_server: null,
+            mt5_login: null,
+        }).eq('license_code', userId);
+
         console.log(`MT5 disconnected for user ${userId}`);
         res.json({ success: true });
     } catch (err) {
@@ -472,6 +497,12 @@ app.post('/settings/:userId', (req, res) => {
     if (user.tradesCount >= user.maxTrades && !user.emergencyUnlocked) {
         user.isLocked = true;
     }
+
+    // Persist settings to Supabase so they survive server restarts
+    supabase.from('purchases').update({
+        max_trades: user.maxTrades,
+        count_winning_trades: user.countWinningTrades,
+    }).eq('license_code', userId).then(() => {}).catch(() => {});
 
     res.json({ success: true, maxTrades: user.maxTrades, countWinningTrades: user.countWinningTrades, isLocked: user.isLocked });
 });
@@ -548,7 +579,9 @@ app.post('/add-tokens-iap/:userId', async (req, res) => {
 });
 
 // Admin: generate (or register) license code (called by website after purchase)
-app.post('/admin/generate-code', (req, res) => {
+// Note: license codes are stored in Supabase purchases table — this endpoint is kept
+// for backward compatibility but the website handles Supabase insertion directly.
+app.post('/admin/generate-code', async (req, res) => {
     const adminKey = req.headers['x-admin-key'];
     if (!adminKey || adminKey !== process.env.ADMIN_KEY) {
         return res.status(401).json({ error: 'Unauthorized' });
@@ -560,7 +593,14 @@ app.post('/admin/generate-code', (req, res) => {
         const rand = (n) => Array.from({ length: n }, () => chars[Math.floor(Math.random() * chars.length)]).join('');
         code = `EL-${rand(4)}-${rand(4)}`;
     }
-    licenseCodes[code] = { activated: false };
+
+    // Also insert into Supabase in case the website didn't handle it
+    const { error } = await supabase.from('purchases').upsert(
+        { license_code: code, emergency_tokens_remaining: DEFAULT_TOKENS },
+        { onConflict: 'license_code', ignoreDuplicates: true }
+    );
+    if (error) console.log('Supabase upsert warning:', error.message);
+
     console.log(`License code registered: ${code}`);
     res.json({ success: true, code });
 });
