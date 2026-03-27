@@ -199,8 +199,9 @@ function initUser(userId) {
     }
 }
 
-function checkDailyReset(user) {
-    const today = new Date().toDateString();
+function checkDailyReset(user, localDateStr) {
+    // Use the client's local date if provided (so reset happens at user's local midnight)
+    const today = localDateStr || new Date().toDateString();
     if (user.lastReset !== today) {
         user.tradesCount = 0;
         user.isLocked = false;
@@ -460,10 +461,11 @@ app.delete('/connect-mt5/:userId', async (req, res) => {
 // Status endpoint
 app.get('/status/:userId', async (req, res) => {
     const { userId } = req.params;
+    const localDate = req.headers['x-local-date'] || null;
     const isNewUser = !userStates[userId];
     initUser(userId);
     const user = userStates[userId];
-    checkDailyReset(user);
+    checkDailyReset(user, localDate);
     checkWeeklyTokenReset(user);
 
     // On server restart, reload persisted token count from Supabase
