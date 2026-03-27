@@ -8,10 +8,9 @@ app.use(express.json());
 // =====================
 // Supabase setup
 // =====================
-const supabase = createClient(
-    process.env.SUPABASE_URL || 'https://ixlmaqkhgjgmijlbstia.supabase.co',
-    process.env.SUPABASE_SERVICE_ROLE_KEY
-);
+const SUPABASE_URL = process.env.SUPABASE_URL || 'https://ixlmaqkhgjgmijlbstia.supabase.co';
+const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || 'placeholder-key-set-env-var';
+const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
 async function getStoredTokens(licenseCode) {
     const { data } = await supabase
