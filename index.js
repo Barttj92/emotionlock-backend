@@ -159,7 +159,7 @@ async function getDeals(accountId, region, fromTime, toTime) {
 // =====================
 // License codes
 // =====================
-const DEFAULT_TOKENS = 3;
+const DEFAULT_TOKENS = 2;
 
 // Validate license code against Supabase purchases table
 async function isValidLicenseCode(code) {
@@ -547,7 +547,7 @@ app.post('/register-device/:userId', (req, res) => {
 // No admin key needed — userId comes from the app's own session
 app.post('/add-tokens-iap/:userId', async (req, res) => {
     const userId = req.params.userId;
-    const tokens = parseInt(req.body && req.body.tokens) || 3;
+    const tokens = parseInt(req.body && req.body.tokens) || 2;
     const transactionId = req.body && req.body.transactionId;
 
     if (!userId) return res.status(400).json({ error: 'Missing userId' });
@@ -619,7 +619,7 @@ app.post('/admin/add-tokens/:licenseCode', (req, res) => {
         return res.status(401).json({ error: 'Unauthorized' });
     }
     const { licenseCode } = req.params;
-    const tokens = parseInt(req.body && req.body.tokens) || 3;
+    const tokens = parseInt(req.body && req.body.tokens) || 2;
 
     // Find the user who has this license code activated
     const userId = Object.keys(userStates).find(id => userStates[id].licenseCode === licenseCode);
