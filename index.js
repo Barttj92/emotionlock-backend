@@ -1,15 +1,67 @@
 const express = require('express');
+const crypto = require('crypto');
+const cors = require('cors');
+const rateLimit = require('express-rate-limit');
+const { z } = require('zod');
 let apn = null;
 try { apn = require('@parse/node-apn'); } catch (err) { console.error('apn module unavailable (push disabled):', err.message); }
 const { createClient } = require('@supabase/supabase-js');
+
+// =====================
+// Startup checks
+// =====================
+if (!process.env.SUPABASE_SERVICE_ROLE_KEY) {
+    console.error('FATAL: SUPABASE_SERVICE_ROLE_KEY environment variable is not set.');
+    process.exit(1);
+}
+
 const app = express();
+
+// =====================
+// Security middleware
+// =====================
+app.use(cors({ origin: 'https://emotionlock.app' }));
 app.use(express.json());
+
+// Debug logger — only logs in non-production environments
+const debugLog = (...args) => { if (process.env.NODE_ENV !== 'production') console.log(...args); };
+
+// Timing-safe admin key comparison
+function isValidAdminKey(key) {
+    if (!key || !process.env.ADMIN_KEY) return false;
+    try {
+        return crypto.timingSafeEqual(Buffer.from(key), Buffer.from(process.env.ADMIN_KEY));
+    } catch {
+        return false;
+    }
+}
+
+// Rate limiters
+const unlockLimiter = rateLimit({
+    windowMs: 60 * 60 * 1000, // 1 hour
+    max: 5,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { error: 'Too many unlock attempts. Try again in an hour.' },
+});
+
+const mt5Limiter = rateLimit({
+    windowMs: 60 * 60 * 1000, // 1 hour
+    max: 10,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { error: 'Too many connection attempts. Try again in an hour.' },
+});
 
 // =====================
 // Supabase setup
 // =====================
-const SUPABASE_URL = process.env.SUPABASE_URL || 'https://ixlmaqkhgjgmijlbstia.supabase.co';
-const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || 'placeholder-key-set-env-var';
+const SUPABASE_URL = process.env.SUPABASE_URL;
+if (!SUPABASE_URL) {
+    console.error('FATAL: SUPABASE_URL environment variable is not set.');
+    process.exit(1);
+}
+const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
 async function getStoredTokens(licenseCode) {
@@ -176,6 +228,9 @@ async function isValidLicenseCode(code) {
 // =====================
 const userStates = {};
 
+// Idempotency set for IAP transactions (survives within process lifetime)
+const processedIAPTransactions = new Set();
+
 function initUser(userId) {
     if (!userStates[userId]) {
         userStates[userId] = {
@@ -211,16 +266,31 @@ function checkDailyReset(user, localDateStr) {
     }
 }
 
+// Get day-of-week (0=Sun) and hour in Europe/Amsterdam, correct across CET/CEST transitions.
+// Previous implementation hardcoded UTC+1, which drifted one hour during summer time (CEST).
+function getAmsterdamDayHour(date) {
+    const parts = new Intl.DateTimeFormat('en-GB', {
+        timeZone: 'Europe/Amsterdam',
+        weekday: 'short',
+        hour: '2-digit',
+        hour12: false,
+    }).formatToParts(date);
+    const weekdayShort = parts.find(p => p.type === 'weekday')?.value ?? 'Mon';
+    const hourStr = parts.find(p => p.type === 'hour')?.value ?? '0';
+    const dayMap = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 };
+    // Intl may return "24" for midnight in some locales; normalize.
+    const hour = parseInt(hourStr, 10) % 24;
+    return { day: dayMap[weekdayShort] ?? 0, hour };
+}
+
 function shouldResetWeeklyTokens(lastTokenReset) {
     if (!lastTokenReset) return true;
     const now = new Date();
     const last = new Date(lastTokenReset);
-    const nowUTC1Hour = (now.getUTCHours() + 1) % 24;
-    const nowDay = now.getUTCDay();
-    const isResetTime = nowDay === 0 && nowUTC1Hour >= 22;
-    const lastResetDay = last.getUTCDay();
-    const lastResetHourUTC1 = (last.getUTCHours() + 1) % 24;
-    const wasBeforeReset = lastResetDay !== 0 || lastResetHourUTC1 < 22;
+    const nowAms = getAmsterdamDayHour(now);
+    const lastAms = getAmsterdamDayHour(last);
+    const isResetTime = nowAms.day === 0 && nowAms.hour >= 22;
+    const wasBeforeReset = lastAms.day !== 0 || lastAms.hour < 22;
     const daysDiff = Math.floor((now - last) / (1000 * 60 * 60 * 24));
     return (isResetTime && daysDiff >= 1 && wasBeforeReset) || daysDiff >= 7;
 }
@@ -248,7 +318,7 @@ async function checkUserTrades(userId) {
     try {
         const accountInfo = await getMetaApiAccountInfo(user.metaApiAccountId);
         if (!accountInfo) {
-            console.log(`User ${userId}: MetaApi account not found`);
+            debugLog(`User ${userId}: MetaApi account not found`);
             return;
         }
 
@@ -258,7 +328,7 @@ async function checkUserTrades(userId) {
             (accountInfo.connectionStatus === 'CONNECTED' || accountInfo.connectionStatus === 'SYNCHRONIZING');
 
         if (!isReady) {
-            console.log(`User ${userId}: account not ready yet (${accountInfo.state} / ${accountInfo.connectionStatus})`);
+            debugLog(`User ${userId}: account not ready yet (${accountInfo.state} / ${accountInfo.connectionStatus})`);
             return;
         }
 
@@ -288,18 +358,18 @@ async function checkUserTrades(userId) {
             user.tradesCount++;
             newTradesDetected = true;
 
-            console.log(`User ${userId}: trade counted. Profit: ${deal.profit}. Total: ${user.tradesCount}/${user.maxTrades}`);
+            debugLog(`User ${userId}: trade counted. Total: ${user.tradesCount}/${user.maxTrades}`);
         }
 
         // If a new trade came in after an emergency unlock, reset the emergency so locking can trigger again
         if (newTradesDetected && user.emergencyUnlocked) {
             user.emergencyUnlocked = false;
-            console.log(`User ${userId}: new trade after emergency unlock — resetting emergency state`);
+            debugLog(`User ${userId}: new trade after emergency unlock — resetting emergency state`);
         }
 
         if (newTradesDetected && user.tradesCount >= user.maxTrades && !user.isLocked) {
             user.isLocked = true;
-            console.log(`User ${userId}: trade limit reached (${user.tradesCount}/${user.maxTrades}), sending push`);
+            debugLog(`User ${userId}: trade limit reached, sending push`);
             await sendPushNotification(
                 user.deviceToken,
                 '🔒 EmotionLock activated',
@@ -325,16 +395,19 @@ setInterval(async () => {
 // Routes
 // =====================
 
+// PUBLIC ROUTE: health check — no auth needed, returns no sensitive data
 app.get('/', (req, res) => {
     res.json({ status: 'EmotionLock backend running' });
 });
 
-// Activate license code
+// PUBLIC ROUTE: license activation — validates licenseCode against Supabase, no session needed
 app.post('/activate', async (req, res) => {
+    try {
     const { licenseCode } = req.body;
     if (!licenseCode) return res.status(400).json({ error: 'licenseCode required' });
 
-    const key = licenseCode.toUpperCase().trim();
+    const key = String(licenseCode).slice(0, 50).toUpperCase().trim();
+    if (key.length < 5) return res.status(400).json({ error: 'Invalid license code format' });
 
     // Validate against Supabase — works after every server restart
     const valid = await isValidLicenseCode(key);
@@ -365,25 +438,38 @@ app.post('/activate', async (req, res) => {
         userStates[key].mt5Server = purchase.mt5_server;
         userStates[key].mt5Login = purchase.mt5_login;
         userStates[key].mt5Connected = true;
-        console.log(`Restored MT5 connection for ${key}: ${purchase.mt5_server}`);
+        debugLog(`Restored MT5 connection for user`);
     }
     if (purchase?.max_trades) userStates[key].maxTrades = purchase.max_trades;
     if (purchase?.count_winning_trades !== undefined) userStates[key].countWinningTrades = purchase.count_winning_trades;
 
     console.log(`License activated: ${key}`);
     res.json({ success: true, userId: key });
+    } catch (err) {
+        console.error('Activate error:', err.message);
+        res.status(500).json({ error: 'Failed to activate license. Please try again.' });
+    }
 });
 
-// Connect MT5 account
-app.post('/connect-mt5/:userId', async (req, res) => {
+const connectMt5Schema = z.object({
+    server:   z.string().min(1).max(100),
+    login:    z.union([z.string().min(1).max(20), z.number().int().positive()]),
+    password: z.string().min(1).max(128),
+});
+
+// PUBLIC ROUTE: MT5 connect — no session auth, but requires a valid userId (licenseCode) in userStates.
+//               Rate-limited to 10 requests/hour per IP. Credentials are forwarded to MetaApi only.
+app.post('/connect-mt5/:userId', mt5Limiter, async (req, res) => {
     const { userId } = req.params;
-    const { server, login, password } = req.body;
+
+    const parsed = connectMt5Schema.safeParse(req.body);
+    if (!parsed.success) {
+        return res.status(400).json({ error: 'Invalid input.', details: parsed.error.issues.map(i => i.message) });
+    }
+    const { server, login, password } = parsed.data;
 
     if (!userStates[userId]) {
         return res.status(404).json({ error: 'User not found. Activate your license first.' });
-    }
-    if (!server || !login || !password) {
-        return res.status(400).json({ error: 'server, login and password are required' });
     }
 
     try {
@@ -414,17 +500,15 @@ app.post('/connect-mt5/:userId', async (req, res) => {
             mt5_login: String(login),
         }).eq('license_code', userId);
 
-        console.log(`MT5 connected for user ${userId}: ${server} #${login}`);
+        debugLog(`MT5 connected for user ${userId}`);
         res.json({
             success: true,
-            server,
-            login: String(login),
             message: 'Connecting... it may take a few minutes to fully sync.'
         });
 
     } catch (err) {
         console.error(`MT5 connect error for ${userId}:`, err.message);
-        res.status(500).json({ error: err.message });
+        res.status(500).json({ error: 'Failed to connect MT5 account. Please try again.' });
     }
 });
 
@@ -454,85 +538,114 @@ app.delete('/connect-mt5/:userId', async (req, res) => {
         res.json({ success: true });
     } catch (err) {
         console.error(`MT5 disconnect error for ${userId}:`, err.message);
-        res.status(500).json({ error: err.message });
+        res.status(500).json({ error: 'Failed to disconnect MT5 account. Please try again.' });
     }
 });
 
-// Status endpoint
+// PUBLIC ROUTE: status polling — called by the iOS app every 5s. UserId is the Keychain UUID
+//               (non-guessable). Returns only non-sensitive trade state.
 app.get('/status/:userId', async (req, res) => {
-    const { userId } = req.params;
-    const localDate = req.headers['x-local-date'] || null;
-    const isNewUser = !userStates[userId];
-    initUser(userId);
-    const user = userStates[userId];
-    checkDailyReset(user, localDate);
-    checkWeeklyTokenReset(user);
-
-    // On server restart, reload persisted token count from Supabase
-    if (isNewUser) {
-        const storedTokens = await getStoredTokens(userId);
-        if (storedTokens !== null) {
-            user.emergencyTokens = storedTokens;
-            console.log(`Server restart: restored ${storedTokens} tokens for ${userId}`);
-        }
-    }
-
-    res.json({
-        tradesCount: user.tradesCount,
-        isLocked: user.isLocked,
-        emergencyUnlocked: user.emergencyUnlocked,
-        emergencyTokens: user.emergencyTokens,
-        mt5Connected: user.mt5Connected,
-        mt5Server: user.mt5Server,
-        mt5Login: user.mt5Login,
-        maxTrades: user.maxTrades,
-    });
-});
-
-// Update user settings
-app.post('/settings/:userId', (req, res) => {
-    const { userId } = req.params;
-    const { maxTrades, countWinningTrades } = req.body;
-    if (!userStates[userId]) {
+    try {
+        const { userId } = req.params;
+        const localDate = req.headers['x-local-date'] || null;
+        const isNewUser = !userStates[userId];
         initUser(userId);
+        const user = userStates[userId];
+        checkDailyReset(user, localDate);
+        checkWeeklyTokenReset(user);
+
+        // On server restart, reload persisted token count from Supabase
+        if (isNewUser) {
+            const storedTokens = await getStoredTokens(userId);
+            if (storedTokens !== null) {
+                user.emergencyTokens = storedTokens;
+                console.log(`Server restart: restored ${storedTokens} tokens for ${userId}`);
+            }
+        }
+
+        res.json({
+            tradesCount: user.tradesCount,
+            isLocked: user.isLocked,
+            emergencyUnlocked: user.emergencyUnlocked,
+            emergencyTokens: user.emergencyTokens,
+            mt5Connected: user.mt5Connected,
+            maxTrades: user.maxTrades,
+        });
+    } catch (err) {
+        console.error(`Status error for ${req.params.userId}:`, err.message);
+        res.status(500).json({ error: 'Failed to fetch status. Please try again.' });
     }
-    const user = userStates[userId];
-    if (maxTrades !== undefined) user.maxTrades = maxTrades;
-    if (countWinningTrades !== undefined) user.countWinningTrades = countWinningTrades;
-
-    // Re-evaluate lock state: if trades >= new maxTrades and not emergency-unlocked → lock
-    if (user.tradesCount >= user.maxTrades && !user.emergencyUnlocked) {
-        user.isLocked = true;
-    }
-
-    // Persist settings to Supabase so they survive server restarts
-    supabase.from('purchases').update({
-        max_trades: user.maxTrades,
-        count_winning_trades: user.countWinningTrades,
-    }).eq('license_code', userId).then(() => {}).catch(() => {});
-
-    res.json({ success: true, maxTrades: user.maxTrades, countWinningTrades: user.countWinningTrades, isLocked: user.isLocked });
 });
 
-// Emergency unlock
-app.post('/unlock/:userId', async (req, res) => {
-    const { userId } = req.params;
-    initUser(userId);
-    const user = userStates[userId];
-    checkWeeklyTokenReset(user);
-    if (user.emergencyTokens <= 0) {
-        return res.status(400).json({ error: 'No tokens available' });
-    }
-    user.isLocked = false;
-    user.emergencyUnlocked = true;
-    user.emergencyTokens -= 1;
-    // Persist new token count to Supabase so server restarts don't reset it
-    await saveTokens(userId, user.emergencyTokens);
-    console.log(`User ${userId}: emergency unlock. Tokens left: ${user.emergencyTokens}`);
-    res.json({ success: true, isLocked: false, emergencyUnlocked: true, emergencyTokens: user.emergencyTokens });
+const settingsSchema = z.object({
+    maxTrades:          z.number().int().min(1).max(10).optional(),
+    countWinningTrades: z.boolean().optional(),
 });
 
-// Register device push token
+// PUBLIC ROUTE: user settings — called by iOS app. UserId is the Keychain UUID (non-guessable).
+app.post('/settings/:userId', (req, res) => {
+    try {
+        const { userId } = req.params;
+
+        const parsed = settingsSchema.safeParse(req.body);
+        if (!parsed.success) {
+            return res.status(400).json({ error: 'Invalid input.', details: parsed.error.issues.map(i => i.message) });
+        }
+        const { maxTrades, countWinningTrades } = parsed.data;
+
+        if (!userStates[userId]) {
+            initUser(userId);
+        }
+        const user = userStates[userId];
+        if (maxTrades !== undefined) {
+            user.maxTrades = maxTrades;
+        }
+        if (countWinningTrades !== undefined) user.countWinningTrades = countWinningTrades;
+
+        // Re-evaluate lock state: if trades >= new maxTrades and not emergency-unlocked → lock
+        if (user.tradesCount >= user.maxTrades && !user.emergencyUnlocked) {
+            user.isLocked = true;
+        }
+
+        // Persist settings to Supabase so they survive server restarts
+        supabase.from('purchases').update({
+            max_trades: user.maxTrades,
+            count_winning_trades: user.countWinningTrades,
+        }).eq('license_code', userId).then(() => {}).catch(() => {});
+
+        res.json({ success: true, maxTrades: user.maxTrades, countWinningTrades: user.countWinningTrades, isLocked: user.isLocked });
+    } catch (err) {
+        console.error(`Settings error for ${req.params.userId}:`, err.message);
+        res.status(500).json({ error: 'Failed to update settings.' });
+    }
+});
+
+// PUBLIC ROUTE: emergency unlock — rate-limited to 5/hour per IP. UserId is the Keychain UUID.
+app.post('/unlock/:userId', unlockLimiter, async (req, res) => {
+    try {
+        const { userId } = req.params;
+        if (!userStates[userId]) {
+            return res.status(404).json({ error: 'User not found. Open the app first.' });
+        }
+        const user = userStates[userId];
+        checkWeeklyTokenReset(user);
+        if (user.emergencyTokens <= 0) {
+            return res.status(400).json({ error: 'No tokens available' });
+        }
+        user.isLocked = false;
+        user.emergencyUnlocked = true;
+        user.emergencyTokens -= 1;
+        // Persist new token count to Supabase so server restarts don't reset it
+        await saveTokens(userId, user.emergencyTokens);
+        debugLog(`User ${userId}: emergency unlock. Tokens left: ${user.emergencyTokens}`);
+        res.json({ success: true, isLocked: false, emergencyUnlocked: true, emergencyTokens: user.emergencyTokens });
+    } catch (err) {
+        console.error(`Unlock error for ${req.params.userId}:`, err.message);
+        res.status(500).json({ error: 'Failed to process unlock. Please try again.' });
+    }
+});
+
+// PUBLIC ROUTE: device token registration — called on app launch. UserId is the Keychain UUID.
 app.post('/register-device/:userId', (req, res) => {
     const { userId } = req.params;
     const { deviceToken } = req.body;
@@ -543,46 +656,9 @@ app.post('/register-device/:userId', (req, res) => {
     res.json({ success: true });
 });
 
-// IAP: add tokens after Apple in-app purchase (called directly from the iOS app)
-// No admin key needed — userId comes from the app's own session
-app.post('/add-tokens-iap/:userId', async (req, res) => {
-    const userId = req.params.userId;
-    const tokens = parseInt(req.body && req.body.tokens) || 2;
-    const transactionId = req.body && req.body.transactionId;
-
-    if (!userId) return res.status(400).json({ error: 'Missing userId' });
-
-    // Idempotency: don't add tokens twice for same Apple transaction ID
-    if (transactionId) {
-        if (!processedIAPTransactions) global.processedIAPTransactions = new Set();
-        if (global.processedIAPTransactions.has(transactionId)) {
-            return res.json({ success: true, alreadyProcessed: true });
-        }
-        global.processedIAPTransactions.add(transactionId);
-    }
-
-    if (!userStates[userId]) initUser(userId);
-    userStates[userId].emergencyTokens = (userStates[userId].emergencyTokens || 0) + tokens;
-
-    // Persist to Supabase
-    try {
-        const { data: purchase } = await supabase
-            .from('purchases')
-            .select('emergency_tokens_remaining, emergency_tokens_purchased')
-            .eq('user_id', userId)
-            .single();
-        if (purchase) {
-            await supabase.from('purchases').update({
-                emergency_tokens_remaining: (purchase.emergency_tokens_remaining ?? 0) + tokens,
-                emergency_tokens_purchased: (purchase.emergency_tokens_purchased ?? 0) + tokens,
-            }).eq('user_id', userId);
-        }
-    } catch (e) {
-        console.error('IAP token persist error:', e);
-    }
-
-    console.log(`IAP: Added ${tokens} tokens to user ${userId}. Total: ${userStates[userId].emergencyTokens}`);
-    res.json({ success: true, tokens: userStates[userId].emergencyTokens });
+// Token purchases removed — emergency tokens are free (3 per week, included with subscription)
+app.post('/add-tokens-iap/:userId', (req, res) => {
+    res.status(410).json({ error: 'Token purchases are no longer available.' });
 });
 
 // Admin: generate (or register) license code (called by website after purchase)
@@ -590,7 +666,7 @@ app.post('/add-tokens-iap/:userId', async (req, res) => {
 // for backward compatibility but the website handles Supabase insertion directly.
 app.post('/admin/generate-code', async (req, res) => {
     const adminKey = req.headers['x-admin-key'];
-    if (!adminKey || adminKey !== process.env.ADMIN_KEY) {
+    if (!isValidAdminKey(adminKey)) {
         return res.status(401).json({ error: 'Unauthorized' });
     }
     // Accept a custom code from the website, or generate one
@@ -615,7 +691,7 @@ app.post('/admin/generate-code', async (req, res) => {
 // Admin: add emergency tokens to a license (called by website after token purchase)
 app.post('/admin/add-tokens/:licenseCode', (req, res) => {
     const adminKey = req.headers['x-admin-key'];
-    if (!adminKey || adminKey !== process.env.ADMIN_KEY) {
+    if (!isValidAdminKey(adminKey)) {
         return res.status(401).json({ error: 'Unauthorized' });
     }
     const { licenseCode } = req.params;
@@ -636,6 +712,46 @@ app.post('/admin/add-tokens/:licenseCode', (req, res) => {
     userStates[userId].emergencyTokens = (userStates[userId].emergencyTokens || 0) + tokens;
     console.log(`Added ${tokens} emergency tokens to user ${userId} (license ${licenseCode}). Total: ${userStates[userId].emergencyTokens}`);
     res.json({ success: true, tokens: userStates[userId].emergencyTokens });
+});
+
+// Delete account — required by Apple App Store policy
+app.delete('/delete-account/:userId', async (req, res) => {
+    const { userId } = req.params;
+
+    if (!userStates[userId]) {
+        return res.status(404).json({ error: 'User not found. Open the app first.' });
+    }
+
+    const user = userStates[userId];
+
+    try {
+        // Disconnect MT5 if connected
+        if (user?.metaApiAccountId) {
+            try {
+                await undeployAndDeleteMetaApiAccount(user.metaApiAccountId);
+            } catch (e) {
+                console.log(`MT5 cleanup on account delete for ${userId}:`, e.message);
+            }
+        }
+
+        // Clear from in-memory state
+        delete userStates[userId];
+
+        // Clear all user data from Supabase — match on user_id (UUID from Keychain)
+        await supabase.from('purchases').update({
+            meta_api_account_id: null,
+            mt5_server: null,
+            mt5_login: null,
+            emergency_tokens_remaining: null,
+            emergency_tokens_purchased: null,
+        }).eq('user_id', userId);
+
+        console.log(`Account deleted for user ${userId}`);
+        res.json({ success: true });
+    } catch (err) {
+        console.error(`Delete account error for ${userId}:`, err.message);
+        res.status(500).json({ error: 'Failed to delete account. Please try again.' });
+    }
 });
 
 const PORT = process.env.PORT || 3000;
@@ -823,7 +939,7 @@ setTimeout(async () => {
 // Manual trigger endpoint (called by Vercel cron or admin)
 app.post('/scout/run', async (req, res) => {
     const adminKey = req.headers['x-admin-key'];
-    if (!adminKey || adminKey !== process.env.ADMIN_KEY) {
+    if (!isValidAdminKey(adminKey)) {
         return res.status(401).json({ error: 'Unauthorized' });
     }
     const [redditCount, twitterCount] = await Promise.all([redditScout(), twitterScout()]);
@@ -833,7 +949,7 @@ app.post('/scout/run', async (req, res) => {
 // GET endpoint for scout status
 app.get('/scout/status', (req, res) => {
     const adminKey = req.headers['x-admin-key'];
-    if (!adminKey || adminKey !== process.env.ADMIN_KEY) {
+    if (!isValidAdminKey(adminKey)) {
         return res.status(401).json({ error: 'Unauthorized' });
     }
     res.json({
