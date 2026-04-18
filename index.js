@@ -144,6 +144,8 @@ async function createMetaApiAccount(server, login, password, name) {
             type: 'cloud',
             magic: 0,
             application: 'MetaApi',
+            // Explicit G1 tier (regular reliability). Never use 'high' — doubles hourly cost.
+            reliability: 'regular',
             copyFactoryRoles: [],
             tags: ['emotionlock']
         })
@@ -332,10 +334,25 @@ async function checkUserTrades(userId) {
             return;
         }
 
+        // Incremental fetch: only pull deals since last successful check (with 60s overlap for safety).
+        // Falls back to today-midnight on first run or after a daily reset.
         const todayMidnight = new Date();
         todayMidnight.setHours(0, 0, 0, 0);
-        const fromTime = todayMidnight.toISOString();
-        const toTime = new Date().toISOString();
+        const now = new Date();
+
+        let fromDate;
+        if (user.lastDealCheck) {
+            const lastCheck = new Date(user.lastDealCheck);
+            // 60s overlap to catch deals that arrived during the previous poll window
+            const overlapped = new Date(lastCheck.getTime() - 60 * 1000);
+            // Never go earlier than today-midnight (daily reset boundary)
+            fromDate = overlapped > todayMidnight ? overlapped : todayMidnight;
+        } else {
+            fromDate = todayMidnight;
+        }
+
+        const fromTime = fromDate.toISOString();
+        const toTime = now.toISOString();
 
         const deals = await getDeals(user.metaApiAccountId, user.mt5Region, fromTime, toTime);
 
@@ -656,7 +673,7 @@ app.post('/register-device/:userId', (req, res) => {
     res.json({ success: true });
 });
 
-// Token purchases removed — emergency tokens are free (3 per week, included with subscription)
+// Token purchases removed — emergency tokens are free (2 per week, included with subscription)
 app.post('/add-tokens-iap/:userId', (req, res) => {
     res.status(410).json({ error: 'Token purchases are no longer available.' });
 });
