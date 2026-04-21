@@ -168,16 +168,20 @@ async function deployMetaApiAccount(accountId) {
     }
 }
 
-async function undeployAndDeleteMetaApiAccount(accountId) {
+async function undeployMetaApiAccount(accountId) {
     try {
         await fetch(`${PROVISIONING_API}/users/current/accounts/${accountId}/undeploy`, {
             method: 'POST',
             headers: { 'auth-token': METAAPI_TOKEN }
         });
-        await new Promise(r => setTimeout(r, 3000));
     } catch (e) {
         console.log('Undeploy warning:', e.message);
     }
+}
+
+async function undeployAndDeleteMetaApiAccount(accountId) {
+    await undeployMetaApiAccount(accountId);
+    await new Promise(r => setTimeout(r, 3000));
     const response = await fetch(`${PROVISIONING_API}/users/current/accounts/${accountId}`, {
         method: 'DELETE',
         headers: { 'auth-token': METAAPI_TOKEN }
@@ -444,12 +448,14 @@ app.post('/activate', async (req, res) => {
         .eq('license_code', key)
         .maybeSingle();
 
-    if (purchase?.meta_api_account_id) {
+    if (purchase?.meta_api_account_id && purchase?.mt5_server) {
         userStates[key].metaApiAccountId = purchase.meta_api_account_id;
         userStates[key].mt5Server = purchase.mt5_server;
         userStates[key].mt5Login = purchase.mt5_login;
         userStates[key].mt5Connected = true;
         debugLog(`Restored MT5 connection for user`);
+    } else if (purchase?.meta_api_account_id) {
+        userStates[key].metaApiAccountId = purchase.meta_api_account_id;
     }
     if (purchase?.max_trades) userStates[key].maxTrades = purchase.max_trades;
     if (purchase?.count_winning_trades !== undefined) userStates[key].countWinningTrades = purchase.count_winning_trades;
@@ -484,29 +490,48 @@ app.post('/connect-mt5/:userId', mt5Limiter, async (req, res) => {
     }
 
     try {
-        // Disconnect existing account if any
-        if (userStates[userId].metaApiAccountId) {
-            try {
-                await undeployAndDeleteMetaApiAccount(userStates[userId].metaApiAccountId);
-            } catch (e) {
-                console.log('Cleanup old account warning:', e.message);
+        // Check Supabase for an existing MetaAPI account for this user
+        const { data: savedAccount } = await supabase
+            .from('purchases')
+            .select('meta_api_account_id, mt5_server, mt5_login')
+            .eq('license_code', userId)
+            .maybeSingle();
+
+        const existingMetaApiId = savedAccount?.meta_api_account_id || userStates[userId].metaApiAccountId;
+        const isSameAccount = existingMetaApiId &&
+            savedAccount?.mt5_server === server &&
+            savedAccount?.mt5_login === String(login);
+
+        let accountId;
+        if (isSameAccount) {
+            // Same server + login: redeploy the existing account, no new account needed
+            console.log(`Reusing existing MetaAPI account for user ${userId}`);
+            accountId = existingMetaApiId;
+            await deployMetaApiAccount(accountId);
+        } else {
+            // Different account: delete old (if any), create new
+            if (existingMetaApiId) {
+                try {
+                    await undeployAndDeleteMetaApiAccount(existingMetaApiId);
+                } catch (e) {
+                    console.log('Cleanup old account warning:', e.message);
+                }
             }
+            console.log(`Creating new MetaAPI account for user ${userId} on ${server}...`);
+            const account = await createMetaApiAccount(server, String(login), password, `EmotionLock-${userId}`);
+            accountId = account.id;
+            await deployMetaApiAccount(accountId);
         }
 
-        console.log(`Connecting MT5 for user ${userId} on ${server}...`);
-        const account = await createMetaApiAccount(server, String(login), password, `EmotionLock-${userId}`);
-
-        userStates[userId].metaApiAccountId = account.id;
+        userStates[userId].metaApiAccountId = accountId;
         userStates[userId].mt5Server = server;
         userStates[userId].mt5Login = String(login);
         userStates[userId].mt5Connected = true;
         userStates[userId].processedDealIds = new Set();
 
-        await deployMetaApiAccount(account.id);
-
         // Persist MT5 connection to Supabase so it survives server restarts
         await supabase.from('purchases').update({
-            meta_api_account_id: account.id,
+            meta_api_account_id: accountId,
             mt5_server: server,
             mt5_login: String(login),
         }).eq('license_code', userId);
@@ -532,15 +557,14 @@ app.delete('/connect-mt5/:userId', async (req, res) => {
     if (!user.metaApiAccountId) return res.status(400).json({ error: 'No MT5 account connected' });
 
     try {
-        await undeployAndDeleteMetaApiAccount(user.metaApiAccountId);
-        user.metaApiAccountId = null;
+        // Undeploy only — keep the MetaAPI account so it can be reused on reconnect
+        await undeployMetaApiAccount(user.metaApiAccountId);
         user.mt5Connected = false;
         user.mt5Server = null;
         user.mt5Login = null;
 
-        // Clear MT5 from Supabase too
+        // Null server/login in Supabase (signals "disconnected") but keep meta_api_account_id for reuse
         await supabase.from('purchases').update({
-            meta_api_account_id: null,
             mt5_server: null,
             mt5_login: null,
         }).eq('license_code', userId);
@@ -579,12 +603,15 @@ app.get('/status/:userId', async (req, res) => {
                 .eq('license_code', userId)
                 .maybeSingle();
 
-            if (purchase?.meta_api_account_id) {
+            if (purchase?.meta_api_account_id && purchase?.mt5_server) {
                 user.metaApiAccountId = purchase.meta_api_account_id;
                 user.mt5Server = purchase.mt5_server;
                 user.mt5Login = purchase.mt5_login;
                 user.mt5Connected = true;
                 console.log(`Server restart: restored MT5 connection for ${userId}`);
+            } else if (purchase?.meta_api_account_id) {
+                // Account exists in MetaAPI but user intentionally disconnected — keep ID for reuse, don't reconnect
+                user.metaApiAccountId = purchase.meta_api_account_id;
             }
             if (purchase?.max_trades) user.maxTrades = purchase.max_trades;
             if (purchase?.count_winning_trades !== undefined) user.countWinningTrades = purchase.count_winning_trades;
