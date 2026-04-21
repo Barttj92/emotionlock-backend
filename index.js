@@ -609,6 +609,10 @@ app.get('/status/:userId', async (req, res) => {
                 user.mt5Login = purchase.mt5_login;
                 user.mt5Connected = true;
                 console.log(`Server restart: restored MT5 connection for ${userId}`);
+                // Ensure the MetaAPI account is deployed after restart (fire-and-forget)
+                deployMetaApiAccount(purchase.meta_api_account_id).catch(e =>
+                    console.log(`Redeploy after restart warning for ${userId}:`, e.message)
+                );
             } else if (purchase?.meta_api_account_id) {
                 // Account exists in MetaAPI but user intentionally disconnected — keep ID for reuse, don't reconnect
                 user.metaApiAccountId = purchase.meta_api_account_id;
