@@ -507,7 +507,7 @@ app.post('/connect-mt5/:userId', mt5Limiter, async (req, res) => {
         const { data: savedAccount } = await supabase
             .from('purchases')
             .select('meta_api_account_id, mt5_server, mt5_login')
-            .eq('license_code', userId)
+            .eq('user_id', userId)
             .maybeSingle();
 
         const existingMetaApiId = savedAccount?.meta_api_account_id || userStates[userId].metaApiAccountId;
@@ -554,7 +554,7 @@ app.post('/connect-mt5/:userId', mt5Limiter, async (req, res) => {
             meta_api_account_id: accountId,
             mt5_server: server,
             mt5_login: String(login),
-        }).eq('license_code', userId);
+        }).eq('user_id', userId);
 
         debugLog(`MT5 connected for user ${userId}`);
         res.json({
@@ -615,7 +615,7 @@ app.get('/status/:userId', async (req, res) => {
             const { data: purchase } = await supabase
                 .from('purchases')
                 .select('meta_api_account_id, mt5_server, mt5_login, max_trades, count_winning_trades')
-                .eq('license_code', userId)
+                .eq('user_id', userId)
                 .maybeSingle();
 
             if (purchase?.meta_api_account_id) {
@@ -685,7 +685,7 @@ app.post('/settings/:userId', (req, res) => {
         supabase.from('purchases').update({
             max_trades: user.maxTrades,
             count_winning_trades: user.countWinningTrades,
-        }).eq('license_code', userId).then(() => {}).catch(() => {});
+        }).eq('user_id', userId).then(() => {}).catch(() => {});
 
         res.json({ success: true, maxTrades: user.maxTrades, countWinningTrades: user.countWinningTrades, isLocked: user.isLocked });
     } catch (err) {
