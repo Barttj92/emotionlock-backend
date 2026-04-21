@@ -586,6 +586,8 @@ app.get('/status/:userId', async (req, res) => {
             emergencyUnlocked: user.emergencyUnlocked,
             emergencyTokens: user.emergencyTokens,
             mt5Connected: user.mt5Connected,
+            mt5Server: user.mt5Server ?? null,
+            mt5Login: user.mt5Login ?? null,
             maxTrades: user.maxTrades,
         });
     } catch (err) {
