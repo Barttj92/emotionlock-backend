@@ -367,14 +367,27 @@ async function checkUserTrades(userId) {
         const now = new Date();
 
         let fromDate;
+        if (!user.lastDealCheck) {
+            // First poll after connecting or after a server restart.
+            // Seed processedDealIds with everything from the last 60s so the overlap
+            // window on the next real poll doesn't accidentally re-fetch these deals.
+            // Do NOT count any of them — history before EmotionLock connected is irrelevant.
+            const seedFrom = new Date(now.getTime() - 60 * 1000);
+            const seedDeals = await getDeals(user.metaApiAccountId, user.mt5Region, seedFrom.toISOString(), now.toISOString());
+            for (const deal of seedDeals) {
+                user.processedDealIds.add(deal.id);
+            }
+            user.lastDealCheck = now.toISOString();
+            console.log(`[trades] ${userId.slice(0,8)}: first check — seeded ${seedDeals.length} existing deals, poll window initialized`);
+            return;
+        }
+
         if (user.lastDealCheck) {
             const lastCheck = new Date(user.lastDealCheck);
             // 60s overlap to catch deals that arrived during the previous poll window
             const overlapped = new Date(lastCheck.getTime() - 60 * 1000);
             // Never go earlier than today-midnight (daily reset boundary)
             fromDate = overlapped > todayMidnight ? overlapped : todayMidnight;
-        } else {
-            fromDate = todayMidnight;
         }
 
         const fromTime = fromDate.toISOString();
