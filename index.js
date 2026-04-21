@@ -378,12 +378,6 @@ async function checkUserTrades(userId) {
             debugLog(`User ${userId}: trade counted. Total: ${user.tradesCount}/${user.maxTrades}`);
         }
 
-        // If a new trade came in after an emergency unlock, reset the emergency so locking can trigger again
-        if (newTradesDetected && user.emergencyUnlocked) {
-            user.emergencyUnlocked = false;
-            debugLog(`User ${userId}: new trade after emergency unlock — resetting emergency state`);
-        }
-
         if (newTradesDetected && user.tradesCount >= user.maxTrades && !user.isLocked) {
             user.isLocked = true;
             debugLog(`User ${userId}: trade limit reached, sending push`);
@@ -667,13 +661,13 @@ app.post('/unlock/:userId', unlockLimiter, async (req, res) => {
         if (user.emergencyTokens <= 0) {
             return res.status(400).json({ error: 'No tokens available' });
         }
+        user.tradesCount = Math.max(0, user.tradesCount - 1);
         user.isLocked = false;
-        user.emergencyUnlocked = true;
         user.emergencyTokens -= 1;
         // Persist new token count to Supabase so server restarts don't reset it
         await saveTokens(userId, user.emergencyTokens);
-        debugLog(`User ${userId}: emergency unlock. Tokens left: ${user.emergencyTokens}`);
-        res.json({ success: true, isLocked: false, emergencyUnlocked: true, emergencyTokens: user.emergencyTokens });
+        debugLog(`User ${userId}: emergency unlock. tradesCount: ${user.tradesCount}, tokens left: ${user.emergencyTokens}`);
+        res.json({ success: true, isLocked: false, tradesCount: user.tradesCount, emergencyTokens: user.emergencyTokens });
     } catch (err) {
         console.error(`Unlock error for ${req.params.userId}:`, err.message);
         res.status(500).json({ error: 'Failed to process unlock. Please try again.' });
