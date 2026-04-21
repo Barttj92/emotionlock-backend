@@ -361,8 +361,8 @@ async function checkUserTrades(userId) {
         for (const deal of deals) {
             if (user.processedDealIds.has(deal.id)) continue;
 
-            const isTradeClosed = deal.entryType === 'DEAL_ENTRY_OUT' || deal.entryType === 'DEAL_ENTRY_INOUT';
-            if (!isTradeClosed) continue;
+            const isTradeOpened = deal.entryType === 'DEAL_ENTRY_IN' || deal.entryType === 'DEAL_ENTRY_INOUT';
+            if (!isTradeOpened) continue;
             if (deal.type === 'DEAL_TYPE_BALANCE') continue;
 
             const isWin = (deal.profit || 0) > 0;
@@ -571,13 +571,29 @@ app.get('/status/:userId', async (req, res) => {
         checkDailyReset(user, localDate);
         checkWeeklyTokenReset(user);
 
-        // On server restart, reload persisted token count from Supabase
+        // On server restart, reload all persisted state from Supabase
         if (isNewUser) {
             const storedTokens = await getStoredTokens(userId);
             if (storedTokens !== null) {
                 user.emergencyTokens = storedTokens;
                 console.log(`Server restart: restored ${storedTokens} tokens for ${userId}`);
             }
+
+            const { data: purchase } = await supabase
+                .from('purchases')
+                .select('meta_api_account_id, mt5_server, mt5_login, max_trades, count_winning_trades')
+                .eq('license_code', userId)
+                .maybeSingle();
+
+            if (purchase?.meta_api_account_id) {
+                user.metaApiAccountId = purchase.meta_api_account_id;
+                user.mt5Server = purchase.mt5_server;
+                user.mt5Login = purchase.mt5_login;
+                user.mt5Connected = true;
+                console.log(`Server restart: restored MT5 connection for ${userId}`);
+            }
+            if (purchase?.max_trades) user.maxTrades = purchase.max_trades;
+            if (purchase?.count_winning_trades !== undefined) user.countWinningTrades = purchase.count_winning_trades;
         }
 
         res.json({
