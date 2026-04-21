@@ -80,6 +80,14 @@ async function saveTokens(licenseCode, tokens) {
         .eq('license_code', licenseCode);
 }
 
+async function saveDailyTrades(userId, count, dateStr) {
+    await supabase
+        .from('purchases')
+        .update({ daily_trades_count: count, daily_trades_date: dateStr })
+        .eq('user_id', userId);
+}
+
+
 // =====================
 // APNs setup
 // =====================
@@ -257,7 +265,7 @@ function initUser(userId) {
             isLocked: false,
             emergencyUnlocked: false,
             emergencyTokens: DEFAULT_TOKENS,
-            lastReset: new Date().toDateString(),
+            lastReset: new Date().toISOString().split('T')[0],
             lastTokenReset: new Date().toISOString(),
             maxTrades: 1,
             countWinningTrades: false,
@@ -275,7 +283,7 @@ function initUser(userId) {
 
 function checkDailyReset(user, localDateStr) {
     // Use the client's local date if provided (so reset happens at user's local midnight)
-    const today = localDateStr || new Date().toDateString();
+    const today = localDateStr || new Date().toISOString().split('T')[0];
     if (user.lastReset !== today) {
         user.tradesCount = 0;
         user.isLocked = false;
@@ -334,7 +342,7 @@ async function checkUserTrades(userId) {
     if (!user.mt5Connected) { console.log(`[trades] ${userId.slice(0,8)}: mt5Connected=false, skipping`); return; }
     if (!user.metaApiAccountId) { console.log(`[trades] ${userId.slice(0,8)}: no metaApiAccountId, skipping`); return; }
 
-    checkDailyReset(user);
+    checkDailyReset(user, new Date().toISOString().split('T')[0]);
 
     try {
         const accountInfo = await getMetaApiAccountInfo(user.metaApiAccountId);
@@ -384,15 +392,25 @@ async function checkUserTrades(userId) {
         for (const deal of deals) {
             if (user.processedDealIds.has(deal.id)) continue;
 
-            const isTradeOpened = deal.entryType === 'DEAL_ENTRY_IN' || deal.entryType === 'DEAL_ENTRY_INOUT';
-            if (!isTradeOpened) continue;
+            // Count on close only (DEAL_ENTRY_OUT closes an existing position,
+            // DEAL_ENTRY_INOUT closes and immediately reverses in one step)
+            const isTradeClose = deal.entryType === 'DEAL_ENTRY_OUT' || deal.entryType === 'DEAL_ENTRY_INOUT';
+            if (!isTradeClose) continue;
+
+            // Balance/deposit entries are never real trades
             if (deal.type === 'DEAL_TYPE_BALANCE') continue;
+
+            // When countWinningTrades is enabled, skip breakeven and losing closes
+            if (user.countWinningTrades && (deal.profit === undefined || deal.profit <= 0)) continue;
 
             user.processedDealIds.add(deal.id);
             user.tradesCount++;
             newTradesDetected = true;
 
-            console.log(`User ${userId}: trade counted. Total: ${user.tradesCount}/${user.maxTrades} (deal ${deal.id})`);
+            // Persist updated count to Supabase so a server restart doesn't reset it mid-day
+            saveDailyTrades(userId, user.tradesCount, user.lastReset).catch(() => {});
+
+            console.log(`User ${userId}: trade close counted. Total: ${user.tradesCount}/${user.maxTrades} (deal ${deal.id} profit=${deal.profit})`);
         }
 
         if (newTradesDetected && user.tradesCount >= user.maxTrades && !user.isLocked) {
@@ -545,7 +563,13 @@ app.post('/connect-mt5/:userId', mt5Limiter, async (req, res) => {
         userStates[userId].mt5Server = server;
         userStates[userId].mt5Login = String(login);
         userStates[userId].mt5Connected = true;
-        userStates[userId].processedDealIds = new Set();
+        // Only clear the processed-deal log when switching to a different account.
+        // Keeping it for same-account reconnects prevents today's closes from being double-counted.
+        if (!isSameAccount) {
+            userStates[userId].processedDealIds = new Set();
+            userStates[userId].tradesCount = 0;
+            saveDailyTrades(userId, 0, userStates[userId].lastReset).catch(() => {});
+        }
         if (accountRegion) userStates[userId].mt5Region = accountRegion;
         console.log(`MT5 connected for user ${userId.slice(0,8)}: accountId=${accountId} region=${accountRegion || 'unknown (will detect on first poll)'}`);
 
@@ -614,7 +638,7 @@ app.get('/status/:userId', async (req, res) => {
 
             const { data: purchase } = await supabase
                 .from('purchases')
-                .select('meta_api_account_id, mt5_server, mt5_login, max_trades, count_winning_trades')
+                .select('meta_api_account_id, mt5_server, mt5_login, max_trades, count_winning_trades, daily_trades_count, daily_trades_date')
                 .eq('user_id', userId)
                 .maybeSingle();
 
@@ -633,6 +657,19 @@ app.get('/status/:userId', async (req, res) => {
             }
             if (purchase?.max_trades) user.maxTrades = purchase.max_trades;
             if (purchase?.count_winning_trades !== undefined) user.countWinningTrades = purchase.count_winning_trades;
+
+            // Restore today's trade count so a server restart can't be abused to reset the lock.
+            // Only restore when the stored date matches today (a new day means a legitimate reset).
+            const todayISO = localDate || new Date().toISOString().split('T')[0];
+            if (purchase?.daily_trades_date === todayISO && purchase?.daily_trades_count > 0) {
+                user.tradesCount = purchase.daily_trades_count;
+                user.lastReset = todayISO;
+                // Re-apply lock if limit was already hit
+                if (user.tradesCount >= user.maxTrades) {
+                    user.isLocked = true;
+                }
+                console.log(`Server restart: restored ${purchase.daily_trades_count} trades for ${userId} (date: ${todayISO})`);
+            }
         }
 
         res.json({
