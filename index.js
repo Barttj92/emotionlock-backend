@@ -196,7 +196,11 @@ async function getMetaApiAccountInfo(accountId) {
     const response = await fetch(`${PROVISIONING_API}/users/current/accounts/${accountId}`, {
         headers: { 'auth-token': METAAPI_TOKEN }
     });
-    if (!response.ok) return null;
+    if (!response.ok) {
+        const errText = await response.text();
+        console.log(`[metaapi] getAccountInfo HTTP ${response.status} for ${accountId}: ${errText.slice(0, 200)}`);
+        return null;
+    }
     return response.json();
 }
 
@@ -206,10 +210,19 @@ async function getDeals(accountId, region, fromTime, toTime) {
         const response = await fetch(url, {
             headers: { 'auth-token': METAAPI_TOKEN }
         });
-        if (!response.ok) return [];
+        if (!response.ok) {
+            const errText = await response.text();
+            console.log(`[getDeals] HTTP ${response.status} for account ${accountId} region ${region}: ${errText.slice(0, 200)}`);
+            return [];
+        }
         const data = await response.json();
-        return Array.isArray(data) ? data : [];
+        if (!Array.isArray(data)) {
+            console.log(`[getDeals] Unexpected response format for account ${accountId}:`, JSON.stringify(data).slice(0, 200));
+            return [];
+        }
+        return data;
     } catch (e) {
+        console.log(`[getDeals] Fetch error for account ${accountId}: ${e.message}`);
         return [];
     }
 }
@@ -317,14 +330,16 @@ function checkWeeklyTokenReset(user) {
 // =====================
 async function checkUserTrades(userId) {
     const user = userStates[userId];
-    if (!user || !user.mt5Connected || !user.metaApiAccountId) return;
+    if (!user) return;
+    if (!user.mt5Connected) { console.log(`[trades] ${userId.slice(0,8)}: mt5Connected=false, skipping`); return; }
+    if (!user.metaApiAccountId) { console.log(`[trades] ${userId.slice(0,8)}: no metaApiAccountId, skipping`); return; }
 
     checkDailyReset(user);
 
     try {
         const accountInfo = await getMetaApiAccountInfo(user.metaApiAccountId);
         if (!accountInfo) {
-            debugLog(`User ${userId}: MetaApi account not found`);
+            console.log(`[trades] ${userId.slice(0,8)}: MetaApi account not found (id: ${user.metaApiAccountId})`);
             return;
         }
 
@@ -333,10 +348,9 @@ async function checkUserTrades(userId) {
         const isReady = accountInfo.state === 'DEPLOYED' &&
             (accountInfo.connectionStatus === 'CONNECTED' || accountInfo.connectionStatus === 'SYNCHRONIZING');
 
-        if (!isReady) {
-            debugLog(`User ${userId}: account not ready yet (${accountInfo.state} / ${accountInfo.connectionStatus})`);
-            return;
-        }
+        console.log(`[trades] ${userId.slice(0,8)}: state=${accountInfo.state} status=${accountInfo.connectionStatus} region=${user.mt5Region} ready=${isReady}`);
+
+        if (!isReady) return;
 
         // Incremental fetch: only pull deals since last successful check (with 60s overlap for safety).
         // Falls back to today-midnight on first run or after a daily reset.
@@ -360,6 +374,11 @@ async function checkUserTrades(userId) {
 
         const deals = await getDeals(user.metaApiAccountId, user.mt5Region, fromTime, toTime);
 
+        console.log(`[trades] ${userId.slice(0,8)}: fetched ${deals.length} deals from ${fromTime} to ${toTime}`);
+        if (deals.length > 0) {
+            console.log(`[trades] ${userId.slice(0,8)}: deal types:`, deals.map(d => `${d.id} ${d.entryType} ${d.type} profit=${d.profit}`).join(' | '));
+        }
+
         let newTradesDetected = false;
 
         for (const deal of deals) {
@@ -369,17 +388,11 @@ async function checkUserTrades(userId) {
             if (!isTradeOpened) continue;
             if (deal.type === 'DEAL_TYPE_BALANCE') continue;
 
-            const isWin = (deal.profit || 0) > 0;
-            if (!user.countWinningTrades && isWin) {
-                user.processedDealIds.add(deal.id);
-                continue;
-            }
-
             user.processedDealIds.add(deal.id);
             user.tradesCount++;
             newTradesDetected = true;
 
-            debugLog(`User ${userId}: trade counted. Total: ${user.tradesCount}/${user.maxTrades}`);
+            console.log(`User ${userId}: trade counted. Total: ${user.tradesCount}/${user.maxTrades} (deal ${deal.id})`);
         }
 
         if (newTradesDetected && user.tradesCount >= user.maxTrades && !user.isLocked) {
@@ -503,11 +516,15 @@ app.post('/connect-mt5/:userId', mt5Limiter, async (req, res) => {
             savedAccount?.mt5_login === String(login);
 
         let accountId;
+        let accountRegion = null;
         if (isSameAccount) {
             // Same server + login: redeploy the existing account, no new account needed
             console.log(`Reusing existing MetaAPI account for user ${userId}`);
             accountId = existingMetaApiId;
             await deployMetaApiAccount(accountId);
+            // Fetch info to get region
+            const info = await getMetaApiAccountInfo(accountId);
+            if (info?.region) accountRegion = info.region;
         } else {
             // Different account: delete old (if any), create new
             if (existingMetaApiId) {
@@ -520,6 +537,7 @@ app.post('/connect-mt5/:userId', mt5Limiter, async (req, res) => {
             console.log(`Creating new MetaAPI account for user ${userId} on ${server}...`);
             const account = await createMetaApiAccount(server, String(login), password, `EmotionLock-${userId}`);
             accountId = account.id;
+            if (account.region) accountRegion = account.region;
             await deployMetaApiAccount(accountId);
         }
 
@@ -528,6 +546,8 @@ app.post('/connect-mt5/:userId', mt5Limiter, async (req, res) => {
         userStates[userId].mt5Login = String(login);
         userStates[userId].mt5Connected = true;
         userStates[userId].processedDealIds = new Set();
+        if (accountRegion) userStates[userId].mt5Region = accountRegion;
+        console.log(`MT5 connected for user ${userId.slice(0,8)}: accountId=${accountId} region=${accountRegion || 'unknown (will detect on first poll)'}`);
 
         // Persist MT5 connection to Supabase so it survives server restarts
         await supabase.from('purchases').update({
@@ -713,6 +733,54 @@ app.post('/register-device/:userId', (req, res) => {
 // Token purchases removed — emergency tokens are free (2 per week, included with subscription)
 app.post('/add-tokens-iap/:userId', (req, res) => {
     res.status(410).json({ error: 'Token purchases are no longer available.' });
+});
+
+// Admin: inspect live user state (trade counting debug)
+app.get('/admin/user-state/:userId', async (req, res) => {
+    const adminKey = req.headers['x-admin-key'];
+    if (!isValidAdminKey(adminKey)) return res.status(401).json({ error: 'Unauthorized' });
+
+    const { userId } = req.params;
+    const user = userStates[userId];
+    if (!user) return res.json({ exists: false, knownUsers: Object.keys(userStates).map(k => k.slice(0, 8)) });
+
+    // Also fetch live MetaAPI account info
+    let accountInfo = null;
+    if (user.metaApiAccountId) {
+        accountInfo = await getMetaApiAccountInfo(user.metaApiAccountId).catch(() => null);
+    }
+
+    res.json({
+        exists: true,
+        mt5Connected: user.mt5Connected,
+        metaApiAccountId: user.metaApiAccountId,
+        mt5Region: user.mt5Region,
+        mt5Server: user.mt5Server,
+        mt5Login: user.mt5Login,
+        tradesCount: user.tradesCount,
+        maxTrades: user.maxTrades,
+        isLocked: user.isLocked,
+        lastDealCheck: user.lastDealCheck,
+        processedDealIds: [...(user.processedDealIds || [])],
+        metaApiAccountInfo: accountInfo ? {
+            state: accountInfo.state,
+            connectionStatus: accountInfo.connectionStatus,
+            region: accountInfo.region,
+        } : null,
+    });
+});
+
+// Admin: manually trigger trade check for a user
+app.post('/admin/check-trades/:userId', async (req, res) => {
+    const adminKey = req.headers['x-admin-key'];
+    if (!isValidAdminKey(adminKey)) return res.status(401).json({ error: 'Unauthorized' });
+
+    const { userId } = req.params;
+    if (!userStates[userId]) return res.status(404).json({ error: 'User not in memory' });
+
+    await checkUserTrades(userId);
+    const user = userStates[userId];
+    res.json({ tradesCount: user.tradesCount, isLocked: user.isLocked, lastDealCheck: user.lastDealCheck });
 });
 
 // Admin: generate (or register) license code (called by website after purchase)
