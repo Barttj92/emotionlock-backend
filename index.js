@@ -742,12 +742,33 @@ app.post('/settings/:userId', (req, res) => {
             initUser(userId);
         }
         const user = userStates[userId];
+
         if (maxTrades !== undefined) {
+            // Increasing the limit while locked effectively acts as an emergency unlock.
+            // Require a token, and refuse when none are left.
+            const wouldUnlock = user.isLocked && maxTrades > user.tradesCount;
+            if (wouldUnlock) {
+                checkWeeklyTokenReset(user);
+                if (user.emergencyTokens <= 0) {
+                    return res.status(400).json({
+                        error: 'no_tokens',
+                        message: 'No emergency tokens left. You cannot raise your limit while locked.',
+                        isLocked: user.isLocked,
+                        emergencyTokens: user.emergencyTokens,
+                    });
+                }
+                user.emergencyTokens -= 1;
+                user.isLocked = false;
+                user.emergencyUnlocked = true;
+                saveTokens(userId, user.emergencyTokens).catch(() => {});
+                debugLog(`User ${userId}: limit raised while locked, token used. Tokens left: ${user.emergencyTokens}`);
+            }
             user.maxTrades = maxTrades;
         }
+
         if (countWinningTrades !== undefined) user.countWinningTrades = countWinningTrades;
 
-        // Re-evaluate lock state: if trades >= new maxTrades and not emergency-unlocked → lock
+        // Re-lock if still over the (possibly new) limit
         if (user.tradesCount >= user.maxTrades && !user.emergencyUnlocked) {
             user.isLocked = true;
         }
@@ -758,7 +779,14 @@ app.post('/settings/:userId', (req, res) => {
             count_winning_trades: user.countWinningTrades,
         }).eq('user_id', userId).then(() => {}).catch(() => {});
 
-        res.json({ success: true, maxTrades: user.maxTrades, countWinningTrades: user.countWinningTrades, isLocked: user.isLocked });
+        res.json({
+            success: true,
+            maxTrades: user.maxTrades,
+            countWinningTrades: user.countWinningTrades,
+            isLocked: user.isLocked,
+            emergencyTokens: user.emergencyTokens,
+            emergencyUnlocked: user.emergencyUnlocked,
+        });
     } catch (err) {
         console.error(`Settings error for ${req.params.userId}:`, err.message);
         res.status(500).json({ error: 'Failed to update settings.' });
