@@ -542,9 +542,13 @@ app.post('/connect-mt5/:userId', mt5Limiter, async (req, res) => {
             .maybeSingle();
 
         const existingMetaApiId = savedAccount?.meta_api_account_id || userStates[userId].metaApiAccountId;
+        // Fall back to in-memory state when the Supabase row isn't populated yet.
+        // Without this, every reconnect creates a new MetaAPI account.
+        const existingServer = savedAccount?.mt5_server ?? userStates[userId].mt5Server;
+        const existingLogin  = savedAccount?.mt5_login  ?? userStates[userId].mt5Login;
         const isSameAccount = existingMetaApiId &&
-            savedAccount?.mt5_server === server &&
-            savedAccount?.mt5_login === String(login);
+            existingServer?.trim() === server.trim() &&
+            existingLogin === String(login);
 
         let accountId;
         let accountRegion = null;
@@ -587,11 +591,12 @@ app.post('/connect-mt5/:userId', mt5Limiter, async (req, res) => {
         console.log(`MT5 connected for user ${userId.slice(0,8)}: accountId=${accountId} region=${accountRegion || 'unknown (will detect on first poll)'}`);
 
         // Persist MT5 connection to Supabase so it survives server restarts
-        await supabase.from('purchases').update({
+        const { error: mt5SaveErr } = await supabase.from('purchases').update({
             meta_api_account_id: accountId,
             mt5_server: server,
             mt5_login: String(login),
         }).eq('user_id', userId);
+        if (mt5SaveErr) console.error(`Failed to persist MT5 for ${userId}:`, mt5SaveErr.message);
 
         debugLog(`MT5 connected for user ${userId}`);
         res.json({
@@ -839,6 +844,45 @@ app.post('/admin/check-trades/:userId', async (req, res) => {
     await checkUserTrades(userId);
     const user = userStates[userId];
     res.json({ tradesCount: user.tradesCount, isLocked: user.isLocked, lastDealCheck: user.lastDealCheck });
+});
+
+// Admin: list all MetaAPI accounts for cleanup inspection
+app.get('/admin/metaapi-accounts', async (req, res) => {
+    const adminKey = req.headers['x-admin-key'];
+    if (!isValidAdminKey(adminKey)) return res.status(401).json({ error: 'Unauthorized' });
+
+    try {
+        const response = await fetch(`${PROVISIONING_API}/users/current/accounts`, {
+            headers: { 'auth-token': METAAPI_TOKEN }
+        });
+        if (!response.ok) return res.status(500).json({ error: 'MetaAPI request failed' });
+        const accounts = await response.json();
+        res.json(accounts.map(a => ({
+            id: a.id,
+            name: a.name,
+            login: a.login,
+            server: a.server,
+            state: a.state,
+            connectionStatus: a.connectionStatus,
+            region: a.region,
+        })));
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// Admin: delete a specific MetaAPI account by id
+app.delete('/admin/metaapi-accounts/:accountId', async (req, res) => {
+    const adminKey = req.headers['x-admin-key'];
+    if (!isValidAdminKey(adminKey)) return res.status(401).json({ error: 'Unauthorized' });
+
+    const { accountId } = req.params;
+    try {
+        await undeployAndDeleteMetaApiAccount(accountId);
+        res.json({ success: true, deleted: accountId });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
 });
 
 // Admin: generate (or register) license code (called by website after purchase)
