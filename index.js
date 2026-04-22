@@ -654,41 +654,57 @@ app.get('/status/:userId', async (req, res) => {
         checkDailyReset(user, localDate);
         checkWeeklyTokenReset(user);
 
-        // On server restart, reload all persisted state from Supabase
+        // On first contact or server restart, sync state with Supabase
         if (isNewUser) {
-            const storedTokens = await getStoredTokens(userId);
-            if (storedTokens !== null) {
-                user.emergencyTokens = storedTokens;
-                console.log(`Server restart: restored ${storedTokens} tokens for ${userId}`);
-            }
-
             // Two separate queries so a missing column never blocks MT5 restoration.
             const { data: purchase, error: purchaseErr } = await supabase
                 .from('purchases')
-                .select('meta_api_account_id, mt5_server, mt5_login, max_trades, count_winning_trades')
+                .select('meta_api_account_id, mt5_server, mt5_login, max_trades, count_winning_trades, emergency_tokens_remaining')
                 .eq('user_id', userId)
                 .maybeSingle();
 
             if (purchaseErr) {
-                console.error(`Server restart: failed to load purchase for ${userId}:`, purchaseErr.message);
+                console.error(`[status] Supabase query failed for ${userId}:`, purchaseErr.message);
+            }
+
+            if (!purchase && !purchaseErr) {
+                // No row exists yet for this userId. This happens for every new Apple IAP customer
+                // because purchases rows are not automatically created on first use.
+                // Create one now so all subsequent MT5, settings, and trade-count saves land correctly.
+                const { error: createErr } = await supabase
+                    .from('purchases')
+                    .insert({
+                        user_id: userId,
+                        emergency_tokens_remaining: DEFAULT_TOKENS,
+                        daily_trades_count: 0,
+                    });
+                if (createErr) {
+                    console.error(`[status] Could not create purchases row for ${userId}:`, createErr.message);
+                } else {
+                    console.log(`[status] Auto-created purchases row for new user ${userId}`);
+                }
+            }
+
+            if (purchase?.emergency_tokens_remaining != null) {
+                user.emergencyTokens = purchase.emergency_tokens_remaining;
             }
 
             if (purchase?.meta_api_account_id) {
                 user.metaApiAccountId = purchase.meta_api_account_id;
-                if (purchase?.mt5_server) {
+                if (purchase.mt5_server) {
                     user.mt5Server = purchase.mt5_server;
                     user.mt5Login = purchase.mt5_login;
                     user.mt5Connected = true;
-                    console.log(`Server restart: restored MT5 connection for ${userId}`);
+                    console.log(`[status] Restored MT5 connection for ${userId}`);
                     deployMetaApiAccount(purchase.meta_api_account_id).catch(e =>
-                        console.log(`Redeploy after restart warning for ${userId}:`, e.message)
+                        console.log(`[status] Redeploy warning for ${userId}:`, e.message)
                     );
                 }
             }
             if (purchase?.max_trades) user.maxTrades = purchase.max_trades;
             if (purchase?.count_winning_trades !== undefined) user.countWinningTrades = purchase.count_winning_trades;
 
-            // Restore today's trade count (separate query — new columns, non-critical).
+            // Restore today's trade count (separate query — daily_trades columns added later).
             const todayISO = localDate || new Date().toISOString().split('T')[0];
             const { data: tradeData } = await supabase
                 .from('purchases')
@@ -702,7 +718,7 @@ app.get('/status/:userId', async (req, res) => {
                 if (user.tradesCount >= user.maxTrades) {
                     user.isLocked = true;
                 }
-                console.log(`Server restart: restored ${tradeData.daily_trades_count} trades for ${userId} (date: ${todayISO})`);
+                console.log(`[status] Restored ${tradeData.daily_trades_count} trades for ${userId} (date: ${todayISO})`);
             }
         }
 
