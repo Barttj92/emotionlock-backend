@@ -80,6 +80,14 @@ async function saveTokens(licenseCode, tokens) {
         .eq('license_code', licenseCode);
 }
 
+// UUID-based save — used for all Apple IAP users (the standard flow)
+async function saveTokensByUserId(userId, tokens) {
+    await supabase
+        .from('purchases')
+        .update({ emergency_tokens_remaining: tokens })
+        .eq('user_id', userId);
+}
+
 async function saveDailyTrades(userId, count, dateStr) {
     await supabase
         .from('purchases')
@@ -322,12 +330,14 @@ function shouldResetWeeklyTokens(lastTokenReset) {
     return (isResetTime && daysDiff >= 1 && wasBeforeReset) || daysDiff >= 7;
 }
 
-function checkWeeklyTokenReset(user) {
+function checkWeeklyTokenReset(user, userId) {
     if (shouldResetWeeklyTokens(user.lastTokenReset)) {
         user.emergencyTokens = DEFAULT_TOKENS;
         user.lastTokenReset = new Date().toISOString();
-        // Persist reset to Supabase (fire and forget)
-        if (user.licenseCode) {
+        // Persist reset — prefer userId (Apple IAP), fall back to licenseCode (legacy)
+        if (userId) {
+            saveTokensByUserId(userId, DEFAULT_TOKENS).catch(() => {});
+        } else if (user.licenseCode) {
             saveTokens(user.licenseCode, DEFAULT_TOKENS).catch(() => {});
         }
     }
@@ -652,7 +662,7 @@ app.get('/status/:userId', async (req, res) => {
         initUser(userId);
         const user = userStates[userId];
         checkDailyReset(user, localDate);
-        checkWeeklyTokenReset(user);
+        checkWeeklyTokenReset(user, userId);
 
         // On first contact or server restart, sync state with Supabase
         if (isNewUser) {
@@ -764,7 +774,7 @@ app.post('/settings/:userId', (req, res) => {
             // Require a token, and refuse when none are left.
             const wouldUnlock = user.isLocked && maxTrades > user.tradesCount;
             if (wouldUnlock) {
-                checkWeeklyTokenReset(user);
+                checkWeeklyTokenReset(user, userId);
                 if (user.emergencyTokens <= 0) {
                     return res.status(400).json({
                         error: 'no_tokens',
@@ -776,7 +786,7 @@ app.post('/settings/:userId', (req, res) => {
                 user.emergencyTokens -= 1;
                 user.isLocked = false;
                 user.emergencyUnlocked = true;
-                saveTokens(userId, user.emergencyTokens).catch(() => {});
+                saveTokensByUserId(userId, user.emergencyTokens).catch(() => {});
                 debugLog(`User ${userId}: limit raised while locked, token used. Tokens left: ${user.emergencyTokens}`);
             }
             user.maxTrades = maxTrades;
@@ -817,7 +827,7 @@ app.post('/unlock/:userId', unlockLimiter, async (req, res) => {
             return res.status(404).json({ error: 'User not found. Open the app first.' });
         }
         const user = userStates[userId];
-        checkWeeklyTokenReset(user);
+        checkWeeklyTokenReset(user, userId);
         if (user.emergencyTokens <= 0) {
             return res.status(400).json({ error: 'No tokens available' });
         }
@@ -825,7 +835,7 @@ app.post('/unlock/:userId', unlockLimiter, async (req, res) => {
         user.isLocked = false;
         user.emergencyTokens -= 1;
         // Persist new token count to Supabase so server restarts don't reset it
-        await saveTokens(userId, user.emergencyTokens);
+        await saveTokensByUserId(userId, user.emergencyTokens);
         debugLog(`User ${userId}: emergency unlock. tradesCount: ${user.tradesCount}, tokens left: ${user.emergencyTokens}`);
         res.json({ success: true, isLocked: false, tradesCount: user.tradesCount, emergencyTokens: user.emergencyTokens });
     } catch (err) {
