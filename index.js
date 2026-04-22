@@ -319,7 +319,11 @@ function getAmsterdamDayHour(date) {
 }
 
 function shouldResetWeeklyTokens(lastTokenReset) {
-    if (!lastTokenReset) return true;
+    // If we have no record of the last reset (e.g. after a server restart),
+    // do NOT reset. initUser already starts with DEFAULT_TOKENS and the real
+    // value is loaded from Supabase in the isNewUser block that follows.
+    // Returning true here would overwrite Supabase with 2 before the restore runs.
+    if (!lastTokenReset) return false;
     const now = new Date();
     const last = new Date(lastTokenReset);
     const nowAms = getAmsterdamDayHour(now);
@@ -662,9 +666,10 @@ app.get('/status/:userId', async (req, res) => {
         initUser(userId);
         const user = userStates[userId];
         checkDailyReset(user, localDate);
-        checkWeeklyTokenReset(user, userId);
 
-        // On first contact or server restart, sync state with Supabase
+        // On first contact or server restart, sync state with Supabase.
+        // checkWeeklyTokenReset runs AFTER this block so it sees the correct
+        // persisted token count, not the default value from initUser.
         if (isNewUser) {
             // Two separate queries so a missing column never blocks MT5 restoration.
             const { data: purchase, error: purchaseErr } = await supabase
@@ -731,6 +736,10 @@ app.get('/status/:userId', async (req, res) => {
                 console.log(`[status] Restored ${tradeData.daily_trades_count} trades for ${userId} (date: ${todayISO})`);
             }
         }
+
+        // Run weekly reset after Supabase restore so we compare against the real
+        // persisted token count, not the initUser default.
+        checkWeeklyTokenReset(user, userId);
 
         res.json({
             tradesCount: user.tradesCount,
