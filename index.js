@@ -649,11 +649,16 @@ app.get('/status/:userId', async (req, res) => {
                 console.log(`Server restart: restored ${storedTokens} tokens for ${userId}`);
             }
 
-            const { data: purchase } = await supabase
+            // Two separate queries so a missing column never blocks MT5 restoration.
+            const { data: purchase, error: purchaseErr } = await supabase
                 .from('purchases')
-                .select('meta_api_account_id, mt5_server, mt5_login, max_trades, count_winning_trades, daily_trades_count, daily_trades_date')
+                .select('meta_api_account_id, mt5_server, mt5_login, max_trades, count_winning_trades')
                 .eq('user_id', userId)
                 .maybeSingle();
+
+            if (purchaseErr) {
+                console.error(`Server restart: failed to load purchase for ${userId}:`, purchaseErr.message);
+            }
 
             if (purchase?.meta_api_account_id) {
                 user.metaApiAccountId = purchase.meta_api_account_id;
@@ -662,7 +667,6 @@ app.get('/status/:userId', async (req, res) => {
                     user.mt5Login = purchase.mt5_login;
                     user.mt5Connected = true;
                     console.log(`Server restart: restored MT5 connection for ${userId}`);
-                    // Ensure the MetaAPI account is deployed after restart (fire-and-forget)
                     deployMetaApiAccount(purchase.meta_api_account_id).catch(e =>
                         console.log(`Redeploy after restart warning for ${userId}:`, e.message)
                     );
@@ -671,17 +675,21 @@ app.get('/status/:userId', async (req, res) => {
             if (purchase?.max_trades) user.maxTrades = purchase.max_trades;
             if (purchase?.count_winning_trades !== undefined) user.countWinningTrades = purchase.count_winning_trades;
 
-            // Restore today's trade count so a server restart can't be abused to reset the lock.
-            // Only restore when the stored date matches today (a new day means a legitimate reset).
+            // Restore today's trade count (separate query — new columns, non-critical).
             const todayISO = localDate || new Date().toISOString().split('T')[0];
-            if (purchase?.daily_trades_date === todayISO && purchase?.daily_trades_count > 0) {
-                user.tradesCount = purchase.daily_trades_count;
+            const { data: tradeData } = await supabase
+                .from('purchases')
+                .select('daily_trades_count, daily_trades_date')
+                .eq('user_id', userId)
+                .maybeSingle();
+
+            if (tradeData?.daily_trades_date === todayISO && tradeData?.daily_trades_count > 0) {
+                user.tradesCount = tradeData.daily_trades_count;
                 user.lastReset = todayISO;
-                // Re-apply lock if limit was already hit
                 if (user.tradesCount >= user.maxTrades) {
                     user.isLocked = true;
                 }
-                console.log(`Server restart: restored ${purchase.daily_trades_count} trades for ${userId} (date: ${todayISO})`);
+                console.log(`Server restart: restored ${tradeData.daily_trades_count} trades for ${userId} (date: ${todayISO})`);
             }
         }
 
