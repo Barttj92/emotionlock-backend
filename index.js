@@ -769,35 +769,37 @@ app.post('/settings/:userId', (req, res) => {
         }
         const user = userStates[userId];
 
-        if (maxTrades !== undefined) {
-            // Increasing the limit while locked effectively acts as an emergency unlock.
-            // Require a token, and refuse when none are left.
-            const wouldUnlock = user.isLocked && maxTrades > user.tradesCount;
-            if (wouldUnlock) {
-                checkWeeklyTokenReset(user, userId);
-                if (user.emergencyTokens <= 0) {
-                    return res.status(400).json({
-                        error: 'no_tokens',
-                        message: 'No emergency tokens left. You cannot raise your limit while locked.',
-                        isLocked: user.isLocked,
-                        emergencyTokens: user.emergencyTokens,
-                    });
-                }
-                user.emergencyTokens -= 1;
+        if (maxTrades !== undefined && maxTrades !== user.maxTrades) {
+            // Any change to the trade limit costs 1 emergency token — up or down.
+            // This prevents gaming the system by quietly lowering the limit mid-day.
+            checkWeeklyTokenReset(user, userId);
+            if (user.emergencyTokens <= 0) {
+                return res.status(400).json({
+                    error: 'no_tokens',
+                    message: 'No emergency tokens left. You cannot change your trade limit.',
+                    isLocked: user.isLocked,
+                    emergencyTokens: user.emergencyTokens,
+                });
+            }
+            user.emergencyTokens -= 1;
+            saveTokensByUserId(userId, user.emergencyTokens).catch(() => {});
+
+            const wasLocked = user.isLocked;
+            user.maxTrades = maxTrades;
+
+            // Re-evaluate lock state after the change
+            if (user.tradesCount >= user.maxTrades) {
+                user.isLocked = true;
+                user.emergencyUnlocked = false;
+            } else if (wasLocked) {
+                // Limit raised high enough to lift the lock
                 user.isLocked = false;
                 user.emergencyUnlocked = true;
-                saveTokensByUserId(userId, user.emergencyTokens).catch(() => {});
-                debugLog(`User ${userId}: limit raised while locked, token used. Tokens left: ${user.emergencyTokens}`);
             }
-            user.maxTrades = maxTrades;
+            debugLog(`User ${userId}: maxTrades changed to ${maxTrades}, token used. Tokens left: ${user.emergencyTokens}`);
         }
 
         if (countWinningTrades !== undefined) user.countWinningTrades = countWinningTrades;
-
-        // Re-lock if still over the (possibly new) limit
-        if (user.tradesCount >= user.maxTrades && !user.emergencyUnlocked) {
-            user.isLocked = true;
-        }
 
         // Persist settings to Supabase so they survive server restarts
         supabase.from('purchases').update({
