@@ -553,13 +553,21 @@ app.post('/connect-mt5/:userId', mt5Limiter, async (req, res) => {
         let accountId;
         let accountRegion = null;
         if (isSameAccount) {
-            // Same server + login: redeploy the existing account, no new account needed
-            console.log(`Reusing existing MetaAPI account for user ${userId}`);
-            accountId = existingMetaApiId;
-            await deployMetaApiAccount(accountId);
-            // Fetch info to get region
-            const info = await getMetaApiAccountInfo(accountId);
-            if (info?.region) accountRegion = info.region;
+            // Same server + login: redeploy the existing account, no new account needed.
+            // If the account was manually deleted in MetaAPI, fall through and create a fresh one.
+            const info = await getMetaApiAccountInfo(existingMetaApiId);
+            if (info) {
+                console.log(`Reusing existing MetaAPI account for user ${userId}`);
+                accountId = existingMetaApiId;
+                await deployMetaApiAccount(accountId);
+                if (info.region) accountRegion = info.region;
+            } else {
+                console.log(`Existing MetaAPI account not found, creating new one for user ${userId}`);
+                const account = await createMetaApiAccount(server, String(login), password, `EmotionLock-${userId}`);
+                accountId = account.id;
+                if (account.region) accountRegion = account.region;
+                await deployMetaApiAccount(accountId);
+            }
         } else {
             // Different account: delete old (if any), create new
             if (existingMetaApiId) {
