@@ -781,19 +781,28 @@ app.post('/settings/:userId', (req, res) => {
         const user = userStates[userId];
 
         if (maxTrades !== undefined && maxTrades !== user.maxTrades) {
-            // Any change to the trade limit costs 1 emergency token — up or down.
-            // This prevents gaming the system by quietly lowering the limit mid-day.
-            checkWeeklyTokenReset(user, userId);
-            if (user.emergencyTokens <= 0) {
-                return res.status(400).json({
-                    error: 'no_tokens',
-                    message: 'No emergency tokens left. You cannot change your trade limit.',
-                    isLocked: user.isLocked,
-                    emergencyTokens: user.emergencyTokens,
-                });
+            // Initial setup: free when the backend still has the factory default (1),
+            // the user has no trades today, and tokens are untouched.
+            // This covers onboarding after a fresh install — not an impulsive mid-day change.
+            const isInitialSetup = user.maxTrades === 1
+                && user.tradesCount === 0
+                && user.emergencyTokens === DEFAULT_TOKENS;
+
+            if (!isInitialSetup) {
+                // Any other change to the trade limit costs 1 emergency token — up or down.
+                // This prevents gaming the system by quietly lowering the limit mid-day.
+                checkWeeklyTokenReset(user, userId);
+                if (user.emergencyTokens <= 0) {
+                    return res.status(400).json({
+                        error: 'no_tokens',
+                        message: 'No emergency tokens left. You cannot change your trade limit.',
+                        isLocked: user.isLocked,
+                        emergencyTokens: user.emergencyTokens,
+                    });
+                }
+                user.emergencyTokens -= 1;
+                saveTokensByUserId(userId, user.emergencyTokens).catch(() => {});
             }
-            user.emergencyTokens -= 1;
-            saveTokensByUserId(userId, user.emergencyTokens).catch(() => {});
 
             const wasLocked = user.isLocked;
             user.maxTrades = maxTrades;
