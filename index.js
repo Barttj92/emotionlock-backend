@@ -692,6 +692,8 @@ app.get('/status/:userId', async (req, res) => {
                         user_id: userId,
                         emergency_tokens_remaining: DEFAULT_TOKENS,
                         daily_trades_count: 0,
+                        max_trades: user.maxTrades,
+                        count_winning_trades: user.countWinningTrades,
                     });
                 if (createErr) {
                     console.error(`[status] Could not create purchases row for ${userId}:`, createErr.message);
@@ -1009,6 +1011,53 @@ app.post('/admin/add-tokens/:licenseCode', (req, res) => {
     userStates[userId].emergencyTokens = (userStates[userId].emergencyTokens || 0) + tokens;
     console.log(`Added ${tokens} emergency tokens to user ${userId} (license ${licenseCode}). Total: ${userStates[userId].emergencyTokens}`);
     res.json({ success: true, tokens: userStates[userId].emergencyTokens });
+});
+
+// Admin: list active in-memory user states (UUIDs + key fields, no passwords)
+app.get('/admin/user-states', (req, res) => {
+    const adminKey = req.headers['x-admin-key'];
+    if (!isValidAdminKey(adminKey)) return res.status(401).json({ error: 'Unauthorized' });
+
+    const states = Object.entries(userStates).map(([id, u]) => ({
+        userId: id,
+        mt5Connected: u.mt5Connected,
+        mt5Server: u.mt5Server,
+        mt5Login: u.mt5Login,
+        tradesCount: u.tradesCount,
+        maxTrades: u.maxTrades,
+        isLocked: u.isLocked,
+        emergencyTokens: u.emergencyTokens,
+        lastReset: u.lastReset,
+    }));
+    res.json({ count: states.length, users: states });
+});
+
+// Admin: patch tokens and/or maxTrades for a UUID directly in Supabase + memory
+app.post('/admin/fix-user/:userId', async (req, res) => {
+    const adminKey = req.headers['x-admin-key'];
+    if (!isValidAdminKey(adminKey)) return res.status(401).json({ error: 'Unauthorized' });
+
+    const { userId } = req.params;
+    const { tokens, maxTrades } = req.body;
+
+    const updates = {};
+    if (tokens !== undefined) updates.emergency_tokens_remaining = tokens;
+    if (maxTrades !== undefined) updates.max_trades = maxTrades;
+
+    if (Object.keys(updates).length === 0) {
+        return res.status(400).json({ error: 'Provide at least one of: tokens, maxTrades' });
+    }
+
+    const { error } = await supabase.from('purchases').update(updates).eq('user_id', userId);
+    if (error) return res.status(500).json({ error: error.message });
+
+    // Also patch in-memory state if user is active
+    if (userStates[userId]) {
+        if (tokens !== undefined) userStates[userId].emergencyTokens = tokens;
+        if (maxTrades !== undefined) userStates[userId].maxTrades = maxTrades;
+    }
+
+    res.json({ success: true, userId, applied: updates });
 });
 
 // Delete account — required by Apple App Store policy
