@@ -220,6 +220,62 @@ async function getMetaApiAccountInfo(accountId) {
     return response.json();
 }
 
+// Safety net against duplicate accounts: if Supabase row and in-memory state are
+// both missing (server restart with stale data, lost rows, etc.) we still need to
+// find any pre-existing MetaAPI account tied to this user before creating a new one.
+// Every account we create is named `EmotionLock-${userId}` and tagged 'emotionlock'
+// so we can recover by listing accounts and matching on name.
+async function findMetaApiAccountByName(name) {
+    try {
+        const response = await fetch(`${PROVISIONING_API}/users/current/accounts`, {
+            headers: { 'auth-token': METAAPI_TOKEN }
+        });
+        if (!response.ok) {
+            console.log(`[metaapi] findByName list HTTP ${response.status}`);
+            return null;
+        }
+        const accounts = await response.json();
+        if (!Array.isArray(accounts)) return null;
+        // Exact match on name. If multiple accounts somehow share a name, prefer
+        // the first one. Duplicate cleanup is a separate admin concern.
+        const match = accounts.find(a => a && a.name === name);
+        return match || null;
+    } catch (err) {
+        console.log(`[metaapi] findByName error: ${err.message}`);
+        return null;
+    }
+}
+
+// Wraps createMetaApiAccount with the safety-net check. Always called instead of
+// createMetaApiAccount directly from the connect-mt5 flow. Behavior:
+//   1. List MetaAPI accounts and look for one named `EmotionLock-${userId}`
+//   2. If found AND credentials match: redeploy and reuse (no new account)
+//   3. If found but credentials are stale: delete it, then create fresh
+//   4. If not found: create fresh
+// Returns { id, region, recovered }.
+async function createOrRecoverMetaApiAccount(server, login, password, userId) {
+    const name = `EmotionLock-${userId}`;
+    const orphan = await findMetaApiAccountByName(name);
+    if (orphan && orphan.id) {
+        const sameCreds = (orphan.server || '').trim() === server.trim() &&
+                          String(orphan.login || '') === String(login);
+        if (sameCreds) {
+            console.log(`[metaapi] Recovered orphan account ${orphan.id} by name for user ${userId}`);
+            await deployMetaApiAccount(orphan.id);
+            return { id: orphan.id, region: orphan.region || null, recovered: true };
+        }
+        console.log(`[metaapi] Stale orphan account ${orphan.id} for user ${userId}, deleting before create`);
+        try {
+            await undeployAndDeleteMetaApiAccount(orphan.id);
+        } catch (e) {
+            console.log('Orphan cleanup warning:', e.message);
+        }
+    }
+    const account = await createMetaApiAccount(server, String(login), password, name);
+    await deployMetaApiAccount(account.id);
+    return { id: account.id, region: account.region || null, recovered: false };
+}
+
 async function getDeals(accountId, region, fromTime, toTime) {
     const url = `https://mt-client-api-v1.${region}.agiliumtrade.ai/users/current/accounts/${accountId}/history-deals/time/${fromTime}/${toTime}`;
     try {
@@ -576,14 +632,15 @@ app.post('/connect-mt5/:userId', mt5Limiter, async (req, res) => {
                 await deployMetaApiAccount(accountId);
                 if (info.region) accountRegion = info.region;
             } else {
-                console.log(`Existing MetaAPI account not found, creating new one for user ${userId}`);
-                const account = await createMetaApiAccount(server, String(login), password, `EmotionLock-${userId}`);
-                accountId = account.id;
-                if (account.region) accountRegion = account.region;
-                await deployMetaApiAccount(accountId);
+                console.log(`Existing MetaAPI account not found, creating or recovering for user ${userId}`);
+                const result = await createOrRecoverMetaApiAccount(server, String(login), password, userId);
+                accountId = result.id;
+                accountRegion = result.region;
             }
         } else {
-            // Different account: delete old (if any), create new
+            // Different account: delete old (if any), then create or recover via safety net.
+            // The safety net protects against orphans when Supabase + in-memory are both empty
+            // (server restart with stale data) so we never create a duplicate MetaAPI account.
             if (existingMetaApiId) {
                 try {
                     await undeployAndDeleteMetaApiAccount(existingMetaApiId);
@@ -591,11 +648,10 @@ app.post('/connect-mt5/:userId', mt5Limiter, async (req, res) => {
                     console.log('Cleanup old account warning:', e.message);
                 }
             }
-            console.log(`Creating new MetaAPI account for user ${userId} on ${server}...`);
-            const account = await createMetaApiAccount(server, String(login), password, `EmotionLock-${userId}`);
-            accountId = account.id;
-            if (account.region) accountRegion = account.region;
-            await deployMetaApiAccount(accountId);
+            console.log(`Creating or recovering MetaAPI account for user ${userId} on ${server}...`);
+            const result = await createOrRecoverMetaApiAccount(server, String(login), password, userId);
+            accountId = result.id;
+            accountRegion = result.region;
         }
 
         userStates[userId].metaApiAccountId = accountId;
@@ -1067,6 +1123,87 @@ app.post('/admin/fix-user/:userId', async (req, res) => {
     }
 
     res.json({ success: true, userId, applied: updates });
+});
+
+// Reset operational state after a fresh install / re-onboarding.
+// Called by the iOS app the first time the user completes onboarding after a
+// (re)install. The Keychain userId survives app deletion (by design, for
+// license recovery), which means a re-installer would otherwise inherit stale
+// MT5 connections, tradesCount and maxTrades from their previous session.
+//
+// This endpoint resets only OPERATIONAL state. License and subscription rows
+// in Supabase are intentionally left untouched so existing entitlements
+// (mt5license + monthly) keep working without a restore flow.
+app.post('/reset-after-onboarding/:userId', async (req, res) => {
+    const { userId } = req.params;
+    if (!userId) return res.status(400).json({ error: 'Missing userId' });
+
+    // Validate body. maxTrades is required so the caller's onboarding choice
+    // becomes the authoritative limit. countWinningTrades is optional and
+    // falls back to false (the safer default).
+    const rawMax = req.body?.maxTrades;
+    const maxTrades = Number.isInteger(rawMax) ? rawMax : parseInt(rawMax, 10);
+    if (!Number.isFinite(maxTrades) || maxTrades < 1 || maxTrades > 50) {
+        return res.status(400).json({ error: 'maxTrades must be an integer between 1 and 50' });
+    }
+    const countWinningTrades = req.body?.countWinningTrades === true;
+
+    try {
+        // 1) Tear down any existing MetaAPI account so we don't pay for an
+        //    orphan. Use full delete (not just undeploy) since the user is
+        //    starting fresh and may pick a different broker.
+        const existing = userStates[userId];
+        if (existing?.metaApiAccountId) {
+            try {
+                await undeployAndDeleteMetaApiAccount(existing.metaApiAccountId);
+            } catch (e) {
+                console.log(`MT5 cleanup on reset for ${userId}:`, e.message);
+            }
+        }
+
+        // 2) Reset in-memory state to a clean slate. Re-init via initUser so we
+        //    get the same shape any other endpoint expects, then overwrite the
+        //    user-supplied fields.
+        delete userStates[userId];
+        initUser(userId);
+        const user = userStates[userId];
+        user.maxTrades = maxTrades;
+        user.countWinningTrades = countWinningTrades;
+        user.emergencyTokens = DEFAULT_TOKENS;
+        user.lastTokenReset = new Date().toISOString();
+
+        // 3) Persist the operational columns in Supabase. License/subscription
+        //    columns (has_license, etc.) are intentionally NOT touched.
+        const { error } = await supabase.from('purchases').update({
+            meta_api_account_id: null,
+            mt5_server: null,
+            mt5_login: null,
+            max_trades: maxTrades,
+            count_winning_trades: countWinningTrades,
+            emergency_tokens_remaining: DEFAULT_TOKENS,
+        }).eq('user_id', userId);
+
+        if (error) {
+            console.error(`Reset Supabase update failed for ${userId}:`, error.message);
+            // Don't fail the whole request — in-memory state is already correct
+            // and the next /status poll will re-persist what it can.
+        }
+
+        console.log(`Reset after onboarding for ${userId}: maxTrades=${maxTrades}, countWinningTrades=${countWinningTrades}`);
+        res.json({
+            success: true,
+            userId,
+            maxTrades,
+            countWinningTrades,
+            emergencyTokens: DEFAULT_TOKENS,
+            tradesCount: 0,
+            isLocked: false,
+            mt5Connected: false,
+        });
+    } catch (err) {
+        console.error(`Reset after onboarding error for ${userId}:`, err.message);
+        res.status(500).json({ error: 'Reset failed. Please try again.' });
+    }
 });
 
 // Delete account — required by Apple App Store policy
