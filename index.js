@@ -332,7 +332,6 @@ function initUser(userId) {
             lastReset: new Date().toISOString().split('T')[0],
             lastTokenReset: new Date().toISOString(),
             maxTrades: 1,
-            countWinningTrades: false,
             deviceToken: null,
             metaApiAccountId: null,
             mt5Connected: false,
@@ -340,6 +339,7 @@ function initUser(userId) {
             mt5Login: null,
             mt5Region: 'vint-hill',
             processedDealIds: new Set(),
+            todayDeals: [],
             lastDealCheck: null,
         };
     }
@@ -354,6 +354,7 @@ function checkDailyReset(user, localDateStr) {
         user.emergencyUnlocked = false;
         user.lastReset = today;
         user.processedDealIds = new Set();
+        user.todayDeals = [];
     }
 }
 
@@ -438,17 +439,27 @@ async function checkUserTrades(userId) {
 
         let fromDate;
         if (!user.lastDealCheck) {
-            // First poll after connecting or after a server restart.
-            // Seed processedDealIds with everything from the last 60s so the overlap
-            // window on the next real poll doesn't accidentally re-fetch these deals.
-            // Do NOT count any of them — history before EmotionLock connected is irrelevant.
-            const seedFrom = new Date(now.getTime() - 60 * 1000);
-            const seedDeals = await getDeals(user.metaApiAccountId, user.mt5Region, seedFrom.toISOString(), now.toISOString());
+            // First poll after connecting or server restart.
+            // Fetch all of today's deals to:
+            // 1. Seed processedDealIds so the overlap window doesn't double-count.
+            // 2. Rebuild todayDeals for the status display without incrementing tradesCount
+            //    (tradesCount was already restored from Supabase).
+            const seedDeals = await getDeals(user.metaApiAccountId, user.mt5Region, todayMidnight.toISOString(), now.toISOString());
+            user.todayDeals = [];
             for (const deal of seedDeals) {
                 user.processedDealIds.add(deal.id);
+                const isTradeClose = deal.entryType === 'DEAL_ENTRY_OUT' || deal.entryType === 'DEAL_ENTRY_INOUT';
+                if (!isTradeClose || deal.type === 'DEAL_TYPE_BALANCE') continue;
+                const direction = deal.type === 'DEAL_TYPE_SELL' ? 'Long' : 'Short';
+                user.todayDeals.push({
+                    symbol: deal.symbol || '',
+                    direction,
+                    price: deal.price ?? null,
+                    profit: deal.profit ?? null,
+                });
             }
             user.lastDealCheck = now.toISOString();
-            console.log(`[trades] ${userId.slice(0,8)}: first check — seeded ${seedDeals.length} existing deals, poll window initialized`);
+            console.log(`[trades] ${userId.slice(0,8)}: first check — seeded ${seedDeals.length} deals, rebuilt ${user.todayDeals.length} todayDeals`);
             return;
         }
 
@@ -483,12 +494,20 @@ async function checkUserTrades(userId) {
             // Balance/deposit entries are never real trades
             if (deal.type === 'DEAL_TYPE_BALANCE') continue;
 
-            // When countWinningTrades is enabled, skip breakeven and losing closes
-            if (user.countWinningTrades && (deal.profit === undefined || deal.profit <= 0)) continue;
-
             user.processedDealIds.add(deal.id);
             user.tradesCount++;
             newTradesDetected = true;
+
+            // Store trade details for today's overview in the status response.
+            // direction: closing SELL deal = was Long position, closing BUY deal = was Short.
+            const direction = deal.type === 'DEAL_TYPE_SELL' ? 'Long' : 'Short';
+            if (!user.todayDeals) user.todayDeals = [];
+            user.todayDeals.push({
+                symbol: deal.symbol || '',
+                direction,
+                price: deal.price ?? null,
+                profit: deal.profit ?? null,
+            });
 
             // Persist updated count to Supabase so a server restart doesn't reset it mid-day
             saveDailyTrades(userId, user.tradesCount, user.lastReset).catch(() => {});
@@ -558,7 +577,7 @@ app.post('/activate', async (req, res) => {
     // Restore MT5 connection from Supabase if available
     const { data: purchase } = await supabase
         .from('purchases')
-        .select('meta_api_account_id, mt5_server, mt5_login, max_trades, count_winning_trades')
+        .select('meta_api_account_id, mt5_server, mt5_login, max_trades')
         .eq('license_code', key)
         .maybeSingle();
 
@@ -572,7 +591,6 @@ app.post('/activate', async (req, res) => {
         }
     }
     if (purchase?.max_trades) userStates[key].maxTrades = purchase.max_trades;
-    if (purchase?.count_winning_trades !== undefined) userStates[key].countWinningTrades = purchase.count_winning_trades;
 
     console.log(`License activated: ${key}`);
     res.json({ success: true, userId: key });
@@ -730,7 +748,7 @@ app.get('/status/:userId', async (req, res) => {
             // Two separate queries so a missing column never blocks MT5 restoration.
             const { data: purchase, error: purchaseErr } = await supabase
                 .from('purchases')
-                .select('meta_api_account_id, mt5_server, mt5_login, max_trades, count_winning_trades, emergency_tokens_remaining')
+                .select('meta_api_account_id, mt5_server, mt5_login, max_trades, emergency_tokens_remaining')
                 .eq('user_id', userId)
                 .maybeSingle();
 
@@ -749,7 +767,6 @@ app.get('/status/:userId', async (req, res) => {
                         emergency_tokens_remaining: DEFAULT_TOKENS,
                         daily_trades_count: 0,
                         max_trades: user.maxTrades,
-                        count_winning_trades: user.countWinningTrades,
                     });
                 if (createErr) {
                     console.error(`[status] Could not create purchases row for ${userId}:`, createErr.message);
@@ -775,7 +792,6 @@ app.get('/status/:userId', async (req, res) => {
                 }
             }
             if (purchase?.max_trades) user.maxTrades = purchase.max_trades;
-            if (purchase?.count_winning_trades !== undefined) user.countWinningTrades = purchase.count_winning_trades;
 
             // Restore today's trade count (separate query — daily_trades columns added later).
             const todayISO = localDate || new Date().toISOString().split('T')[0];
@@ -808,6 +824,7 @@ app.get('/status/:userId', async (req, res) => {
             mt5Server: user.mt5Server ?? null,
             mt5Login: user.mt5Login ?? null,
             maxTrades: user.maxTrades,
+            todayDeals: user.todayDeals ?? [],
         });
     } catch (err) {
         console.error(`Status error for ${req.params.userId}:`, err.message);
@@ -816,8 +833,7 @@ app.get('/status/:userId', async (req, res) => {
 });
 
 const settingsSchema = z.object({
-    maxTrades:          z.number().int().min(1).max(10).optional(),
-    countWinningTrades: z.boolean().optional(),
+    maxTrades: z.number().int().min(1).max(10).optional(),
 });
 
 // PUBLIC ROUTE: user settings — called by iOS app. UserId is the Keychain UUID (non-guessable).
@@ -829,7 +845,7 @@ app.post('/settings/:userId', (req, res) => {
         if (!parsed.success) {
             return res.status(400).json({ error: 'Invalid input.', details: parsed.error.issues.map(i => i.message) });
         }
-        const { maxTrades, countWinningTrades } = parsed.data;
+        const { maxTrades } = parsed.data;
 
         if (!userStates[userId]) {
             initUser(userId);
@@ -875,18 +891,14 @@ app.post('/settings/:userId', (req, res) => {
             debugLog(`User ${userId}: maxTrades changed to ${maxTrades}, token used. Tokens left: ${user.emergencyTokens}`);
         }
 
-        if (countWinningTrades !== undefined) user.countWinningTrades = countWinningTrades;
-
         // Persist settings to Supabase so they survive server restarts
         supabase.from('purchases').update({
             max_trades: user.maxTrades,
-            count_winning_trades: user.countWinningTrades,
         }).eq('user_id', userId).then(() => {}).catch(() => {});
 
         res.json({
             success: true,
             maxTrades: user.maxTrades,
-            countWinningTrades: user.countWinningTrades,
             isLocked: user.isLocked,
             emergencyTokens: user.emergencyTokens,
             emergencyUnlocked: user.emergencyUnlocked,
@@ -1138,15 +1150,11 @@ app.post('/reset-after-onboarding/:userId', async (req, res) => {
     const { userId } = req.params;
     if (!userId) return res.status(400).json({ error: 'Missing userId' });
 
-    // Validate body. maxTrades is required so the caller's onboarding choice
-    // becomes the authoritative limit. countWinningTrades is optional and
-    // falls back to false (the safer default).
     const rawMax = req.body?.maxTrades;
     const maxTrades = Number.isInteger(rawMax) ? rawMax : parseInt(rawMax, 10);
     if (!Number.isFinite(maxTrades) || maxTrades < 1 || maxTrades > 50) {
         return res.status(400).json({ error: 'maxTrades must be an integer between 1 and 50' });
     }
-    const countWinningTrades = req.body?.countWinningTrades === true;
 
     try {
         // 1) Tear down any existing MetaAPI account so we don't pay for an
@@ -1168,7 +1176,6 @@ app.post('/reset-after-onboarding/:userId', async (req, res) => {
         initUser(userId);
         const user = userStates[userId];
         user.maxTrades = maxTrades;
-        user.countWinningTrades = countWinningTrades;
         user.emergencyTokens = DEFAULT_TOKENS;
         user.lastTokenReset = new Date().toISOString();
 
@@ -1179,7 +1186,6 @@ app.post('/reset-after-onboarding/:userId', async (req, res) => {
             mt5_server: null,
             mt5_login: null,
             max_trades: maxTrades,
-            count_winning_trades: countWinningTrades,
             emergency_tokens_remaining: DEFAULT_TOKENS,
         }).eq('user_id', userId);
 
@@ -1189,12 +1195,11 @@ app.post('/reset-after-onboarding/:userId', async (req, res) => {
             // and the next /status poll will re-persist what it can.
         }
 
-        console.log(`Reset after onboarding for ${userId}: maxTrades=${maxTrades}, countWinningTrades=${countWinningTrades}`);
+        console.log(`Reset after onboarding for ${userId}: maxTrades=${maxTrades}`);
         res.json({
             success: true,
             userId,
             maxTrades,
-            countWinningTrades,
             emergencyTokens: DEFAULT_TOKENS,
             tradesCount: 0,
             isLocked: false,
