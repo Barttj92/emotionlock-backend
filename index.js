@@ -358,6 +358,22 @@ function checkDailyReset(user, localDateStr) {
     }
 }
 
+// Returns the UTC Date object for midnight Amsterdam time on the given date string ("YYYY-MM-DD").
+// Determines the CET/CEST offset by sampling noon UTC on that day, which is always well
+// away from DST transition boundaries (transitions happen at 02:00 Amsterdam, i.e. 00:00/01:00 UTC).
+function getAmsterdamMidnight(dateStr) {
+    const noon = new Date(dateStr + 'T12:00:00Z');
+    const hourStr = new Intl.DateTimeFormat('en-GB', {
+        timeZone: 'Europe/Amsterdam',
+        hour: '2-digit',
+        hour12: false,
+    }).format(noon);
+    const offsetHours = parseInt(hourStr, 10) - 12; // CEST=+2, CET=+1
+    const midnight = new Date(dateStr + 'T00:00:00Z');
+    midnight.setHours(midnight.getHours() - offsetHours);
+    return midnight;
+}
+
 // Get day-of-week (0=Sun) and hour in Europe/Amsterdam, correct across CET/CEST transitions.
 // Previous implementation hardcoded UTC+1, which drifted one hour during summer time (CEST).
 function getAmsterdamDayHour(date) {
@@ -433,8 +449,8 @@ async function checkUserTrades(userId) {
 
         // Incremental fetch: only pull deals since last successful check (with 60s overlap for safety).
         // Falls back to today-midnight on first run or after a daily reset.
-        const todayMidnight = new Date();
-        todayMidnight.setHours(0, 0, 0, 0);
+        // Use Amsterdam midnight (not UTC) so the fetch window matches the daily reset boundary.
+        const todayMidnight = getAmsterdamMidnight(user.lastReset);
         const now = new Date();
 
         let fromDate;
