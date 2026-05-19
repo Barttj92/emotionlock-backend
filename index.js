@@ -1564,3 +1564,89 @@ app.get('/scout/status', (req, res) => {
         discord_note: 'Discord requires joining servers manually and setting up a bot token.',
     });
 });
+
+// =====================
+// Weekly Stats Digest
+// Sends a Monday morning email summary to the admin via Resend
+// Requires RESEND_API_KEY environment variable in Railway
+// =====================
+async function sendWeeklyStatsDigest() {
+    if (!process.env.RESEND_API_KEY) {
+        debugLog('[Digest] RESEND_API_KEY not set, skipping weekly digest.');
+        return;
+    }
+
+    try {
+        const { data: users } = await supabase.from('user_overview').select('*');
+        const { data: opps } = await supabase
+            .from('opportunities')
+            .select('*')
+            .gte('created_at', new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString());
+
+        const totalUsers      = users?.length ?? 0;
+        const activeLicense   = users?.filter(u => u.has_license).length ?? 0;
+        const activeSub       = users?.filter(u => u.has_active_subscription).length ?? 0;
+        const mt5Connected    = users?.filter(u => u.has_mt5).length ?? 0;
+        const newOpps         = opps?.length ?? 0;
+        const responded       = opps?.filter(o => o.status === 'responded').length ?? 0;
+        const pending         = newOpps - responded;
+
+        const dateStr = new Date().toLocaleDateString('en-GB', {
+            weekday: 'long', year: 'numeric', month: 'long', day: 'numeric',
+            timeZone: 'Europe/Amsterdam'
+        });
+
+        const emailText = [
+            'EmotionLock — Weekly Stats Digest',
+            dateStr,
+            '',
+            'USERS',
+            `Total accounts:       ${totalUsers}`,
+            `License activated:    ${activeLicense}`,
+            `Active subscription:  ${activeSub}`,
+            `MT5 connected:        ${mt5Connected}`,
+            '',
+            'COMMUNITY OPPORTUNITIES (LAST 7 DAYS)',
+            `New threads found:    ${newOpps}`,
+            `Responded:            ${responded}`,
+            `Pending response:     ${pending}`,
+            '',
+            'ACTION',
+            'Review Command Center: https://emotionlock.app/command',
+        ].join('\n');
+
+        const res = await fetch('https://api.resend.com/emails', {
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${process.env.RESEND_API_KEY}`,
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+                from: 'noreply@emotionlock.app',
+                to: [process.env.ADMIN_EMAIL || 'janssenbart92@gmail.com'],
+                subject: `EmotionLock Weekly — ${dateStr}`,
+                text: emailText,
+            }),
+        });
+
+        if (res.ok) {
+            console.log('[Digest] Weekly stats digest sent.');
+        } else {
+            const err = await res.text();
+            console.error('[Digest] Failed to send digest:', err);
+        }
+    } catch (err) {
+        console.error('[Digest] Error generating weekly digest:', err?.message ?? err);
+    }
+}
+
+// Schedule: every Monday at 07:00 Europe/Amsterdam
+// setInterval cannot handle timezone-aware scheduling, so we use a simple
+// check: run every hour, send only when it is Monday 07:xx Amsterdam time.
+setInterval(async () => {
+    const now = new Date();
+    const amsterdam = new Date(now.toLocaleString('en-US', { timeZone: 'Europe/Amsterdam' }));
+    if (amsterdam.getDay() === 1 && amsterdam.getHours() === 7 && amsterdam.getMinutes() < 60) {
+        await sendWeeklyStatsDigest();
+    }
+}, 60 * 60 * 1000); // check every hour
