@@ -440,8 +440,8 @@ function checkWeeklyTokenReset(user, userId) {
 async function checkUserTrades(userId) {
     const user = userStates[userId];
     if (!user) return;
-    if (!user.mt5Connected) { console.log(`[trades] ${userId.slice(0,8)}: mt5Connected=false, skipping`); return; }
-    if (!user.metaApiAccountId) { console.log(`[trades] ${userId.slice(0,8)}: no metaApiAccountId, skipping`); return; }
+    if (!user.mt5Connected) return;
+    if (!user.metaApiAccountId) return;
 
     checkDailyReset(user, new Date().toISOString().split('T')[0]);
 
@@ -457,7 +457,7 @@ async function checkUserTrades(userId) {
         const isReady = accountInfo.state === 'DEPLOYED' &&
             (accountInfo.connectionStatus === 'CONNECTED' || accountInfo.connectionStatus === 'SYNCHRONIZING');
 
-        console.log(`[trades] ${userId.slice(0,8)}: state=${accountInfo.state} status=${accountInfo.connectionStatus} region=${user.mt5Region} ready=${isReady}`);
+        debugLog(`[trades] ${userId.slice(0,8)}: state=${accountInfo.state} status=${accountInfo.connectionStatus} region=${user.mt5Region} ready=${isReady}`);
 
         if (!isReady) return;
 
@@ -489,7 +489,7 @@ async function checkUserTrades(userId) {
                 });
             }
             user.lastDealCheck = now.toISOString();
-            console.log(`[trades] ${userId.slice(0,8)}: first check — seeded ${seedDeals.length} deals, rebuilt ${user.todayDeals.length} todayDeals`);
+            debugLog(`[trades] ${userId.slice(0,8)}: first check — seeded ${seedDeals.length} deals, rebuilt ${user.todayDeals.length} todayDeals`);
             return;
         }
 
@@ -506,9 +506,9 @@ async function checkUserTrades(userId) {
 
         const deals = await getDeals(user.metaApiAccountId, user.mt5Region, fromTime, toTime);
 
-        console.log(`[trades] ${userId.slice(0,8)}: fetched ${deals.length} deals from ${fromTime} to ${toTime}`);
+        debugLog(`[trades] ${userId.slice(0,8)}: fetched ${deals.length} deals from ${fromTime} to ${toTime}`);
         if (deals.length > 0) {
-            console.log(`[trades] ${userId.slice(0,8)}: deal types:`, deals.map(d => `${d.id} ${d.entryType} ${d.type} profit=${d.profit}`).join(' | '));
+            debugLog(`[trades] ${userId.slice(0,8)}: deal types:`, deals.map(d => `${d.id} ${d.entryType} ${d.type} profit=${d.profit}`).join(' | '));
         }
 
         let newTradesDetected = false;
