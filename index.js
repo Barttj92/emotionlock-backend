@@ -21,7 +21,8 @@ const app = express();
 // Security middleware
 // =====================
 app.use(cors({ origin: 'https://emotionlock.app' }));
-app.use(express.json());
+// F9: Explicit body size limit — prevents oversized payloads from reaching JSON parsing
+app.use(express.json({ limit: '10kb' }));
 
 // Debug logger — only logs in non-production environments
 const debugLog = (...args) => { if (process.env.NODE_ENV !== 'production') console.log(...args); };
@@ -51,6 +52,17 @@ const mt5Limiter = rateLimit({
     standardHeaders: true,
     legacyHeaders: false,
     message: { error: 'Too many connection attempts. Try again in an hour.' },
+});
+
+// F5: Rate limit on /status — the iOS app polls every 5s (720/hour per device).
+// 1200/hour per IP leaves plenty of room for legitimate polling from a single household
+// while blocking automated scanners that probe random UUIDs to pollute the DB.
+const statusLimiter = rateLimit({
+    windowMs: 60 * 60 * 1000, // 1 hour
+    max: 1200,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { error: 'Too many requests. Please try again later.' },
 });
 
 // =====================
@@ -332,6 +344,8 @@ function initUser(userId) {
             lastReset: new Date().toISOString().split('T')[0],
             lastTokenReset: new Date().toISOString(),
             maxTrades: 1,
+            // F4: Only count winning trades when true (profit > 0). Default false = count all closes.
+            countWinningTrades: false,
             deviceToken: null,
             metaApiAccountId: null,
             mt5Connected: false,
@@ -511,6 +525,23 @@ async function checkUserTrades(userId) {
             if (deal.type === 'DEAL_TYPE_BALANCE') continue;
 
             user.processedDealIds.add(deal.id);
+
+            // F4: countWinningTrades — skip losing/breakeven trades when enabled.
+            // profit null = no financial data (e.g. crypto deals), counted as a trade.
+            const dealProfit = deal.profit ?? null;
+            const isWin = dealProfit !== null && dealProfit > 0;
+            if (user.countWinningTrades && dealProfit !== null && !isWin) {
+                // Mark processed so the overlap window does not recheck it, but do not increment.
+                const direction = deal.type === 'DEAL_TYPE_SELL' ? 'Long' : 'Short';
+                user.todayDeals.push({
+                    symbol: deal.symbol || '',
+                    direction,
+                    price: deal.price ?? null,
+                    profit: dealProfit,
+                });
+                continue;
+            }
+
             user.tradesCount++;
             newTradesDetected = true;
 
@@ -746,9 +777,12 @@ app.delete('/connect-mt5/:userId', async (req, res) => {
     }
 });
 
+// UUID v4 regex used to validate userId before writing to Supabase (F5)
+const UUID_V4_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
 // PUBLIC ROUTE: status polling — called by the iOS app every 5s. UserId is the Keychain UUID
 //               (non-guessable). Returns only non-sensitive trade state.
-app.get('/status/:userId', async (req, res) => {
+app.get('/status/:userId', statusLimiter, async (req, res) => {
     try {
         const { userId } = req.params;
         const localDate = req.headers['x-local-date'] || null;
@@ -764,7 +798,7 @@ app.get('/status/:userId', async (req, res) => {
             // Two separate queries so a missing column never blocks MT5 restoration.
             const { data: purchase, error: purchaseErr } = await supabase
                 .from('purchases')
-                .select('meta_api_account_id, mt5_server, mt5_login, max_trades, emergency_tokens_remaining')
+                .select('meta_api_account_id, mt5_server, mt5_login, max_trades, emergency_tokens_remaining, count_winning_trades')
                 .eq('user_id', userId)
                 .maybeSingle();
 
@@ -775,7 +809,11 @@ app.get('/status/:userId', async (req, res) => {
             if (!purchase && !purchaseErr) {
                 // No row exists yet for this userId. This happens for every new Apple IAP customer
                 // because purchases rows are not automatically created on first use.
-                // Create one now so all subsequent MT5, settings, and trade-count saves land correctly.
+                // F5: Only create the row when userId is a valid UUID v4 (format used by KeychainHelper).
+                // This prevents random-string probes from polluting the purchases table.
+                if (!UUID_V4_RE.test(userId)) {
+                    return res.status(400).json({ error: 'Invalid userId format.' });
+                }
                 const { error: createErr } = await supabase
                     .from('purchases')
                     .insert({
@@ -808,6 +846,8 @@ app.get('/status/:userId', async (req, res) => {
                 }
             }
             if (purchase?.max_trades) user.maxTrades = purchase.max_trades;
+            // F4: Restore countWinningTrades preference from Supabase
+            if (purchase?.count_winning_trades != null) user.countWinningTrades = purchase.count_winning_trades;
 
             // Restore today's trade count (separate query — daily_trades columns added later).
             const todayISO = localDate || new Date().toISOString().split('T')[0];
@@ -840,6 +880,7 @@ app.get('/status/:userId', async (req, res) => {
             mt5Server: user.mt5Server ?? null,
             mt5Login: user.mt5Login ?? null,
             maxTrades: user.maxTrades,
+            countWinningTrades: user.countWinningTrades ?? false,
             todayDeals: user.todayDeals ?? [],
         });
     } catch (err) {
@@ -850,6 +891,8 @@ app.get('/status/:userId', async (req, res) => {
 
 const settingsSchema = z.object({
     maxTrades: z.number().int().min(1).max(10).optional(),
+    // F4: When true, only winning trades (profit > 0) count toward the daily limit.
+    countWinningTrades: z.boolean().optional(),
 });
 
 // PUBLIC ROUTE: user settings — called by iOS app. UserId is the Keychain UUID (non-guessable).
@@ -861,7 +904,7 @@ app.post('/settings/:userId', (req, res) => {
         if (!parsed.success) {
             return res.status(400).json({ error: 'Invalid input.', details: parsed.error.issues.map(i => i.message) });
         }
-        const { maxTrades } = parsed.data;
+        const { maxTrades, countWinningTrades } = parsed.data;
 
         if (!userStates[userId]) {
             initUser(userId);
@@ -907,9 +950,16 @@ app.post('/settings/:userId', (req, res) => {
             debugLog(`User ${userId}: maxTrades changed to ${maxTrades}, token used. Tokens left: ${user.emergencyTokens}`);
         }
 
+        // F4: countWinningTrades toggle — free to change, no token cost.
+        if (countWinningTrades !== undefined && countWinningTrades !== user.countWinningTrades) {
+            user.countWinningTrades = countWinningTrades;
+            debugLog(`User ${userId}: countWinningTrades set to ${countWinningTrades}`);
+        }
+
         // Persist settings to Supabase so they survive server restarts
         supabase.from('purchases').update({
             max_trades: user.maxTrades,
+            count_winning_trades: user.countWinningTrades,
         }).eq('user_id', userId).then(() => {}).catch(() => {});
 
         res.json({
@@ -918,6 +968,7 @@ app.post('/settings/:userId', (req, res) => {
             isLocked: user.isLocked,
             emergencyTokens: user.emergencyTokens,
             emergencyUnlocked: user.emergencyUnlocked,
+            countWinningTrades: user.countWinningTrades,
         });
     } catch (err) {
         console.error(`Settings error for ${req.params.userId}:`, err.message);
@@ -1080,30 +1131,15 @@ app.post('/admin/generate-code', async (req, res) => {
     res.json({ success: true, code });
 });
 
-// Admin: add emergency tokens to a license (called by website after token purchase)
+// Admin: add emergency tokens to a license — kept for backward compat but token purchases
+// are no longer available (F2: removed licenseCodes dead code that caused ReferenceError crashes).
 app.post('/admin/add-tokens/:licenseCode', (req, res) => {
     const adminKey = req.headers['x-admin-key'];
     if (!isValidAdminKey(adminKey)) {
         return res.status(401).json({ error: 'Unauthorized' });
     }
-    const { licenseCode } = req.params;
-    const tokens = parseInt(req.body && req.body.tokens) || 2;
-
-    // Find the user who has this license code activated
-    const userId = Object.keys(userStates).find(id => userStates[id].licenseCode === licenseCode);
-    if (!userId) {
-        // License exists but no user has activated it yet — store tokens for when they do
-        if (!licenseCodes[licenseCode]) {
-            return res.status(404).json({ error: 'License code not found' });
-        }
-        licenseCodes[licenseCode].pendingTokens = (licenseCodes[licenseCode].pendingTokens || 0) + tokens;
-        console.log(`Stored ${tokens} pending tokens for unactivated license ${licenseCode}`);
-        return res.json({ success: true, pending: true });
-    }
-
-    userStates[userId].emergencyTokens = (userStates[userId].emergencyTokens || 0) + tokens;
-    console.log(`Added ${tokens} emergency tokens to user ${userId} (license ${licenseCode}). Total: ${userStates[userId].emergencyTokens}`);
-    res.json({ success: true, tokens: userStates[userId].emergencyTokens });
+    // Token purchases are removed. Emergency tokens are free (2/week with subscription).
+    res.status(410).json({ error: 'Token purchases are no longer available.' });
 });
 
 // Admin: list active in-memory user states (UUIDs + key fields, no passwords)
@@ -1166,6 +1202,14 @@ app.post('/reset-after-onboarding/:userId', async (req, res) => {
     const { userId } = req.params;
     if (!userId) return res.status(400).json({ error: 'Missing userId' });
 
+    // F1: Require the caller to echo the userId in the request body.
+    // This proves possession of the userId at both the URL and body level,
+    // preventing passive observers who only see the path from triggering a reset.
+    const { confirm } = req.body ?? {};
+    if (!confirm || confirm !== userId) {
+        return res.status(403).json({ error: 'Forbidden: confirm field must match userId.' });
+    }
+
     const rawMax = req.body?.maxTrades;
     const maxTrades = Number.isInteger(rawMax) ? rawMax : parseInt(rawMax, 10);
     if (!Number.isFinite(maxTrades) || maxTrades < 1 || maxTrades > 50) {
@@ -1227,6 +1271,49 @@ app.post('/reset-after-onboarding/:userId', async (req, res) => {
     }
 });
 
+// Save user profile (collected after MT5 license purchase in the app)
+// Public endpoint — auth is the userId itself (UUID from Keychain, same pattern as all other user endpoints)
+app.post('/profile/:userId', async (req, res) => {
+    const { userId } = req.params;
+    if (!userId) return res.status(400).json({ error: 'Missing userId' });
+
+    const { firstName, lastName, email } = req.body ?? {};
+
+    if (!firstName || typeof firstName !== 'string' || firstName.trim().length < 1) {
+        return res.status(400).json({ error: 'firstName is required' });
+    }
+    if (!lastName || typeof lastName !== 'string' || lastName.trim().length < 1) {
+        return res.status(400).json({ error: 'lastName is required' });
+    }
+    if (!email || typeof email !== 'string' || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim())) {
+        return res.status(400).json({ error: 'A valid email address is required' });
+    }
+
+    try {
+        const { error } = await supabase.from('profiles').upsert(
+            {
+                user_id:    userId,
+                first_name: firstName.trim(),
+                last_name:  lastName.trim(),
+                email:      email.trim().toLowerCase(),
+                updated_at: new Date().toISOString(),
+            },
+            { onConflict: 'user_id' }
+        );
+
+        if (error) {
+            console.error('[profile] Supabase upsert error:', error.message);
+            return res.status(500).json({ error: 'Failed to save profile. Please try again.' });
+        }
+
+        console.log(`[profile] Saved profile for user ${userId}`);
+        res.json({ success: true });
+    } catch (err) {
+        console.error('[profile] Unexpected error:', err);
+        res.status(500).json({ error: 'Unexpected error. Please try again.' });
+    }
+});
+
 // Delete account — required by Apple App Store policy
 app.delete('/delete-account/:userId', async (req, res) => {
     const { userId } = req.params;
@@ -1258,6 +1345,9 @@ app.delete('/delete-account/:userId', async (req, res) => {
             emergency_tokens_remaining: null,
             emergency_tokens_purchased: null,
         }).eq('user_id', userId);
+
+        // Also remove profile data (GDPR compliance)
+        await supabase.from('profiles').delete().eq('user_id', userId);
 
         console.log(`Account deleted for user ${userId}`);
         res.json({ success: true });
