@@ -733,12 +733,18 @@ app.post('/connect-mt5/:userId', mt5Limiter, async (req, res) => {
         if (accountRegion) userStates[userId].mt5Region = accountRegion;
         console.log(`MT5 connected for user ${userId.slice(0,8)}: accountId=${accountId} region=${accountRegion || 'unknown (will detect on first poll)'}`);
 
-        // Persist MT5 connection to Supabase so it survives server restarts
-        const { error: mt5SaveErr } = await supabase.from('purchases').update({
+        // Persist MT5 connection to Supabase so it survives server restarts.
+        // Upsert (not update) because users coming through /reset-after-onboarding
+        // do not yet have a purchases row if they haven't completed an IAP
+        // purchase, and a silent UPDATE no-op would lose the MT5 link on the
+        // next server restart. The unique index on user_id (partial,
+        // WHERE user_id IS NOT NULL) makes this safe.
+        const { error: mt5SaveErr } = await supabase.from('purchases').upsert({
+            user_id: userId,
             meta_api_account_id: accountId,
             mt5_server: server,
             mt5_login: String(login),
-        }).eq('user_id', userId);
+        }, { onConflict: 'user_id' });
         if (mt5SaveErr) console.error(`Failed to persist MT5 for ${userId}:`, mt5SaveErr.message);
 
         debugLog(`MT5 connected for user ${userId}`);
@@ -1271,8 +1277,103 @@ app.post('/reset-after-onboarding/:userId', async (req, res) => {
     }
 });
 
+// Schema for the Apple IAP purchase notification body. The iOS app calls
+// this endpoint from StoreKitManager after every entitlement refresh, so the
+// payload describes the *current* state Apple reports for this user, not a
+// per-transaction delta. The endpoint is idempotent: repeated calls with the
+// same state are no-ops at the data level.
+const purchaseSchema = z.object({
+    productId:          z.string().min(1).max(100),
+    transactionId:      z.string().min(1).max(100),
+    type:               z.enum(['license', 'subscription']),
+    subscriptionStatus: z.enum(['active', 'trialing', 'expired']).optional(),
+    // expirationDate is an epoch-ms timestamp (StoreKit's Date.timeIntervalSince1970 * 1000).
+    expirationDate:     z.number().int().optional(),
+    // Optional pass-through of the maxTrades chosen during onboarding. Only
+    // applied on the very first INSERT for this user, so we never overwrite a
+    // value the user later changed via /settings or the Settings screen.
+    maxTrades:          z.number().int().min(1).max(50).optional(),
+});
+
+// Record an Apple IAP purchase or subscription state change in Supabase so the
+// Command Center and admin tools can see paying users. Without this the backend
+// would never know a StoreKit purchase happened because Apple does not call
+// the backend by default. (App Store Server Notifications V2 is the longer
+// term complement to this client-side ping, not a replacement.)
+//
+// Public endpoint, authenticated by the Keychain userId itself, same pattern
+// as /profile and /status. Idempotent: the iOS app fires this on every
+// refreshEntitlements call (cold start, restore, transaction update), so
+// repeated invocations with the same payload must not cause side effects.
+app.post('/purchase/:userId', async (req, res) => {
+    const { userId } = req.params;
+    if (!userId || !UUID_V4_RE.test(userId)) {
+        return res.status(400).json({ error: 'Invalid userId format' });
+    }
+
+    const parsed = purchaseSchema.safeParse(req.body);
+    if (!parsed.success) {
+        return res.status(400).json({
+            error: 'Invalid input.',
+            details: parsed.error.issues.map(i => i.message),
+        });
+    }
+    const { productId, transactionId, type, subscriptionStatus, expirationDate, maxTrades } = parsed.data;
+
+    try {
+        // Read the existing row first so we can decide whether to apply the
+        // optional maxTrades pass-through (only on the first INSERT) and so we
+        // never clobber unrelated fields the user has since changed.
+        const { data: existing, error: readErr } = await supabase
+            .from('purchases')
+            .select('user_id, license_code, subscription_status')
+            .eq('user_id', userId)
+            .maybeSingle();
+        if (readErr) {
+            console.error('[purchase] Supabase read error:', readErr.message);
+            return res.status(500).json({ error: 'Failed to record purchase. Please try again.' });
+        }
+
+        const patch = { user_id: userId };
+
+        if (type === 'license') {
+            // Distinguish Apple IAP licenses from admin-generated EL-... codes
+            // by prefixing with IAP-. Apple's transactionId is globally unique
+            // per receipt so this stays idempotent across retries.
+            patch.license_code = `IAP-${transactionId}`;
+        } else {
+            // Subscription state. Always reflect what Apple just reported,
+            // including downgrades to 'expired' so the Command Center can
+            // surface cancelled subs accurately.
+            if (subscriptionStatus) patch.subscription_status = subscriptionStatus;
+            if (expirationDate)     patch.trial_ends_at = new Date(expirationDate).toISOString();
+        }
+
+        // First INSERT only: apply onboarding-time maxTrades if the caller sent
+        // one. Skipping this when a row exists preserves any later /settings
+        // changes the user has made through the Settings screen.
+        if (!existing && typeof maxTrades === 'number') {
+            patch.max_trades = maxTrades;
+        }
+
+        const { error: writeErr } = await supabase
+            .from('purchases')
+            .upsert(patch, { onConflict: 'user_id' });
+        if (writeErr) {
+            console.error('[purchase] Supabase upsert error:', writeErr.message);
+            return res.status(500).json({ error: 'Failed to record purchase. Please try again.' });
+        }
+
+        console.log(`[purchase] Recorded ${type} for user ${userId.slice(0,8)}: product=${productId} tx=${transactionId}`);
+        res.json({ success: true });
+    } catch (err) {
+        console.error('[purchase] Unexpected error:', err);
+        res.status(500).json({ error: 'Unexpected error. Please try again.' });
+    }
+});
+
 // Save user profile (collected after MT5 license purchase in the app)
-// Public endpoint — auth is the userId itself (UUID from Keychain, same pattern as all other user endpoints)
+// Public endpoint, auth is the userId itself (UUID from Keychain, same pattern as all other user endpoints)
 app.post('/profile/:userId', async (req, res) => {
     const { userId } = req.params;
     if (!userId) return res.status(400).json({ error: 'Missing userId' });
