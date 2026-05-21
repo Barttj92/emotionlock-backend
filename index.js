@@ -812,28 +812,20 @@ app.get('/status/:userId', statusLimiter, async (req, res) => {
                 console.error(`[status] Supabase query failed for ${userId}:`, purchaseErr.message);
             }
 
-            if (!purchase && !purchaseErr) {
-                // No row exists yet for this userId. This happens for every new Apple IAP customer
-                // because purchases rows are not automatically created on first use.
-                // F5: Only create the row when userId is a valid UUID v4 (format used by KeychainHelper).
-                // This prevents random-string probes from polluting the purchases table.
-                if (!UUID_V4_RE.test(userId)) {
-                    return res.status(400).json({ error: 'Invalid userId format.' });
-                }
-                const { error: createErr } = await supabase
-                    .from('purchases')
-                    .insert({
-                        user_id: userId,
-                        emergency_tokens_remaining: DEFAULT_TOKENS,
-                        daily_trades_count: 0,
-                        max_trades: user.maxTrades,
-                    });
-                if (createErr) {
-                    console.error(`[status] Could not create purchases row for ${userId}:`, createErr.message);
-                } else {
-                    console.log(`[status] Auto-created purchases row for new user ${userId}`);
-                }
+            // Reject obviously malformed userIds before any work, even when we
+            // are only reading. This keeps the rate limiter accounting honest
+            // and avoids hitting Supabase for every scanner probe.
+            if (!UUID_V4_RE.test(userId)) {
+                return res.status(400).json({ error: 'Invalid userId format.' });
             }
+            // No row exists yet, but we no longer auto-create one here.
+            // /purchase is now the authoritative path that inserts a purchases
+            // row when a real Apple IAP transaction is recorded. Auto-creating
+            // from /status was abused by scanners polling random UUIDs, which
+            // polluted the purchases table with thousands of empty rows
+            // indistinguishable from real users in the Command Center.
+            // If purchase is null, the in-memory defaults from initUser stand;
+            // they will persist correctly once /purchase or /connect-mt5 runs.
 
             if (purchase?.emergency_tokens_remaining != null) {
                 user.emergencyTokens = purchase.emergency_tokens_remaining;
