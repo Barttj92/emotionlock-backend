@@ -1379,6 +1379,43 @@ app.post('/purchase/:userId', async (req, res) => {
 
         console.log(`[purchase] Recorded ${type} for user ${userId.slice(0,8)}: product=${productId} tx=${transactionId}`);
         res.json({ success: true });
+
+        // Fire-and-forget admin notification on the FIRST license purchase
+        // for this user. We detect first-purchase by checking that the
+        // existing row had a null license_code before this UPSERT, which
+        // makes the email immune to restores, entitlement refreshes, and
+        // subsequent /purchase calls for subscription state changes.
+        const isFirstLicensePurchase = type === 'license' && (!existing || !existing.license_code);
+        if (isFirstLicensePurchase) {
+            // Pull profile details so the email is informative without us
+            // having to round-trip back from chat to the admin UI. Best
+            // effort: if the profile lookup fails we still send the email
+            // with the user_id only.
+            supabase
+                .from('profiles')
+                .select('first_name, last_name, email')
+                .ilike('user_id', userId)
+                .maybeSingle()
+                .then(({ data: prof }) => {
+                    const fullName = prof ? `${prof.first_name ?? ''} ${prof.last_name ?? ''}`.trim() : 'a new customer';
+                    const customerEmail = prof?.email ?? 'unknown';
+                    notifyAdmin({
+                        subject: `New EmotionLock purchase: ${fullName || 'new customer'}`,
+                        lines: [
+                            `${fullName || 'A new customer'} just purchased the MT5 Activation license.`,
+                            '',
+                            `Email:          ${customerEmail}`,
+                            `User ID:        ${userId}`,
+                            `Product:        ${productId}`,
+                            `Transaction ID: ${transactionId}`,
+                            `Time:           ${adminNotifyTimestamp()} (Europe/Amsterdam)`,
+                            '',
+                            'View in Command Center: https://emotionlock.app/command',
+                        ],
+                    }).catch(() => {});
+                })
+                .catch(() => {});
+        }
     } catch (err) {
         console.error('[purchase] Unexpected error:', err);
         res.status(500).json({ error: 'Unexpected error. Please try again.' });
@@ -1404,12 +1441,25 @@ app.post('/profile/:userId', async (req, res) => {
     }
 
     try {
+        // Check whether a profile already exists so we only send the
+        // admin notification on the FIRST save, not on every edit.
+        const { data: existingProfile } = await supabase
+            .from('profiles')
+            .select('user_id')
+            .ilike('user_id', userId)
+            .maybeSingle();
+        const isNewProfile = !existingProfile;
+
+        const cleanFirstName = firstName.trim();
+        const cleanLastName  = lastName.trim();
+        const cleanEmail     = email.trim().toLowerCase();
+
         const { error } = await supabase.from('profiles').upsert(
             {
                 user_id:    userId,
-                first_name: firstName.trim(),
-                last_name:  lastName.trim(),
-                email:      email.trim().toLowerCase(),
+                first_name: cleanFirstName,
+                last_name:  cleanLastName,
+                email:      cleanEmail,
                 updated_at: new Date().toISOString(),
             },
             { onConflict: 'user_id' }
@@ -1422,6 +1472,24 @@ app.post('/profile/:userId', async (req, res) => {
 
         console.log(`[profile] Saved profile for user ${userId}`);
         res.json({ success: true });
+
+        // Fire-and-forget admin notification for new signups only. Awaiting
+        // would delay the iOS app for no good reason since the user does not
+        // care about the email roundtrip.
+        if (isNewProfile) {
+            notifyAdmin({
+                subject: `New EmotionLock account: ${cleanFirstName} ${cleanLastName}`,
+                lines: [
+                    `${cleanFirstName} ${cleanLastName} just created an account.`,
+                    '',
+                    `Email:   ${cleanEmail}`,
+                    `User ID: ${userId}`,
+                    `Time:    ${adminNotifyTimestamp()} (Europe/Amsterdam)`,
+                    '',
+                    'View in Command Center: https://emotionlock.app/command',
+                ],
+            }).catch(() => {});
+        }
     } catch (err) {
         console.error('[profile] Unexpected error:', err);
         res.status(500).json({ error: 'Unexpected error. Please try again.' });
@@ -1681,6 +1749,50 @@ app.get('/scout/status', (req, res) => {
 
 // =====================
 // Weekly Stats Digest
+// Sends a transactional notification email to the admin via Resend.
+// Used for one-off events (new profile, new license purchase) where we want
+// to be alerted in real time. Fire-and-forget on the caller side: never
+// blocks the request and silently no-ops when RESEND_API_KEY is missing so
+// local development without the key keeps working.
+async function notifyAdmin({ subject, lines }) {
+    if (!process.env.RESEND_API_KEY) {
+        debugLog('[notify] RESEND_API_KEY not set, skipping admin notification.');
+        return;
+    }
+    try {
+        const text = Array.isArray(lines) ? lines.join('\n') : String(lines);
+        const res = await fetch('https://api.resend.com/emails', {
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${process.env.RESEND_API_KEY}`,
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+                from: 'noreply@emotionlock.app',
+                to: [process.env.ADMIN_EMAIL || 'janssenbart92@gmail.com'],
+                subject,
+                text,
+            }),
+        });
+        if (!res.ok) {
+            const err = await res.text();
+            console.error('[notify] Failed to send admin notification:', err);
+        }
+    } catch (err) {
+        console.error('[notify] Error sending admin notification:', err?.message ?? err);
+    }
+}
+
+// Formats the current moment in the Europe/Amsterdam timezone so the
+// notification emails read consistently regardless of where Railway runs.
+function adminNotifyTimestamp() {
+    return new Date().toLocaleString('nl-NL', {
+        timeZone: 'Europe/Amsterdam',
+        dateStyle: 'short',
+        timeStyle: 'short',
+    });
+}
+
 // Sends a Monday morning email summary to the admin via Resend
 // Requires RESEND_API_KEY environment variable in Railway
 // =====================
