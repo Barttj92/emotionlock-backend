@@ -1313,9 +1313,30 @@ app.post('/purchase/:userId', async (req, res) => {
     const { productId, transactionId, type, subscriptionStatus, expirationDate, maxTrades } = parsed.data;
 
     try {
-        // Read the existing row first so we can decide whether to apply the
-        // optional maxTrades pass-through (only on the first INSERT) and so we
-        // never clobber unrelated fields the user has since changed.
+        // Require that this userId has already completed profile setup. The
+        // iOS app order is onboarding -> profile setup -> license -> sub, so a
+        // real Apple IAP user always has a profiles row before /purchase is
+        // ever called. Without this gate, the endpoint accepts any valid UUID
+        // v4 from any IP and lets scanners pollute the purchases table with
+        // ghost rows that show up in the Command Center as real customers.
+        const { data: profile, error: profileErr } = await supabase
+            .from('profiles')
+            .select('user_id')
+            .ilike('user_id', userId)
+            .maybeSingle();
+        if (profileErr) {
+            console.error('[purchase] Profile lookup error:', profileErr.message);
+            return res.status(500).json({ error: 'Failed to record purchase. Please try again.' });
+        }
+        if (!profile) {
+            // Quiet 404 instead of a noisy log so we don't fill Railway logs
+            // with every scanner probe.
+            return res.status(404).json({ error: 'Unknown user. Complete profile setup first.' });
+        }
+
+        // Read the existing purchases row so we can decide whether to apply
+        // the optional maxTrades pass-through (only on the first INSERT) and
+        // so we never clobber unrelated fields the user has since changed.
         const { data: existing, error: readErr } = await supabase
             .from('purchases')
             .select('user_id, license_code, subscription_status')
