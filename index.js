@@ -6,6 +6,7 @@ const { z } = require('zod');
 let apn = null;
 try { apn = require('@parse/node-apn'); } catch (err) { console.error('apn module unavailable (push disabled):', err.message); }
 const { createClient } = require('@supabase/supabase-js');
+const { verifyAndDecodeNotification: verifyAppleNotification } = require('./apple-notifications');
 
 // =====================
 // Startup checks
@@ -107,6 +108,84 @@ async function saveDailyTrades(userId, count, dateStr) {
         .eq('user_id', userId);
 }
 
+// =====================
+// Subscription / access helpers
+// =====================
+// The iOS app polls /status every 5s, so we cache the subscription state per
+// user to avoid hammering Supabase. Cache is invalidated whenever /purchase
+// or the App Store Server Notifications V2 webhook updates the row, so any
+// real state change is reflected within at most SUBSCRIPTION_CACHE_TTL_MS.
+const SUBSCRIPTION_CACHE_TTL_MS = 60 * 1000;
+
+// Grace window AFTER trial_ends_at before the MetaAPI account is undeployed.
+// Covers Apple's billing retry plus accidental cancellations so users who
+// re-subscribe within 48h keep their MT5 connection without reconnect setup.
+const SUBSCRIPTION_GRACE_MS = 48 * 60 * 60 * 1000;
+
+const subscriptionCache = new Map();
+
+function invalidateSubscriptionCache(userId) {
+    if (!userId) return;
+    subscriptionCache.delete(userId);
+}
+
+async function getSubscriptionState(userId) {
+    const cached = subscriptionCache.get(userId);
+    if (cached && (Date.now() - cached.fetchedAt) < SUBSCRIPTION_CACHE_TTL_MS) {
+        return cached;
+    }
+    const { data, error } = await supabase
+        .from('purchases')
+        .select('subscription_status, trial_ends_at, license_code')
+        .eq('user_id', userId)
+        .maybeSingle();
+    if (error) {
+        console.error(`[subscription] Supabase lookup failed for ${userId}:`, error.message);
+        // Fail open on transient Supabase errors so a paying user is never
+        // locked out by a database hiccup. The next refresh re-checks.
+        return { status: null, trialEndsAt: null, hasLicense: false, fetchedAt: Date.now(), failedOpen: true };
+    }
+    const state = {
+        status: data?.subscription_status ?? null,
+        trialEndsAt: data?.trial_ends_at ? new Date(data.trial_ends_at).getTime() : null,
+        hasLicense: !!data?.license_code,
+        fetchedAt: Date.now(),
+        failedOpen: false,
+    };
+    subscriptionCache.set(userId, state);
+    return state;
+}
+
+// True when the user is entitled to use trade-tracking features right now.
+// Rules:
+//   - 'active' or 'trialing': always allowed.
+//   - 'expired' BUT trial_ends_at is still in the future: Apple sometimes
+//     reports 'expired' during a billing retry window before the access
+//     period has actually ended. Honour Apple's expiresDate as the source
+//     of truth and keep the user active until then.
+//   - 'expired' AND past trial_ends_at: blocked.
+//   - status null (no Apple data yet): treat as active. This protects users
+//     whose first /purchase call hasn't landed yet, plus legacy rows that
+//     existed before subscription_status was tracked.
+async function isSubscriptionActive(userId) {
+    const state = await getSubscriptionState(userId);
+    if (!state) return true;
+    if (state.status === 'active' || state.status === 'trialing') return true;
+    if (state.status === 'expired') {
+        if (state.trialEndsAt && state.trialEndsAt > Date.now()) return true;
+        return false;
+    }
+    return true;
+}
+
+// Used by the periodic cleanup job to find users whose MetaAPI account can
+// be safely undeployed. Requires 'expired' status AND past the grace window.
+async function isPastGracePeriod(userId) {
+    const state = await getSubscriptionState(userId);
+    if (!state || state.status !== 'expired') return false;
+    if (!state.trialEndsAt) return false;
+    return (Date.now() - state.trialEndsAt) > SUBSCRIPTION_GRACE_MS;
+}
 
 // =====================
 // APNs setup
@@ -579,12 +658,97 @@ async function checkUserTrades(userId) {
     }
 }
 
-// Poll every 15 seconds
+// Poll every 15 seconds.
+// Skip users whose subscription has expired beyond the access window. The
+// MetaAPI account itself isn't undeployed yet — that happens in the periodic
+// cleanup job after the 48h grace — but there is no point polling deals for
+// a paywalled user who can't see them anyway.
 setInterval(async () => {
     for (const userId of Object.keys(userStates)) {
+        try {
+            const active = await isSubscriptionActive(userId);
+            if (!active) continue;
+        } catch (e) {
+            // Fail open: a Supabase hiccup must never starve a paying user
+            // of trade tracking. Log and keep polling for this cycle.
+            console.error(`[poll] subscription check failed for ${userId}:`, e.message);
+        }
         await checkUserTrades(userId);
     }
 }, 15000);
+
+// =====================
+// MetaAPI cost cleanup — runs hourly
+// =====================
+// MetaAPI bills per account per hour. When a subscription expires, undeploy
+// the account after the 48h grace window so we stop paying for users who
+// can no longer access the app. The account row is kept (not deleted) so a
+// re-subscribe later can redeploy the existing account instead of forcing
+// the user through MT5 reconnect again. meta_api_undeployed_at is stamped
+// so we know the deploy state without round-tripping to MetaAPI.
+async function cleanupExpiredMetaApiAccounts() {
+    try {
+        const { data: candidates, error } = await supabase
+            .from('purchases')
+            .select('user_id, meta_api_account_id, trial_ends_at, subscription_status, meta_api_undeployed_at')
+            .eq('subscription_status', 'expired')
+            .not('meta_api_account_id', 'is', null);
+
+        if (error) {
+            console.error('[cleanup] Supabase query failed:', error.message);
+            return;
+        }
+
+        const now = Date.now();
+        let undeployed = 0;
+
+        for (const row of (candidates ?? [])) {
+            // Re-evaluate grace per row so the check matches isPastGracePeriod
+            // exactly without trusting any cached value.
+            const trialEndsAt = row.trial_ends_at ? new Date(row.trial_ends_at).getTime() : null;
+            if (!trialEndsAt) continue;
+            if ((now - trialEndsAt) <= SUBSCRIPTION_GRACE_MS) continue;
+
+            // Already undeployed and not redeployed since? Skip to avoid
+            // hammering MetaAPI with redundant undeploy calls every hour.
+            if (row.meta_api_undeployed_at) continue;
+
+            try {
+                await undeployMetaApiAccount(row.meta_api_account_id);
+                await supabase
+                    .from('purchases')
+                    .update({ meta_api_undeployed_at: new Date().toISOString() })
+                    .eq('user_id', row.user_id);
+
+                // Drop in-memory state so the next foregrounding (after
+                // re-subscribe) re-reads Supabase and restores cleanly.
+                if (userStates[row.user_id]) {
+                    userStates[row.user_id].mt5Connected = false;
+                }
+                invalidateSubscriptionCache(row.user_id);
+
+                console.log(`[cleanup] Undeployed MetaAPI ${row.meta_api_account_id} for expired user ${row.user_id.slice(0,8)}`);
+                undeployed++;
+            } catch (e) {
+                console.error(`[cleanup] Undeploy failed for ${row.user_id}:`, e.message);
+            }
+        }
+
+        if (undeployed > 0) {
+            console.log(`[cleanup] Hourly sweep undeployed ${undeployed} MetaAPI account(s).`);
+        }
+    } catch (err) {
+        console.error('[cleanup] Unexpected error:', err.message);
+    }
+}
+
+// Hourly sweep. setInterval drifts over weeks but that is acceptable for a
+// cost-cleanup job that runs 24x/day. Initial delay 5 min after boot so we
+// don't fire before the process has finished warming up.
+setTimeout(() => {
+    cleanupExpiredMetaApiAccounts().catch(() => {});
+    setInterval(() => cleanupExpiredMetaApiAccounts().catch(() => {}), 60 * 60 * 1000);
+}, 5 * 60 * 1000);
 
 // =====================
 // Routes
@@ -666,6 +830,23 @@ app.post('/connect-mt5/:userId', mt5Limiter, async (req, res) => {
 
     if (!userStates[userId]) {
         return res.status(404).json({ error: 'User not found. Activate your license first.' });
+    }
+
+    // Block new MT5 connections for users whose subscription has expired.
+    // Without this gate a paywalled user could trigger a new MetaAPI account
+    // creation (or redeploy of an existing one) and immediately start
+    // accruing hourly cost without us getting paid.
+    try {
+        const active = await isSubscriptionActive(userId);
+        if (!active) {
+            return res.status(402).json({
+                error: 'subscription_expired',
+                message: 'Your EmotionLock subscription is no longer active. Re-subscribe to reconnect MT5.',
+            });
+        }
+    } catch (e) {
+        console.error(`[connect-mt5] subscription check failed for ${userId}:`, e.message);
+        // Fail open: don't block a paying user on a Supabase glitch.
     }
 
     try {
@@ -868,6 +1049,30 @@ app.get('/status/:userId', statusLimiter, async (req, res) => {
         // Run weekly reset after Supabase restore so we compare against the real
         // persisted token count, not the initUser default.
         checkWeeklyTokenReset(user, userId);
+
+        // Subscription gate. The iOS app already paywalls locally via
+        // hasAccess in StoreKitManager, so this is defense in depth + a
+        // clear signal for any client that didn't refresh entitlements yet
+        // (e.g. an older app version, or a foregrounding race condition).
+        // We deliberately keep this last so user state is loaded and ready
+        // the moment the user re-subscribes.
+        try {
+            const active = await isSubscriptionActive(userId);
+            if (!active) {
+                return res.status(402).json({
+                    error: 'subscription_expired',
+                    message: 'Your EmotionLock subscription is no longer active.',
+                    subscriptionExpired: true,
+                    // Surface mt5Connected so the iOS app knows whether a
+                    // reconnect prompt is required after re-subscribing.
+                    mt5Connected: user.mt5Connected,
+                });
+            }
+        } catch (e) {
+            console.error(`[status] subscription check failed for ${userId}:`, e.message);
+            // Fail open: serve the cached state rather than locking out a
+            // paying user on a Supabase transient.
+        }
 
         res.json({
             tradesCount: user.tradesCount,
@@ -1275,16 +1480,22 @@ app.post('/reset-after-onboarding/:userId', async (req, res) => {
 // per-transaction delta. The endpoint is idempotent: repeated calls with the
 // same state are no-ops at the data level.
 const purchaseSchema = z.object({
-    productId:          z.string().min(1).max(100),
-    transactionId:      z.string().min(1).max(100),
-    type:               z.enum(['license', 'subscription']),
-    subscriptionStatus: z.enum(['active', 'trialing', 'expired']).optional(),
+    productId:             z.string().min(1).max(100),
+    transactionId:         z.string().min(1).max(100),
+    type:                  z.enum(['license', 'subscription']),
+    subscriptionStatus:    z.enum(['active', 'trialing', 'expired']).optional(),
     // expirationDate is an epoch-ms timestamp (StoreKit's Date.timeIntervalSince1970 * 1000).
-    expirationDate:     z.number().int().optional(),
+    expirationDate:        z.number().int().optional(),
     // Optional pass-through of the maxTrades chosen during onboarding. Only
     // applied on the very first INSERT for this user, so we never overwrite a
     // value the user later changed via /settings or the Settings screen.
-    maxTrades:          z.number().int().min(1).max(50).optional(),
+    maxTrades:             z.number().int().min(1).max(50).optional(),
+    // ASSN V2 mapping fields. originalTransactionId is the stable id across
+    // renewals (Apple keeps it constant for the lifetime of the subscription),
+    // appAccountToken is the UUID we set at purchase time so the webhook can
+    // map any future notification back to this user without lookups.
+    originalTransactionId: z.string().min(1).max(100).optional(),
+    appAccountToken:       z.string().min(1).max(100).optional(),
 });
 
 // Record an Apple IAP purchase or subscription state change in Supabase so the
@@ -1310,7 +1521,10 @@ app.post('/purchase/:userId', async (req, res) => {
             details: parsed.error.issues.map(i => i.message),
         });
     }
-    const { productId, transactionId, type, subscriptionStatus, expirationDate, maxTrades } = parsed.data;
+    const {
+        productId, transactionId, type, subscriptionStatus, expirationDate, maxTrades,
+        originalTransactionId, appAccountToken,
+    } = parsed.data;
 
     try {
         // Require that this userId has already completed profile setup. The
@@ -1360,7 +1574,14 @@ app.post('/purchase/:userId', async (req, res) => {
             // surface cancelled subs accurately.
             if (subscriptionStatus) patch.subscription_status = subscriptionStatus;
             if (expirationDate)     patch.trial_ends_at = new Date(expirationDate).toISOString();
+            patch.subscription_updated_at = new Date().toISOString();
         }
+
+        // ASSN V2 mapping fields. We persist these on every /purchase call so
+        // a future webhook can map an Apple notification (which carries one
+        // of these ids, not our userId) back to the right purchases row.
+        if (originalTransactionId) patch.original_transaction_id = originalTransactionId;
+        if (appAccountToken)       patch.app_account_token       = appAccountToken;
 
         // First INSERT only: apply onboarding-time maxTrades if the caller sent
         // one. Skipping this when a row exists preserves any later /settings
@@ -1376,6 +1597,11 @@ app.post('/purchase/:userId', async (req, res) => {
             console.error('[purchase] Supabase upsert error:', writeErr.message);
             return res.status(500).json({ error: 'Failed to record purchase. Please try again.' });
         }
+        // Drop the cached subscription state so the next /status poll picks
+        // up the new status immediately (otherwise the user would see the
+        // old "expired" state for up to SUBSCRIPTION_CACHE_TTL_MS after
+        // re-subscribing).
+        invalidateSubscriptionCache(userId);
 
         console.log(`[purchase] Recorded ${type} for user ${userId.slice(0,8)}: product=${productId} tx=${transactionId}`);
         res.json({ success: true });
@@ -1421,6 +1647,238 @@ app.post('/purchase/:userId', async (req, res) => {
         res.status(500).json({ error: 'Unexpected error. Please try again.' });
     }
 });
+
+// =====================
+// App Store Server Notifications V2 webhook
+// =====================
+// Apple POSTs subscription lifecycle events here. Configure the URL in
+// App Store Connect under "App Information → App Store Server Notifications".
+// Set the production URL to:
+//   https://emotionlock-backend-production.up.railway.app/apple/notifications
+// Sandbox notifications arrive at the same URL (Apple sets environment field).
+//
+// Endpoint MUST:
+//   - return 200 within a few seconds (Apple retries on non-2xx with backoff)
+//   - verify the JWS signature against Apple Root CA G3
+//   - be safe to call repeatedly (Apple may redeliver the same notification)
+const APP_BUNDLE_ID = process.env.APNS_BUNDLE_ID || 'com.emotionlock.EmotionLock';
+
+app.post('/apple/notifications', async (req, res) => {
+    const signedPayload = req.body?.signedPayload;
+    if (!signedPayload || typeof signedPayload !== 'string') {
+        // Apple never sends an empty body; treat as a probe/scanner.
+        return res.status(400).json({ error: 'Missing signedPayload' });
+    }
+
+    let notification;
+    try {
+        notification = verifyAppleNotification(signedPayload, APP_BUNDLE_ID);
+    } catch (err) {
+        // 401 instead of 500 so a forged or malformed body does not look
+        // like a server error to Apple (which would trigger their retry).
+        console.error('[apple-notify] JWS verification failed:', err.message);
+        return res.status(401).json({ error: 'Invalid notification signature' });
+    }
+
+    // Send the 200 response IMMEDIATELY so Apple does not retry while we
+    // do the Supabase work. Any failure after this is logged for investigation.
+    res.json({ received: true });
+
+    try {
+        await handleAppleNotification(notification);
+    } catch (err) {
+        console.error('[apple-notify] Handler error after 200 response:', err.message);
+    }
+});
+
+// Maps the verified notification onto our purchases row + cleanup actions.
+// Returns the new subscription_status when applicable.
+async function handleAppleNotification(notification) {
+    const { notificationType, subtype, transactionInfo, renewalInfo, environment } = notification;
+    if (!transactionInfo) {
+        console.log(`[apple-notify] ${notificationType}/${subtype} arrived without transactionInfo, skipping.`);
+        return;
+    }
+
+    const originalTransactionId = transactionInfo.originalTransactionId ?? null;
+    const appAccountToken       = transactionInfo.appAccountToken ?? null;
+    const productId             = transactionInfo.productId ?? null;
+    const expiresDate           = transactionInfo.expiresDate ?? null;
+    const offerType             = transactionInfo.offerType ?? null;
+
+    console.log(
+        `[apple-notify] ${notificationType}${subtype ? '/' + subtype : ''} ` +
+        `env=${environment} product=${productId} txOriginal=${originalTransactionId} ` +
+        `appAccountToken=${appAccountToken ? appAccountToken.slice(0,8) : 'none'}`
+    );
+
+    // Subscriptions only — license (one-time non-consumable) doesn't generate
+    // renewal events. We do still record refunds on the license below.
+    const isSubscription = productId === 'app.emotionlock.monthly';
+    const isLicense      = productId === 'app.emotionlock.mt5license';
+
+    // 1) Map notification → userId. Prefer appAccountToken (set on purchases
+    //    after the iOS update). Fall back to originalTransactionId for users
+    //    who subscribed before that update landed.
+    const userId = await resolveUserIdFromAppleIds(appAccountToken, originalTransactionId);
+    if (!userId) {
+        console.log(`[apple-notify] No matching user for tx ${originalTransactionId} / token ${appAccountToken}. Will store transaction for future reconciliation if it appears later.`);
+        return;
+    }
+
+    // 2) Decide the new subscription_status based on the notification type.
+    //    Keep this conservative: any state we are unsure about → leave the
+    //    row alone instead of guessing.
+    let newStatus = null;
+    if (isSubscription) {
+        switch (notificationType) {
+            case 'SUBSCRIBED':
+                // INITIAL_BUY with an intro offer = trial; otherwise active.
+                newStatus = (subtype === 'INITIAL_BUY' && offerType === 1) ? 'trialing' : 'active';
+                break;
+            case 'DID_RENEW':
+                newStatus = 'active';
+                break;
+            case 'DID_FAIL_TO_RENEW':
+                // BILLING_RETRY: Apple still retries silently for up to 60 days.
+                // GRACE_PERIOD: user is in grace, billing failed but access continues.
+                // No subtype (auto-renew off + expired): straight to expired.
+                if (subtype === 'GRACE_PERIOD' || subtype === 'BILLING_RETRY') {
+                    newStatus = 'active'; // keep access during retry / grace
+                } else {
+                    newStatus = 'expired';
+                }
+                break;
+            case 'EXPIRED':
+            case 'GRACE_PERIOD_EXPIRED':
+                newStatus = 'expired';
+                break;
+            case 'REFUND':
+            case 'REVOKE':
+                newStatus = 'expired';
+                break;
+            case 'DID_CHANGE_RENEWAL_STATUS':
+                // User toggled auto-renew on/off. Doesn't change current
+                // entitlement — the sub runs until expiresDate either way.
+                // Leave status alone, only update timestamps.
+                break;
+            case 'DID_CHANGE_RENEWAL_PREF':
+            case 'PRICE_INCREASE':
+            case 'OFFER_REDEEMED':
+            case 'RENEWAL_EXTENDED':
+                // Informational. No subscription_status change.
+                break;
+            default:
+                console.log(`[apple-notify] Unhandled subscription type: ${notificationType}`);
+        }
+    }
+
+    // 3) Build the upsert patch.
+    const patch = {
+        user_id: userId,
+        subscription_updated_at: new Date().toISOString(),
+    };
+    if (originalTransactionId) patch.original_transaction_id = originalTransactionId;
+    if (appAccountToken)       patch.app_account_token       = appAccountToken;
+    if (expiresDate)           patch.trial_ends_at            = new Date(expiresDate).toISOString();
+    if (newStatus)             patch.subscription_status      = newStatus;
+
+    // Refund on the LICENSE (one-time): wipe the license code so the app
+    // paywalls the user. Don't touch subscription_status — that's a separate
+    // entitlement.
+    if (isLicense && (notificationType === 'REFUND' || notificationType === 'REVOKE')) {
+        patch.license_code = null;
+    }
+
+    const { error: writeErr } = await supabase
+        .from('purchases')
+        .update(patch)
+        .eq('user_id', userId);
+    if (writeErr) {
+        console.error(`[apple-notify] Supabase update failed for ${userId}:`, writeErr.message);
+        return;
+    }
+    invalidateSubscriptionCache(userId);
+
+    // 4) For hard-revocation events, undeploy the MetaAPI account NOW (don't
+    //    wait for the 48h grace sweep). A refund is the user demanding their
+    //    money back, so we have no reason to keep the account costing us.
+    if ((notificationType === 'REFUND' || notificationType === 'REVOKE') && userStates[userId]?.metaApiAccountId) {
+        try {
+            await undeployMetaApiAccount(userStates[userId].metaApiAccountId);
+            await supabase
+                .from('purchases')
+                .update({ meta_api_undeployed_at: new Date().toISOString() })
+                .eq('user_id', userId);
+            userStates[userId].mt5Connected = false;
+            console.log(`[apple-notify] Immediate undeploy after ${notificationType} for ${userId.slice(0,8)}`);
+        } catch (e) {
+            console.error(`[apple-notify] Immediate undeploy failed for ${userId}:`, e.message);
+        }
+    }
+
+    // 5) If a previously-undeployed account just resubscribed, redeploy so
+    //    the user doesn't have to walk through MT5 reconnect again.
+    if (newStatus === 'active' || newStatus === 'trialing') {
+        const { data: row } = await supabase
+            .from('purchases')
+            .select('meta_api_account_id, meta_api_undeployed_at')
+            .eq('user_id', userId)
+            .maybeSingle();
+        if (row?.meta_api_account_id && row?.meta_api_undeployed_at) {
+            try {
+                await deployMetaApiAccount(row.meta_api_account_id);
+                await supabase
+                    .from('purchases')
+                    .update({ meta_api_undeployed_at: null })
+                    .eq('user_id', userId);
+                if (userStates[userId]) userStates[userId].mt5Connected = true;
+                console.log(`[apple-notify] Redeployed MetaAPI ${row.meta_api_account_id} after resubscribe`);
+            } catch (e) {
+                console.error(`[apple-notify] Redeploy failed for ${userId}:`, e.message);
+            }
+        }
+    }
+
+    console.log(`[apple-notify] Applied ${notificationType}${subtype ? '/' + subtype : ''} → ${newStatus ?? 'no-status-change'} for ${userId.slice(0,8)}`);
+}
+
+// Look up the EmotionLock userId for a notification. Prefers appAccountToken
+// (set at purchase via PurchaseOption.appAccountToken — see iOS StoreKitManager)
+// and falls back to originalTransactionId for purchases made before that
+// option was wired up.
+async function resolveUserIdFromAppleIds(appAccountToken, originalTransactionId) {
+    if (appAccountToken) {
+        const { data } = await supabase
+            .from('purchases')
+            .select('user_id')
+            .ilike('app_account_token', appAccountToken)
+            .maybeSingle();
+        if (data?.user_id) return data.user_id;
+        // appAccountToken IS our userId by construction, so even if no row
+        // exists yet, the value itself is the canonical id. The next iOS
+        // /purchase call will populate the row.
+        if (UUID_V4_RE.test(appAccountToken)) return appAccountToken;
+    }
+    if (originalTransactionId) {
+        const { data } = await supabase
+            .from('purchases')
+            .select('user_id')
+            .eq('original_transaction_id', originalTransactionId)
+            .maybeSingle();
+        if (data?.user_id) return data.user_id;
+        // Last-resort fallback: license_code uses the prefix IAP-<transactionId>
+        // for the original purchase. Try that mapping so refunds on the
+        // license still find a row.
+        const { data: byCode } = await supabase
+            .from('purchases')
+            .select('user_id')
+            .eq('license_code', `IAP-${originalTransactionId}`)
+            .maybeSingle();
+        if (byCode?.user_id) return byCode.user_id;
+    }
+    return null;
+}
 
 // Save user profile (collected after MT5 license purchase in the app)
 // Public endpoint, auth is the userId itself (UUID from Keychain, same pattern as all other user endpoints)
