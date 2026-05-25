@@ -136,19 +136,26 @@ async function getSubscriptionState(userId) {
     }
     const { data, error } = await supabase
         .from('purchases')
-        .select('subscription_status, trial_ends_at, license_code')
+        .select('subscription_status, trial_ends_at, license_code, app_trial_started_at, app_trial_ends_at')
         .eq('user_id', userId)
         .maybeSingle();
     if (error) {
         console.error(`[subscription] Supabase lookup failed for ${userId}:`, error.message);
         // Fail open on transient Supabase errors so a paying user is never
         // locked out by a database hiccup. The next refresh re-checks.
-        return { status: null, trialEndsAt: null, hasLicense: false, fetchedAt: Date.now(), failedOpen: true };
+        return {
+            status: null, trialEndsAt: null, hasLicense: false,
+            appTrialStartedAt: null, appTrialEndsAt: null,
+            fetchedAt: Date.now(), failedOpen: true,
+        };
     }
     const state = {
         status: data?.subscription_status ?? null,
         trialEndsAt: data?.trial_ends_at ? new Date(data.trial_ends_at).getTime() : null,
         hasLicense: !!data?.license_code,
+        // App-level trial: separate from Apple's subscription trial. See migration 002.
+        appTrialStartedAt: data?.app_trial_started_at ? new Date(data.app_trial_started_at).getTime() : null,
+        appTrialEndsAt: data?.app_trial_ends_at ? new Date(data.app_trial_ends_at).getTime() : null,
         fetchedAt: Date.now(),
         failedOpen: false,
     };
@@ -156,25 +163,48 @@ async function getSubscriptionState(userId) {
     return state;
 }
 
+// True iff the user is currently in their 1-week free trial window.
+function isAppTrialActive(state) {
+    if (!state || !state.appTrialEndsAt) return false;
+    return state.appTrialEndsAt > Date.now();
+}
+
 // True when the user is entitled to use trade-tracking features right now.
 // Rules:
+//   - In-app 1-week trial active: always allowed (covers brand new users who
+//     haven't paid yet but are inside their free week).
 //   - 'active' or 'trialing': always allowed.
 //   - 'expired' BUT trial_ends_at is still in the future: Apple sometimes
 //     reports 'expired' during a billing retry window before the access
 //     period has actually ended. Honour Apple's expiresDate as the source
 //     of truth and keep the user active until then.
-//   - 'expired' AND past trial_ends_at: blocked.
-//   - status null (no Apple data yet): treat as active. This protects users
-//     whose first /purchase call hasn't landed yet, plus legacy rows that
-//     existed before subscription_status was tracked.
+//   - 'expired' AND past trial_ends_at: blocked, UNLESS the in-app trial is
+//     still running (rare edge case where someone subscribed, cancelled and
+//     is back inside the original 7-day trial — let them finish it).
+//   - App trial expired AND no active sub: blocked.
+//   - status null AND app trial not started yet: treat as access. Brand new
+//     user who hasn't connected MT5 yet — they're allowed to reach
+//     /connect-mt5 which is what starts the trial.
 async function isSubscriptionActive(userId) {
     const state = await getSubscriptionState(userId);
     if (!state) return true;
+    if (isAppTrialActive(state)) return true;
     if (state.status === 'active' || state.status === 'trialing') return true;
     if (state.status === 'expired') {
         if (state.trialEndsAt && state.trialEndsAt > Date.now()) return true;
+        // Edge case: returning user whose old Apple ID had a cancelled sub
+        // but who has NEVER started the in-app trial under this user_id.
+        // Without this branch they can't reach /connect-mt5 to start their
+        // first free week. We grant access here exactly like pre-trial below.
+        if (!state.appTrialStartedAt) return true;
         return false;
     }
+    // status === null
+    // If the in-app trial has already started AND ended without a paid sub,
+    // the user is past their free week and must subscribe.
+    if (state.appTrialEndsAt && state.appTrialEndsAt <= Date.now()) return false;
+    // Pre-trial (no MT5 connect yet) and no Apple data: allow. The trial will
+    // start the moment they call /connect-mt5.
     return true;
 }
 
@@ -751,6 +781,152 @@ setTimeout(() => {
 }, 5 * 60 * 1000);
 
 // =====================
+// Trial expiry push scheduler
+// =====================
+// Sends two pushes ahead of every user's app_trial_ends_at:
+//   - 24h before: "Your free week ends tomorrow"
+//   - 1h before:  "Your free trial expires in 1 hour"
+//
+// Each push is idempotent: the *_at column is stamped on send and the query
+// excludes rows that already have it set, so duplicate notifications are
+// impossible even if the scheduler is restarted mid-cycle.
+//
+// Window widths (24h ± 1h and 1h ± 7.5min) are intentionally larger than the
+// 5-min scheduler tick so a notification cannot slip through if the loop is
+// briefly delayed by Railway autoscaling or a slow Supabase query.
+async function runTrialNotificationScheduler() {
+    if (!apnProvider) return; // No push pipeline configured, nothing to do.
+
+    const now = Date.now();
+    const ONE_HOUR_MS = 60 * 60 * 1000;
+    const ONE_MIN_MS = 60 * 1000;
+
+    // ---- 24h pre-expiry pushes ----
+    try {
+        const lower24 = new Date(now + 23 * ONE_HOUR_MS).toISOString();
+        const upper24 = new Date(now + 25 * ONE_HOUR_MS).toISOString();
+        const { data: due24, error: err24 } = await supabase
+            .from('purchases')
+            .select('user_id, device_token, app_trial_ends_at')
+            .gte('app_trial_ends_at', lower24)
+            .lte('app_trial_ends_at', upper24)
+            .is('trial_notified_24h_at', null);
+        if (err24) {
+            console.error('[trial-push] 24h query failed:', err24.message);
+        } else {
+            for (const row of (due24 ?? [])) {
+                if (!row.device_token) continue;
+                try {
+                    await sendPushNotification(
+                        row.device_token,
+                        'Your free trial ends tomorrow',
+                        "You've got 24 hours left of EmotionLock. Activate to keep using it without interruption."
+                    );
+                    await supabase
+                        .from('purchases')
+                        .update({ trial_notified_24h_at: new Date().toISOString() })
+                        .eq('user_id', row.user_id);
+                    console.log(`[trial-push] 24h notice sent to ${row.user_id.slice(0,8)}`);
+                } catch (e) {
+                    console.error(`[trial-push] 24h send failed for ${row.user_id}:`, e.message);
+                }
+            }
+        }
+    } catch (e) {
+        console.error('[trial-push] 24h block error:', e.message);
+    }
+
+    // ---- 1h pre-expiry pushes ----
+    // Window runs from "now" (lower bound) to "+68min" (upper bound). The wide
+    // lower bound catches users whose trial is about to expire within the next
+    // hour even if a previous scheduler tick was missed (e.g. Railway restart
+    // or a slow Supabase query). The 24h push is the long-warning; the 1h
+    // push is the last-call. Better to send slightly early than not at all.
+    // We deliberately do not push AFTER expiry (which would be confusing) —
+    // the upper bound is the only filter we need on the future side.
+    try {
+        const lower1 = new Date(now).toISOString();                     // now
+        const upper1 = new Date(now + 68 * ONE_MIN_MS).toISOString();   // 68 min
+        const { data: due1, error: err1 } = await supabase
+            .from('purchases')
+            .select('user_id, device_token, app_trial_ends_at')
+            .gte('app_trial_ends_at', lower1)
+            .lte('app_trial_ends_at', upper1)
+            .is('trial_notified_1h_at', null);
+        if (err1) {
+            console.error('[trial-push] 1h query failed:', err1.message);
+        } else {
+            for (const row of (due1 ?? [])) {
+                if (!row.device_token) continue;
+                try {
+                    await sendPushNotification(
+                        row.device_token,
+                        'Your free trial ends in 1 hour',
+                        'Activate now to keep your trade limit protection running.'
+                    );
+                    await supabase
+                        .from('purchases')
+                        .update({ trial_notified_1h_at: new Date().toISOString() })
+                        .eq('user_id', row.user_id);
+                    console.log(`[trial-push] 1h notice sent to ${row.user_id.slice(0,8)}`);
+                } catch (e) {
+                    console.error(`[trial-push] 1h send failed for ${row.user_id}:`, e.message);
+                }
+            }
+        }
+    } catch (e) {
+        console.error('[trial-push] 1h block error:', e.message);
+    }
+
+    // ---- Cost cleanup: undeploy MetaAPI for users whose trial expired and
+    // never paid. Without this, an abandoned trial keeps incurring MetaAPI
+    // hourly cost indefinitely. We wait 24h past trial_ends_at before
+    // undeploying to give legitimate paying users time to complete their
+    // license + sub purchase without their MT5 connection going dark.
+    try {
+        const trialGraceCutoff = new Date(now - 24 * ONE_HOUR_MS).toISOString();
+        const { data: abandoned, error: errAbandoned } = await supabase
+            .from('purchases')
+            .select('user_id, meta_api_account_id, app_trial_ends_at, subscription_status, license_code, meta_api_undeployed_at')
+            .lte('app_trial_ends_at', trialGraceCutoff)
+            .not('meta_api_account_id', 'is', null)
+            .is('meta_api_undeployed_at', null);
+        if (errAbandoned) {
+            console.error('[trial-push] Abandoned query failed:', errAbandoned.message);
+        } else {
+            for (const row of (abandoned ?? [])) {
+                // Skip users who paid: license + active or trialing sub means
+                // they are a real paying customer, hands off their MT5.
+                const subActive = row.subscription_status === 'active' || row.subscription_status === 'trialing';
+                if (subActive && row.license_code) continue;
+                try {
+                    await undeployMetaApiAccount(row.meta_api_account_id);
+                    await supabase
+                        .from('purchases')
+                        .update({ meta_api_undeployed_at: new Date().toISOString() })
+                        .eq('user_id', row.user_id);
+                    if (userStates[row.user_id]) {
+                        userStates[row.user_id].mt5Connected = false;
+                    }
+                    invalidateSubscriptionCache(row.user_id);
+                    console.log(`[trial-push] Undeployed abandoned trial MetaAPI for ${row.user_id.slice(0,8)}`);
+                } catch (e) {
+                    console.error(`[trial-push] Undeploy failed for ${row.user_id}:`, e.message);
+                }
+            }
+        }
+    } catch (e) {
+        console.error('[trial-push] Cost cleanup block error:', e.message);
+    }
+}
+
+// 5-minute tick. Same boot-delay pattern as cleanupExpiredMetaApiAccounts.
+setTimeout(() => {
+    runTrialNotificationScheduler().catch(() => {});
+    setInterval(() => runTrialNotificationScheduler().catch(() => {}), 5 * 60 * 1000);
+}, 5 * 60 * 1000);
+
+// =====================
 // Routes
 // =====================
 
@@ -850,10 +1026,12 @@ app.post('/connect-mt5/:userId', mt5Limiter, async (req, res) => {
     }
 
     try {
-        // Check Supabase for an existing MetaAPI account for this user
+        // Check Supabase for an existing MetaAPI account for this user.
+        // Also pull app_trial_started_at so we know whether this connect is
+        // the moment that should start the 1-week free trial clock.
         const { data: savedAccount } = await supabase
             .from('purchases')
-            .select('meta_api_account_id, mt5_server, mt5_login')
+            .select('meta_api_account_id, mt5_server, mt5_login, app_trial_started_at, app_trial_ends_at')
             .eq('user_id', userId)
             .maybeSingle();
 
@@ -920,13 +1098,29 @@ app.post('/connect-mt5/:userId', mt5Limiter, async (req, res) => {
         // purchase, and a silent UPDATE no-op would lose the MT5 link on the
         // next server restart. The unique index on user_id (partial,
         // WHERE user_id IS NOT NULL) makes this safe.
-        const { error: mt5SaveErr } = await supabase.from('purchases').upsert({
+        //
+        // First-ever MT5 connect for this user starts the 1-week free trial.
+        // We only set the trial timestamps if they're null on the existing row
+        // — never overwrite, so reconnects do not extend the trial.
+        const mt5Patch = {
             user_id: userId,
             meta_api_account_id: accountId,
             mt5_server: server,
             mt5_login: String(login),
-        }, { onConflict: 'user_id' });
+        };
+        const isFirstMt5Connect = !savedAccount?.app_trial_started_at;
+        if (isFirstMt5Connect) {
+            const trialStart = new Date();
+            const trialEnd = new Date(trialStart.getTime() + 7 * 24 * 60 * 60 * 1000);
+            mt5Patch.app_trial_started_at = trialStart.toISOString();
+            mt5Patch.app_trial_ends_at = trialEnd.toISOString();
+            console.log(`[connect-mt5] Starting 1-week free trial for user ${userId.slice(0,8)}, ends at ${trialEnd.toISOString()}`);
+        }
+        const { error: mt5SaveErr } = await supabase.from('purchases').upsert(mt5Patch, { onConflict: 'user_id' });
         if (mt5SaveErr) console.error(`Failed to persist MT5 for ${userId}:`, mt5SaveErr.message);
+        // Trial start (or any MT5 reconnect) is a state change worth invalidating
+        // the cache for so the next /status poll sees the fresh values.
+        invalidateSubscriptionCache(userId);
 
         debugLog(`MT5 connected for user ${userId}`);
         res.json({
@@ -1074,6 +1268,20 @@ app.get('/status/:userId', statusLimiter, async (req, res) => {
             // paying user on a Supabase transient.
         }
 
+        // Trial info — surface enough for the iOS app to render the trial
+        // banner and decide between PaywallView and ContentView locally.
+        // We pull the freshest state here rather than reading the cached
+        // version because trial expiry crosses minute boundaries that the
+        // 60s cache could miss.
+        const subState = await getSubscriptionState(userId);
+        const trialActive = isAppTrialActive(subState);
+        const trialEndsAt = subState.appTrialEndsAt;
+        let trialDaysRemaining = null;
+        if (trialEndsAt) {
+            const msLeft = trialEndsAt - Date.now();
+            trialDaysRemaining = Math.max(0, Math.ceil(msLeft / (24 * 60 * 60 * 1000)));
+        }
+
         res.json({
             tradesCount: user.tradesCount,
             isLocked: user.isLocked,
@@ -1085,6 +1293,11 @@ app.get('/status/:userId', statusLimiter, async (req, res) => {
             maxTrades: user.maxTrades,
             countWinningTrades: user.countWinningTrades ?? false,
             todayDeals: user.todayDeals ?? [],
+            // App-level free trial (1 week from first MT5 connect).
+            trialActive,
+            trialStartedAt: subState.appTrialStartedAt ? new Date(subState.appTrialStartedAt).toISOString() : null,
+            trialEndsAt: trialEndsAt ? new Date(trialEndsAt).toISOString() : null,
+            trialDaysRemaining,
         });
     } catch (err) {
         console.error(`Status error for ${req.params.userId}:`, err.message);
@@ -1205,13 +1418,26 @@ app.post('/unlock/:userId', unlockLimiter, async (req, res) => {
 });
 
 // PUBLIC ROUTE: device token registration — called on app launch. UserId is the Keychain UUID.
-app.post('/register-device/:userId', (req, res) => {
+app.post('/register-device/:userId', async (req, res) => {
     const { userId } = req.params;
     const { deviceToken } = req.body;
     if (!deviceToken) return res.status(400).json({ error: 'deviceToken required' });
     initUser(userId);
     userStates[userId].deviceToken = deviceToken;
     console.log(`User ${userId}: device token registered`);
+
+    // Persist the token to Supabase. Without this, the trial-expiry push
+    // scheduler can't reach users after a Railway restart wipes userStates.
+    // We do this as a best-effort write — a Supabase glitch should not
+    // break the iOS app's device registration flow.
+    try {
+        await supabase.from('purchases').upsert({
+            user_id: userId,
+            device_token: deviceToken,
+        }, { onConflict: 'user_id' });
+    } catch (err) {
+        console.error(`[register-device] Failed to persist token for ${userId}:`, err.message);
+    }
     res.json({ success: true });
 });
 
@@ -1603,6 +1829,49 @@ app.post('/purchase/:userId', async (req, res) => {
         // re-subscribing).
         invalidateSubscriptionCache(userId);
 
+        // Lock reset on post-trial activation.
+        //
+        // When a user's free trial expired with maxTrades reached and they
+        // were locked, paying should give them a fresh start: tradesCount = 0,
+        // isLocked = false, today's deal log cleared. This matches the
+        // generous "trial ends, you pay, you get a clean day" semantics we
+        // committed to. It does NOT apply when:
+        //   - The user is already paying and just renewed (no expired trial).
+        //   - The user is mid-trial (still has free access — no reason to reset).
+        //   - This is a subscription event reflecting state Apple just reported
+        //     as 'expired' (we're recording the bad news, not the recovery).
+        //
+        // Trigger condition: app trial has ended AND the new state grants access
+        // (license + active subscription). We detect "license + sub" by checking
+        // either the patch we just wrote (subscription_status === 'active' or
+        // 'trialing') or by re-reading state. We re-read for safety because the
+        // patch may only contain one of license/subscription on this call.
+        try {
+            const freshState = await getSubscriptionState(userId);
+            const trialExpired = freshState.appTrialEndsAt && freshState.appTrialEndsAt <= Date.now();
+            const subActive = freshState.status === 'active' || freshState.status === 'trialing';
+            const hasLicense = freshState.hasLicense;
+            const grantsAccess = subActive && hasLicense;
+            if (trialExpired && grantsAccess && userStates[userId]) {
+                const u = userStates[userId];
+                if (u.isLocked || u.tradesCount > 0) {
+                    console.log(`[purchase] Post-trial activation reset for ${userId.slice(0,8)}: clearing lock + trade count`);
+                    u.tradesCount = 0;
+                    u.isLocked = false;
+                    u.emergencyUnlocked = false;
+                    u.processedDealIds = new Set();
+                    u.todayDeals = [];
+                    // Persist the cleared counters so a server restart doesn't
+                    // resurrect the old count from Supabase.
+                    saveDailyTrades(userId, 0, u.lastReset).catch(() => {});
+                }
+            }
+        } catch (resetErr) {
+            // Failure here is not fatal — the user still got their access.
+            // Worst case they see yesterday's lock state for the cache TTL.
+            console.error(`[purchase] Post-trial reset check failed for ${userId}:`, resetErr.message);
+        }
+
         console.log(`[purchase] Recorded ${type} for user ${userId.slice(0,8)}: product=${productId} tx=${transactionId}`);
         res.json({ success: true });
 
@@ -1898,6 +2167,18 @@ app.post('/profile/:userId', async (req, res) => {
         return res.status(400).json({ error: 'A valid email address is required' });
     }
 
+    // Block "plus addressing" (foo+1@gmail.com, foo+anything@gmail.com all
+    // land in foo@gmail.com). Without this check a single Gmail user can
+    // generate unlimited "unique" emails to claim multiple free trials.
+    // The error message is intentionally non-technical so the iOS app can
+    // show it verbatim.
+    if (email.includes('+')) {
+        return res.status(400).json({
+            error: 'invalid_email',
+            message: 'Please use your real email address, without a plus sign.',
+        });
+    }
+
     try {
         // Check whether a profile already exists so we only send the
         // admin notification on the FIRST save, not on every edit.
@@ -1912,6 +2193,51 @@ app.post('/profile/:userId', async (req, res) => {
         const cleanLastName  = lastName.trim();
         const cleanEmail     = email.trim().toLowerCase();
 
+        // Email-based trial inheritance.
+        //
+        // Scenario: user installs the app, signs up with email X, starts their
+        // 7-day trial, deletes the app, reinstalls with a different Apple ID,
+        // re-signs up with the same email X. Keychain hands them a fresh
+        // userId, so they would otherwise get a fresh 7-day trial. We block
+        // that by looking up the email on a different userId and, if found,
+        // copying the original app_trial_started_at / app_trial_ends_at over
+        // to the new userId's purchases row.
+        //
+        // The unique index on profiles.email (migration 002) is the final
+        // belt-and-braces guard, but we handle the inheritance here so
+        // returning users with the same email never see a duplicate-email
+        // error — they just keep their original trial window.
+        let inheritedTrialStartedAt = null;
+        let inheritedTrialEndsAt = null;
+        if (isNewProfile) {
+            const { data: emailMatch } = await supabase
+                .from('profiles')
+                .select('user_id')
+                .eq('email', cleanEmail)
+                .neq('user_id', userId)
+                .maybeSingle();
+            if (emailMatch?.user_id) {
+                const { data: oldPurchase } = await supabase
+                    .from('purchases')
+                    .select('app_trial_started_at, app_trial_ends_at')
+                    .eq('user_id', emailMatch.user_id)
+                    .maybeSingle();
+                if (oldPurchase?.app_trial_started_at) {
+                    inheritedTrialStartedAt = oldPurchase.app_trial_started_at;
+                    inheritedTrialEndsAt = oldPurchase.app_trial_ends_at;
+                    console.log(`[profile] Email match found for ${cleanEmail}, inheriting trial window from previous userId`);
+                }
+                // Either way, free up the old email so the unique index does
+                // not reject our new profile row. We blank it rather than
+                // delete the profile because the row is referenced by other
+                // tables (purchases) via user_id.
+                await supabase
+                    .from('profiles')
+                    .update({ email: null })
+                    .eq('user_id', emailMatch.user_id);
+            }
+        }
+
         const { error } = await supabase.from('profiles').upsert(
             {
                 user_id:    userId,
@@ -1925,7 +2251,27 @@ app.post('/profile/:userId', async (req, res) => {
 
         if (error) {
             console.error('[profile] Supabase upsert error:', error.message);
+            // 23505 = unique_violation. Surface a clean error so the iOS app
+            // can show the user a helpful message rather than "Unexpected error".
+            if (error.code === '23505') {
+                return res.status(409).json({
+                    error: 'email_in_use',
+                    message: 'This email is already linked to another EmotionLock account.',
+                });
+            }
             return res.status(500).json({ error: 'Failed to save profile. Please try again.' });
+        }
+
+        // Propagate the inherited trial window to this userId's purchases row.
+        // Upsert because the row may not exist yet (purchases is normally
+        // created on first /connect-mt5 or first /purchase).
+        if (inheritedTrialStartedAt) {
+            await supabase.from('purchases').upsert({
+                user_id: userId,
+                app_trial_started_at: inheritedTrialStartedAt,
+                app_trial_ends_at: inheritedTrialEndsAt,
+            }, { onConflict: 'user_id' });
+            invalidateSubscriptionCache(userId);
         }
 
         console.log(`[profile] Saved profile for user ${userId}`);
