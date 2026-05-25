@@ -347,20 +347,33 @@ async function getMetaApiAccountInfo(accountId) {
 // Every account we create is named `EmotionLock-${userId}` and tagged 'emotionlock'
 // so we can recover by listing accounts and matching on name.
 async function findMetaApiAccountByName(name) {
+    // Paginate. MetaAPI's list endpoint defaults to a page size of ~100. Once
+    // the total account count crosses that boundary, a non-paginated request
+    // would silently stop seeing older accounts and the safety net would
+    // start letting duplicates through. We walk pages until either we find
+    // the match or a page returns fewer rows than the limit (i.e. last page).
+    const PAGE_LIMIT = 100;
+    const MAX_PAGES = 50; // Hard ceiling: 5000 accounts. Plenty for years of growth.
     try {
-        const response = await fetch(`${PROVISIONING_API}/users/current/accounts`, {
-            headers: { 'auth-token': METAAPI_TOKEN }
-        });
-        if (!response.ok) {
-            console.log(`[metaapi] findByName list HTTP ${response.status}`);
-            return null;
+        for (let page = 0; page < MAX_PAGES; page++) {
+            const offset = page * PAGE_LIMIT;
+            const url = `${PROVISIONING_API}/users/current/accounts?limit=${PAGE_LIMIT}&offset=${offset}`;
+            const response = await fetch(url, {
+                headers: { 'auth-token': METAAPI_TOKEN }
+            });
+            if (!response.ok) {
+                console.log(`[metaapi] findByName list HTTP ${response.status} (page ${page})`);
+                return null;
+            }
+            const accounts = await response.json();
+            if (!Array.isArray(accounts)) return null;
+            const match = accounts.find(a => a && a.name === name);
+            if (match) return match;
+            // Last page: fewer results than limit means we have seen everything.
+            if (accounts.length < PAGE_LIMIT) return null;
         }
-        const accounts = await response.json();
-        if (!Array.isArray(accounts)) return null;
-        // Exact match on name. If multiple accounts somehow share a name, prefer
-        // the first one. Duplicate cleanup is a separate admin concern.
-        const match = accounts.find(a => a && a.name === name);
-        return match || null;
+        console.log(`[metaapi] findByName exhausted ${MAX_PAGES} pages without match for ${name}`);
+        return null;
     } catch (err) {
         console.log(`[metaapi] findByName error: ${err.message}`);
         return null;
@@ -443,6 +456,27 @@ const userStates = {};
 // Idempotency set for IAP transactions (survives within process lifetime)
 const processedIAPTransactions = new Set();
 
+// Per-user mutex for /connect-mt5. Prevents concurrent calls from creating
+// duplicate MetaAPI accounts (each account costs money per hour).
+// Map<userId, Promise> — second concurrent call awaits the first.
+const connectMt5InFlight = new Map();
+
+// Returns the calendar date string ("YYYY-MM-DD") in Europe/Amsterdam.
+// Used by the trade-polling loop so the daily reset boundary matches the
+// rule "midnight Europe/Amsterdam" regardless of the server's UTC clock.
+function getAmsterdamDateStr(date = new Date()) {
+    const parts = new Intl.DateTimeFormat('en-CA', {
+        timeZone: 'Europe/Amsterdam',
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit',
+    }).formatToParts(date);
+    const y = parts.find(p => p.type === 'year')?.value ?? '1970';
+    const m = parts.find(p => p.type === 'month')?.value ?? '01';
+    const d = parts.find(p => p.type === 'day')?.value ?? '01';
+    return `${y}-${m}-${d}`;
+}
+
 function initUser(userId) {
     if (!userStates[userId]) {
         userStates[userId] = {
@@ -450,7 +484,12 @@ function initUser(userId) {
             isLocked: false,
             emergencyUnlocked: false,
             emergencyTokens: DEFAULT_TOKENS,
-            lastReset: new Date().toISOString().split('T')[0],
+            // Use Amsterdam date so the lastReset value matches the daily-reset
+            // boundary used everywhere else (polling loop, /status). A UTC
+            // value here would cause an immediate "reset" on the first poll
+            // after 22:00 UTC even though the Amsterdam day hasn't changed.
+            lastReset: getAmsterdamDateStr(),
+            firstSetupComplete: false,
             lastTokenReset: new Date().toISOString(),
             maxTrades: 1,
             // F4: Only count winning trades when true (profit > 0). Default false = count all closes.
@@ -469,8 +508,12 @@ function initUser(userId) {
 }
 
 function checkDailyReset(user, localDateStr) {
-    // Use the client's local date if provided (so reset happens at user's local midnight)
-    const today = localDateStr || new Date().toISOString().split('T')[0];
+    // Canonical reset boundary is Europe/Amsterdam (CLAUDE.md). The iOS app
+    // sends x-local-date already formatted in Amsterdam time, so it should
+    // match. The fallback (no header) used to be UTC, which caused the
+    // polling loop to wipe state hours before the user's actual local
+    // midnight. Now both paths use Amsterdam.
+    const today = localDateStr || getAmsterdamDateStr();
     if (user.lastReset !== today) {
         user.tradesCount = 0;
         user.isLocked = false;
@@ -532,13 +575,23 @@ function shouldResetWeeklyTokens(lastTokenReset) {
 
 function checkWeeklyTokenReset(user, userId) {
     if (shouldResetWeeklyTokens(user.lastTokenReset)) {
+        const nowIso = new Date().toISOString();
         user.emergencyTokens = DEFAULT_TOKENS;
-        user.lastTokenReset = new Date().toISOString();
-        // Persist reset — prefer userId (Apple IAP), fall back to licenseCode (legacy)
+        user.lastTokenReset = nowIso;
+        // Persist reset — prefer userId (Apple IAP), fall back to licenseCode (legacy).
+        // Also stamp last_token_reset so the global sweep knows this user is up-to-date.
         if (userId) {
             saveTokensByUserId(userId, DEFAULT_TOKENS).catch(() => {});
+            supabase.from('purchases')
+                .update({ last_token_reset: nowIso })
+                .eq('user_id', userId)
+                .then(() => {}).catch(() => {});
         } else if (user.licenseCode) {
             saveTokens(user.licenseCode, DEFAULT_TOKENS).catch(() => {});
+            supabase.from('purchases')
+                .update({ last_token_reset: nowIso })
+                .eq('license_code', user.licenseCode)
+                .then(() => {}).catch(() => {});
         }
     }
 }
@@ -552,7 +605,12 @@ async function checkUserTrades(userId) {
     if (!user.mt5Connected) return;
     if (!user.metaApiAccountId) return;
 
-    checkDailyReset(user, new Date().toISOString().split('T')[0]);
+    // Use Europe/Amsterdam local date for the daily reset boundary, not UTC.
+    // Without this, the 15s polling loop wipes processedDealIds + tradesCount
+    // hours BEFORE the user's actual local midnight (between 00:00 UTC and
+    // ~02:00 CET). The iOS app's /status poll uses x-local-date for the same
+    // reason, and these two sources must agree or trades get double-counted.
+    checkDailyReset(user, getAmsterdamDateStr());
 
     try {
         const accountInfo = await getMetaApiAccountInfo(user.metaApiAccountId);
@@ -927,6 +985,114 @@ setTimeout(() => {
 }, 5 * 60 * 1000);
 
 // =====================
+// Weekly token reset sweep
+// =====================
+// The on-activity check (checkWeeklyTokenReset) only fires when a user opens
+// the app. A user who never contacts the backend between two Sundays would
+// keep stale tokens server-side until their next /status — Supabase reads
+// from elsewhere (admin, Command Center) would see the wrong value.
+//
+// This sweep runs every 15 minutes and, when "now" in Europe/Amsterdam is
+// Sunday >= 22:00 OR Monday before the next sweep boundary, finds all
+// purchases rows whose last_token_reset is before the most recent Sunday
+// 22:00 cutoff and updates emergency_tokens_remaining = 2 + stamps the
+// reset timestamp. The query is idempotent: rows already at 2 with a
+// fresh last_token_reset are skipped by the cutoff comparison.
+
+// Returns the Date of the most recent Sunday 22:00 Europe/Amsterdam.
+// Anchors the reset boundary correctly across CET/CEST and across week
+// boundaries (e.g. Tuesday morning -> last reset was 3 days ago).
+function lastSundayResetCutoff(now = new Date()) {
+    // Walk back at most 8 days and find the latest Sunday 22:00 Amsterdam
+    // that is in the past. We rely on getAmsterdamDayHour() which already
+    // handles DST correctly.
+    for (let i = 0; i <= 8; i++) {
+        // Sample at hour granularity is enough — we only need to find the
+        // Sunday 22:00 boundary, not exact second precision.
+        for (let hOffset = 0; hOffset < 24; hOffset++) {
+            const candidate = new Date(now.getTime() - (i * 24 + hOffset) * 60 * 60 * 1000);
+            if (candidate > now) continue;
+            const ams = getAmsterdamDayHour(candidate);
+            if (ams.day === 0 && ams.hour === 22) {
+                // Snap to the start of that Amsterdam hour by zeroing minutes/seconds.
+                candidate.setUTCMinutes(0, 0, 0);
+                return candidate;
+            }
+        }
+    }
+    // Fallback: 7 days ago. Should never reach this in practice.
+    return new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+}
+
+async function sweepWeeklyTokenReset() {
+    try {
+        const now = new Date();
+        const cutoff = lastSundayResetCutoff(now);
+        const cutoffIso = cutoff.toISOString();
+
+        // Only sweep if the cutoff is in the past (i.e. we have crossed the
+        // most recent Sunday 22:00). lastSundayResetCutoff always returns a
+        // past moment, so this is effectively always true — kept explicit
+        // for readability.
+        if (cutoff > now) return;
+
+        // Find rows whose last_token_reset is missing or older than the
+        // cutoff. These are users who have not been reset for this week yet.
+        const { data: stale, error } = await supabase
+            .from('purchases')
+            .select('user_id, emergency_tokens_remaining, last_token_reset')
+            .or(`last_token_reset.is.null,last_token_reset.lt.${cutoffIso}`);
+
+        if (error) {
+            console.error('[token-sweep] query failed:', error.message);
+            return;
+        }
+
+        let reset = 0;
+        for (const row of (stale ?? [])) {
+            if (!row.user_id) continue;
+            // Skip rows that already have full tokens AND a non-null reset
+            // timestamp — they were swept earlier or freshly initialised.
+            // We use this defensive check so an outage that wipes
+            // last_token_reset to null doesn't flip 0-token users back to 2
+            // unfairly mid-week. Wait — actually that IS what we want on a
+            // Sunday boundary. So: only the cutoff comparison gates this.
+            const { error: updErr } = await supabase
+                .from('purchases')
+                .update({
+                    emergency_tokens_remaining: DEFAULT_TOKENS,
+                    last_token_reset: now.toISOString(),
+                })
+                .eq('user_id', row.user_id);
+            if (updErr) {
+                console.error(`[token-sweep] update failed for ${row.user_id}:`, updErr.message);
+                continue;
+            }
+            // Refresh in-memory state if loaded so the next /status returns
+            // the swept value immediately.
+            if (userStates[row.user_id]) {
+                userStates[row.user_id].emergencyTokens = DEFAULT_TOKENS;
+                userStates[row.user_id].lastTokenReset = now.toISOString();
+            }
+            reset++;
+        }
+
+        if (reset > 0) {
+            console.log(`[token-sweep] Reset emergency tokens for ${reset} user(s). Cutoff: ${cutoffIso}`);
+        }
+    } catch (err) {
+        console.error('[token-sweep] Unexpected error:', err.message);
+    }
+}
+
+// 15-minute tick. The 5-min boot delay matches the other schedulers so
+// we don't fire before Supabase + MetaAPI clients are warm.
+setTimeout(() => {
+    sweepWeeklyTokenReset().catch(() => {});
+    setInterval(() => sweepWeeklyTokenReset().catch(() => {}), 15 * 60 * 1000);
+}, 5 * 60 * 1000);
+
+// =====================
 // Routes
 // =====================
 
@@ -1007,6 +1173,24 @@ app.post('/connect-mt5/:userId', mt5Limiter, async (req, res) => {
     if (!userStates[userId]) {
         return res.status(404).json({ error: 'User not found. Activate your license first.' });
     }
+
+    // Per-user mutex. A second concurrent /connect-mt5 call for the same user
+    // (e.g. flaky network retry, double-tap, foregrounding race) must NOT
+    // race the first call through createOrRecoverMetaApiAccount — both calls
+    // would see an empty Supabase row, both would invoke create, and we
+    // would end up with two MetaAPI accounts named EmotionLock-${userId},
+    // each billed hourly. Returning 409 keeps the client side simple: the
+    // iOS app retries on next /status anyway.
+    if (connectMt5InFlight.has(userId)) {
+        return res.status(409).json({
+            error: 'connect_in_progress',
+            message: 'Another connection attempt is already in progress. Please wait a moment.',
+        });
+    }
+    let _resolveInFlight;
+    connectMt5InFlight.set(userId, new Promise(r => { _resolveInFlight = r; }));
+    res.on('finish', () => { connectMt5InFlight.delete(userId); _resolveInFlight && _resolveInFlight(); });
+    res.on('close',  () => { connectMt5InFlight.delete(userId); _resolveInFlight && _resolveInFlight(); });
 
     // Block new MT5 connections for users whose subscription has expired.
     // Without this gate a paywalled user could trigger a new MetaAPI account
@@ -1179,7 +1363,7 @@ app.get('/status/:userId', statusLimiter, async (req, res) => {
             // Two separate queries so a missing column never blocks MT5 restoration.
             const { data: purchase, error: purchaseErr } = await supabase
                 .from('purchases')
-                .select('meta_api_account_id, mt5_server, mt5_login, max_trades, emergency_tokens_remaining, count_winning_trades')
+                .select('meta_api_account_id, mt5_server, mt5_login, max_trades, emergency_tokens_remaining, count_winning_trades, first_setup_complete, last_token_reset')
                 .eq('user_id', userId)
                 .maybeSingle();
 
@@ -1221,9 +1405,16 @@ app.get('/status/:userId', statusLimiter, async (req, res) => {
             if (purchase?.max_trades) user.maxTrades = purchase.max_trades;
             // F4: Restore countWinningTrades preference from Supabase
             if (purchase?.count_winning_trades != null) user.countWinningTrades = purchase.count_winning_trades;
+            // One-shot latch for the initial-setup loophole — survives restarts.
+            if (purchase?.first_setup_complete === true) user.firstSetupComplete = true;
+            // Restore last_token_reset so the on-activity check has the right
+            // anchor and doesn't fire a spurious extra reset after a restart.
+            if (purchase?.last_token_reset) user.lastTokenReset = purchase.last_token_reset;
 
             // Restore today's trade count (separate query — daily_trades columns added later).
-            const todayISO = localDate || new Date().toISOString().split('T')[0];
+            // Amsterdam fallback so the comparison against daily_trades_date is
+            // consistent with the polling loop's reset boundary.
+            const todayISO = localDate || getAmsterdamDateStr();
             const { data: tradeData } = await supabase
                 .from('purchases')
                 .select('daily_trades_count, daily_trades_date')
@@ -1328,10 +1519,17 @@ app.post('/settings/:userId', (req, res) => {
         const user = userStates[userId];
 
         if (maxTrades !== undefined && maxTrades !== user.maxTrades) {
-            // Initial setup: free when the backend still has the factory default (1),
-            // the user has no trades today, and tokens are untouched.
-            // This covers onboarding after a fresh install — not an impulsive mid-day change.
-            const isInitialSetup = user.maxTrades === 1
+            // Initial setup: free ONLY once per user, when the backend still
+            // has the factory default (1) AND the user has not yet completed
+            // their first setup (firstSetupComplete=false). The previous
+            // condition (maxTrades===1 && tradesCount===0 && tokens===2) was
+            // exploitable: every Monday after the Sunday token reset, a user
+            // whose limit happened to be 1 (and who hadn't traded yet that
+            // day) could change their limit for free. The firstSetupComplete
+            // flag is a one-shot latch persisted to Supabase so the loophole
+            // closes the moment the user makes their first real settings call.
+            const isInitialSetup = !user.firstSetupComplete
+                && user.maxTrades === 1
                 && user.tradesCount === 0
                 && user.emergencyTokens === DEFAULT_TOKENS;
 
@@ -1354,6 +1552,11 @@ app.post('/settings/:userId', (req, res) => {
             const wasLocked = user.isLocked;
             user.maxTrades = maxTrades;
 
+            // One-shot latch: any successful maxTrades change closes the
+            // initial-setup loophole permanently. Persisted to Supabase
+            // below so a server restart can't re-open it.
+            user.firstSetupComplete = true;
+
             // Re-evaluate lock state after the change
             if (user.tradesCount >= user.maxTrades) {
                 user.isLocked = true;
@@ -1372,10 +1575,13 @@ app.post('/settings/:userId', (req, res) => {
             debugLog(`User ${userId}: countWinningTrades set to ${countWinningTrades}`);
         }
 
-        // Persist settings to Supabase so they survive server restarts
+        // Persist settings to Supabase so they survive server restarts.
+        // first_setup_complete is included so the initial-setup loophole
+        // stays closed across restarts.
         supabase.from('purchases').update({
             max_trades: user.maxTrades,
             count_winning_trades: user.countWinningTrades,
+            first_setup_complete: user.firstSetupComplete,
         }).eq('user_id', userId).then(() => {}).catch(() => {});
 
         res.json({
@@ -1401,6 +1607,19 @@ app.post('/unlock/:userId', unlockLimiter, async (req, res) => {
         }
         const user = userStates[userId];
         checkWeeklyTokenReset(user, userId);
+        // Guard: do not burn a token when the user is not locked. The UI
+        // already filters this out, but a race condition between status poll
+        // and a fresh trade close could let the call through and silently
+        // cost the user a token for nothing.
+        if (!user.isLocked) {
+            return res.status(400).json({
+                error: 'not_locked',
+                message: 'You are not currently locked. No token has been used.',
+                isLocked: false,
+                tradesCount: user.tradesCount,
+                emergencyTokens: user.emergencyTokens,
+            });
+        }
         if (user.emergencyTokens <= 0) {
             return res.status(400).json({ error: 'No tokens available' });
         }
@@ -2226,20 +2445,47 @@ app.post('/profile/:userId', async (req, res) => {
                 .neq('user_id', userId)
                 .maybeSingle();
             if (emailMatch?.user_id) {
+                // SECURITY: Before we touch the previous owner's email + trial,
+                // verify they are dormant. A user who already paid (has a
+                // license OR an active subscription OR is mid-trial) must NOT
+                // have their email blanked by someone else signing up with
+                // their address. Otherwise an attacker can hijack the email
+                // of any paying user and inherit their trial dates.
                 const { data: oldPurchase } = await supabase
                     .from('purchases')
-                    .select('app_trial_started_at, app_trial_ends_at')
+                    .select('app_trial_started_at, app_trial_ends_at, license_code, subscription_status, original_transaction_id')
                     .eq('user_id', emailMatch.user_id)
                     .maybeSingle();
+
+                const oldHasLicense = !!oldPurchase?.license_code;
+                const oldSubActive = oldPurchase?.subscription_status === 'active'
+                                   || oldPurchase?.subscription_status === 'trialing';
+                const oldHasOriginalTransaction = !!oldPurchase?.original_transaction_id;
+                const oldAppTrialEnds = oldPurchase?.app_trial_ends_at ? new Date(oldPurchase.app_trial_ends_at).getTime() : null;
+                const oldAppTrialActive = oldAppTrialEnds !== null && oldAppTrialEnds > Date.now();
+
+                const oldIsDormant = !oldHasLicense
+                    && !oldSubActive
+                    && !oldHasOriginalTransaction
+                    && !oldAppTrialActive;
+
+                if (!oldIsDormant) {
+                    console.warn(`[profile] Refusing email reuse: ${cleanEmail} belongs to non-dormant userId ${emailMatch.user_id.slice(0,8)}`);
+                    return res.status(409).json({
+                        error: 'email_in_use',
+                        message: 'This email is already linked to an active EmotionLock account. Contact support if this is your account.',
+                    });
+                }
+
                 if (oldPurchase?.app_trial_started_at) {
                     inheritedTrialStartedAt = oldPurchase.app_trial_started_at;
                     inheritedTrialEndsAt = oldPurchase.app_trial_ends_at;
-                    console.log(`[profile] Email match found for ${cleanEmail}, inheriting trial window from previous userId`);
+                    console.log(`[profile] Email match found for ${cleanEmail} (dormant), inheriting trial window from previous userId`);
                 }
-                // Either way, free up the old email so the unique index does
-                // not reject our new profile row. We blank it rather than
-                // delete the profile because the row is referenced by other
-                // tables (purchases) via user_id.
+                // Old user is dormant: free up the email so the unique index
+                // does not reject our new profile row. We blank rather than
+                // delete the profile because purchases references it via
+                // user_id, and we still want admin to be able to audit.
                 await supabase
                     .from('profiles')
                     .update({ email: null })
@@ -2309,40 +2555,67 @@ app.post('/profile/:userId', async (req, res) => {
     }
 });
 
-// Delete account — required by Apple App Store policy
+// Delete account — required by Apple App Store policy.
+// Must work even when in-memory state is empty (e.g. cold Railway restart
+// before any /status call). Source of truth is Supabase + MetaAPI.
 app.delete('/delete-account/:userId', async (req, res) => {
     const { userId } = req.params;
 
-    if (!userStates[userId]) {
-        return res.status(404).json({ error: 'User not found. Open the app first.' });
+    if (!UUID_V4_RE.test(userId)) {
+        return res.status(400).json({ error: 'Invalid userId format.' });
     }
 
-    const user = userStates[userId];
-
     try {
-        // Disconnect MT5 if connected
-        if (user?.metaApiAccountId) {
+        // Resolve the MetaAPI account ID from BOTH sources. In-memory if loaded,
+        // otherwise Supabase. We must NOT 404 just because the user hasn't
+        // opened the app this session — Apple requires deletion to succeed
+        // for any account that exists server-side.
+        let metaApiAccountId = userStates[userId]?.metaApiAccountId ?? null;
+        if (!metaApiAccountId) {
+            const { data: row } = await supabase
+                .from('purchases')
+                .select('meta_api_account_id')
+                .eq('user_id', userId)
+                .maybeSingle();
+            metaApiAccountId = row?.meta_api_account_id ?? null;
+        }
+
+        // MetaAPI cleanup: undeploy AND delete the account so we stop paying
+        // MetaAPI's hourly cost. Failure here must not block the rest of
+        // the deletion — we log and continue.
+        if (metaApiAccountId) {
             try {
-                await undeployAndDeleteMetaApiAccount(user.metaApiAccountId);
+                await undeployAndDeleteMetaApiAccount(metaApiAccountId);
             } catch (e) {
-                console.log(`MT5 cleanup on account delete for ${userId}:`, e.message);
+                console.log(`[delete-account] MetaAPI cleanup warning for ${userId}:`, e.message);
             }
         }
 
-        // Clear from in-memory state
+        // Drop in-memory state if present. Idempotent — safe to call even
+        // when the entry doesn't exist.
         delete userStates[userId];
+        invalidateSubscriptionCache(userId);
 
-        // Clear all user data from Supabase — match on user_id (UUID from Keychain)
-        await supabase.from('purchases').update({
-            meta_api_account_id: null,
-            mt5_server: null,
-            mt5_login: null,
-            emergency_tokens_remaining: null,
-            emergency_tokens_purchased: null,
-        }).eq('user_id', userId);
+        // Supabase cleanup. We DELETE the purchases row entirely so a
+        // re-installing user gets a clean slate. Apple still has the
+        // receipt history server-side via App Store Server Notifications,
+        // so we are not losing audit trail for refunds.
+        const { error: purchaseErr } = await supabase
+            .from('purchases')
+            .delete()
+            .eq('user_id', userId);
+        if (purchaseErr) {
+            console.error(`[delete-account] Supabase purchases delete failed for ${userId}:`, purchaseErr.message);
+        }
 
-        // Also remove profile data (GDPR compliance)
-        await supabase.from('profiles').delete().eq('user_id', userId);
+        // Profile data (GDPR).
+        const { error: profileErr } = await supabase
+            .from('profiles')
+            .delete()
+            .eq('user_id', userId);
+        if (profileErr) {
+            console.error(`[delete-account] Supabase profiles delete failed for ${userId}:`, profileErr.message);
+        }
 
         console.log(`Account deleted for user ${userId}`);
         res.json({ success: true });
