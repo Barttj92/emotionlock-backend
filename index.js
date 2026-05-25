@@ -2170,13 +2170,22 @@ app.post('/profile/:userId', async (req, res) => {
     // Block "plus addressing" (foo+1@gmail.com, foo+anything@gmail.com all
     // land in foo@gmail.com). Without this check a single Gmail user can
     // generate unlimited "unique" emails to claim multiple free trials.
-    // The error message is intentionally non-technical so the iOS app can
-    // show it verbatim.
+    //
+    // Allowlist: the admin's own address (janssenbart92@gmail.com) is
+    // exempt because Bart relies on plus-addressing to test the trial flow
+    // end-to-end with fresh "users" that all land in his real inbox.
+    // The local part is checked case-insensitively against the bare name
+    // (before the '+'). Any other plus address is rejected.
     if (email.includes('+')) {
-        return res.status(400).json({
-            error: 'invalid_email',
-            message: 'Please use your real email address, without a plus sign.',
-        });
+        const localPart = String(email).trim().toLowerCase().split('@')[0] || '';
+        const beforePlus = localPart.split('+')[0];
+        const isAdminTest = beforePlus === 'janssenbart92';
+        if (!isAdminTest) {
+            return res.status(400).json({
+                error: 'invalid_email',
+                message: 'Please use your real email address, without a plus sign.',
+            });
+        }
     }
 
     try {
