@@ -522,6 +522,14 @@ function initUser(userId) {
             mt5Login: null,
             mt5Region: 'vint-hill',
             processedDealIds: new Set(),
+            // Partial-fill collapse: a single trade may produce multiple MetaAPI
+            // deals if the broker splits the close into chunks. We want one
+            // tradesCount++ per unique position the user opened+closed today,
+            // not per partial fill. processedPositionIds tracks which positions
+            // already counted this day; cleared on daily reset alongside
+            // processedDealIds. We still record every individual deal id so
+            // the overlap window doesn't reprocess them.
+            processedPositionIds: new Set(),
             todayDeals: [],
             lastDealCheck: null,
             // MT5 sync status surfaced to the iOS app via /status so the UI can
@@ -553,6 +561,7 @@ function checkDailyReset(user, localDateStr) {
         user.emergencyUnlocked = false;
         user.lastReset = today;
         user.processedDealIds = new Set();
+        user.processedPositionIds = new Set();
         user.todayDeals = [];
     }
 }
@@ -739,11 +748,25 @@ async function checkUserTrades(userId) {
             //    to max(tradesCount, seedCloseCount). Never decrement.
             const seedDeals = await getDeals(user.metaApiAccountId, user.mt5Region, todayMidnight.toISOString(), now.toISOString());
             user.todayDeals = [];
+            // Rebuild processedPositionIds from scratch since seed represents
+            // the full picture of today's deals as MetaAPI sees them.
+            user.processedPositionIds = new Set();
             let seedCloseCount = 0;
             for (const deal of seedDeals) {
                 user.processedDealIds.add(deal.id);
                 const isTradeClose = deal.entryType === 'DEAL_ENTRY_OUT' || deal.entryType === 'DEAL_ENTRY_INOUT';
                 if (!isTradeClose || deal.type === 'DEAL_TYPE_BALANCE') continue;
+
+                // Partial-fill collapse: only the first close of each unique
+                // positionId is shown in todayDeals and counted. Subsequent
+                // partials (same trade, multiple chunks) are silently consumed
+                // so a 1-lot order split across 2 partials = 1 trade, not 2.
+                // Fallback to deal.id when positionId is missing so we don't
+                // accidentally collapse unrelated deals.
+                const positionId = deal.positionId || `_deal_${deal.id}`;
+                if (user.processedPositionIds.has(positionId)) continue;
+                user.processedPositionIds.add(positionId);
+
                 const direction = deal.type === 'DEAL_TYPE_SELL' ? 'Long' : 'Short';
                 const dealProfit = deal.profit ?? null;
                 user.todayDeals.push({
@@ -811,6 +834,20 @@ async function checkUserTrades(userId) {
             if (deal.type === 'DEAL_TYPE_BALANCE') continue;
 
             user.processedDealIds.add(deal.id);
+
+            // Partial-fill collapse: a single trade may close in multiple
+            // chunks (broker-side splitting), each producing its own deal but
+            // all sharing the same positionId. Count and surface only the
+            // first close of each position; consume the rest silently so the
+            // user's discipline tally matches their intent (1 trade = 1 close
+            // decision, not N partial fills). Fallback to deal.id keeps
+            // unrelated deals from collapsing if positionId is missing.
+            const positionId = deal.positionId || `_deal_${deal.id}`;
+            if (user.processedPositionIds.has(positionId)) {
+                debugLog(`[trades] ${userId.slice(0,8)}: skipping partial fill for already-counted position ${positionId} (deal ${deal.id})`);
+                continue;
+            }
+            user.processedPositionIds.add(positionId);
 
             // F4: countWinningTrades — skip losing/breakeven trades when enabled.
             // profit null = no financial data (e.g. crypto deals), counted as a trade.
@@ -1338,6 +1375,63 @@ app.post('/connect-mt5/:userId', mt5Limiter, async (req, res) => {
             .eq('user_id', userId)
             .maybeSingle();
 
+        // Risk #4: detect duplicate MT5 credentials across user_ids.
+        // Scenario: user wipes Keychain (factory reset, restore from backup
+        // without Keychain sync, or Apple ID switch) → app generates a fresh
+        // userId on next launch → reconnect MT5 with same broker creds →
+        // backend safety net (findMetaApiAccountByName) only looks for
+        // "EmotionLock-${userId}" so it doesn't see the old account → new
+        // MetaAPI account created. Both accounts now bill hourly until
+        // someone notices.
+        //
+        // Variant 1 (safe): observe and notify. We DO NOT auto-claim the old
+        // account because two real users could legitimately share one demo
+        // MT5 account, and silently transferring ownership is irreversible.
+        // Admin gets an email and decides via /admin/metaapi-accounts/:id.
+        //
+        // Throttle: only fire on the user's first-ever connect (no trial
+        // timestamp yet) so a single recurring user with a duplicate doesn't
+        // spam the inbox on every reconnect.
+        const isFirstConnectForDupeCheck = !savedAccount?.app_trial_started_at;
+        if (isFirstConnectForDupeCheck) {
+            try {
+                const { data: dupes } = await supabase
+                    .from('purchases')
+                    .select('user_id, meta_api_account_id, mt5_server, mt5_login, subscription_status, app_trial_ends_at, created_at')
+                    .eq('mt5_server', server)
+                    .eq('mt5_login', String(login))
+                    .neq('user_id', userId)
+                    .not('meta_api_account_id', 'is', null);
+                if (dupes && dupes.length > 0) {
+                    console.log(`[connect-mt5] Duplicate MT5 detected: ${dupes.length} other user(s) already linked to ${server}/${login} (new user ${userId})`);
+                    const lines = [
+                        `New /connect-mt5 from user ${userId} matches MT5 credentials already claimed by ${dupes.length} other user_id(s).`,
+                        ``,
+                        `New user: ${userId}`,
+                        `MT5 server: ${server}`,
+                        `MT5 login: ${login}`,
+                        ``,
+                        `Likely cause: Keychain reset, restore-from-backup, or Apple ID switch by the same person. The old MetaAPI account(s) are now orphaned and still billing hourly.`,
+                        ``,
+                        `Existing users with same MT5 creds:`,
+                        ...dupes.map(d => `  - user_id=${d.user_id} metaApiAccountId=${d.meta_api_account_id} sub=${d.subscription_status} trial_ends=${d.app_trial_ends_at} created=${d.created_at}`),
+                        ``,
+                        `If old user is abandoned, clean up via:`,
+                        `  DELETE /admin/metaapi-accounts/{old_meta_api_account_id}`,
+                        ``,
+                        `Time (Europe/Amsterdam): ${adminNotifyTimestamp()}`,
+                    ];
+                    notifyAdmin({
+                        subject: `[EmotionLock] Duplicate MT5 detected for user ${userId.slice(0,8)}`,
+                        lines,
+                    }).catch(() => {});
+                }
+            } catch (e) {
+                console.error(`[connect-mt5] Duplicate MT5 check failed for ${userId}:`, e.message);
+                // Fail open: a Supabase glitch must never block a legitimate connect.
+            }
+        }
+
         const existingMetaApiId = savedAccount?.meta_api_account_id || userStates[userId].metaApiAccountId;
         // Fall back to in-memory state when the Supabase row isn't populated yet.
         // Without this, every reconnect creates a new MetaAPI account.
@@ -1398,6 +1492,7 @@ app.post('/connect-mt5/:userId', mt5Limiter, async (req, res) => {
         // Keeping it for same-account reconnects prevents today's closes from being double-counted.
         if (!isSameAccount) {
             userStates[userId].processedDealIds = new Set();
+            userStates[userId].processedPositionIds = new Set();
             userStates[userId].tradesCount = 0;
             saveDailyTrades(userId, 0, userStates[userId].lastReset).catch(() => {});
         }
@@ -1838,6 +1933,7 @@ app.get('/admin/user-state/:userId', async (req, res) => {
         isLocked: user.isLocked,
         lastDealCheck: user.lastDealCheck,
         processedDealIds: [...(user.processedDealIds || [])],
+        processedPositionIds: [...(user.processedPositionIds || [])],
         metaApiAccountInfo: accountInfo ? {
             state: accountInfo.state,
             connectionStatus: accountInfo.connectionStatus,
