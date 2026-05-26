@@ -329,6 +329,27 @@ async function undeployAndDeleteMetaApiAccount(accountId) {
     }
 }
 
+// Forces a MetaAPI account to reconnect to the broker by cycling deploy state.
+// Used by the polling auto-recovery path when an account is DEPLOYED but
+// connectionStatus is DISCONNECTED — calling /deploy alone on an already
+// deployed account is a no-op and won't kick the broker connection. The
+// undeploy-then-deploy cycle is the documented way to force a fresh sync.
+// Returns true on success, false on any failure (logged, never throws to
+// caller so the polling loop can stay healthy).
+async function redeployMetaApiAccount(accountId) {
+    try {
+        await undeployMetaApiAccount(accountId);
+        // Short wait so MetaAPI registers the undeploy before we redeploy.
+        // Empirically 3-5s is enough; we use 5s to be safe on a slow region.
+        await new Promise(r => setTimeout(r, 5000));
+        await deployMetaApiAccount(accountId);
+        return true;
+    } catch (e) {
+        console.error(`[redeploy] Failed for ${accountId}: ${e.message}`);
+        return false;
+    }
+}
+
 async function getMetaApiAccountInfo(accountId) {
     const response = await fetch(`${PROVISIONING_API}/users/current/accounts/${accountId}`, {
         headers: { 'auth-token': METAAPI_TOKEN }
@@ -503,6 +524,18 @@ function initUser(userId) {
             processedDealIds: new Set(),
             todayDeals: [],
             lastDealCheck: null,
+            // MT5 sync status surfaced to the iOS app via /status so the UI can
+            // show "connecting" vs "disconnected, retry" vs "synchronizing"
+            // instead of an opaque 0/N counter when something upstream is wrong.
+            // Updated by checkUserTrades each poll based on MetaAPI accountInfo.
+            mt5SyncStatus: 'not_connected',
+            mt5SyncStatusAt: null,
+            // Throttle for the auto-redeploy path. Without this a stuck account
+            // would get hammered with redeploy calls every 15s, racking up
+            // unnecessary MetaAPI traffic and never giving the broker time to
+            // resync. 3 minutes is enough for a normal undeploy+deploy cycle
+            // (~30-60s) plus broker sync (~30-60s) plus a safety margin.
+            lastRedeployAttempt: null,
         };
     }
 }
@@ -616,17 +649,72 @@ async function checkUserTrades(userId) {
         const accountInfo = await getMetaApiAccountInfo(user.metaApiAccountId);
         if (!accountInfo) {
             console.log(`[trades] ${userId.slice(0,8)}: MetaApi account not found (id: ${user.metaApiAccountId})`);
+            user.mt5SyncStatus = 'unknown';
+            user.mt5SyncStatusAt = new Date().toISOString();
             return;
         }
 
         if (accountInfo.region) user.mt5Region = accountInfo.region;
+
+        // Derive a UX-friendly sync status from the raw MetaAPI fields so
+        // the iOS app can surface "MT5 is reconnecting" or "tap to reconnect"
+        // instead of silently showing 0/N when the upstream broker link is
+        // down. Stored on user state, returned via /status.
+        let syncStatus = 'unknown';
+        if (accountInfo.state === 'DEPLOYED') {
+            if (accountInfo.connectionStatus === 'CONNECTED') syncStatus = 'connected';
+            else if (accountInfo.connectionStatus === 'SYNCHRONIZING') syncStatus = 'synchronizing';
+            else if (accountInfo.connectionStatus === 'DISCONNECTED') syncStatus = 'disconnected';
+            else syncStatus = 'unknown';
+        } else if (accountInfo.state === 'DEPLOYING') {
+            syncStatus = 'deploying';
+        } else if (accountInfo.state === 'UNDEPLOYED' || accountInfo.state === 'UNDEPLOYING') {
+            syncStatus = 'undeployed';
+        }
+        user.mt5SyncStatus = syncStatus;
+        user.mt5SyncStatusAt = new Date().toISOString();
 
         const isReady = accountInfo.state === 'DEPLOYED' &&
             (accountInfo.connectionStatus === 'CONNECTED' || accountInfo.connectionStatus === 'SYNCHRONIZING');
 
         debugLog(`[trades] ${userId.slice(0,8)}: state=${accountInfo.state} status=${accountInfo.connectionStatus} region=${user.mt5Region} ready=${isReady}`);
 
-        if (!isReady) return;
+        if (!isReady) {
+            // Auto-recovery: silent failure prevention.
+            // Two stuck states can leave a paying user with no trade tracking
+            // and no signal that something is wrong:
+            //   1. DEPLOYED + DISCONNECTED — account is up but broker link
+            //      dropped. Just calling /deploy is a no-op when state is
+            //      already DEPLOYED, so we need redeployMetaApiAccount
+            //      (undeploy -> wait -> deploy) to force a fresh sync.
+            //   2. UNDEPLOYED while user still has access — either cleanup
+            //      raced with a re-subscribe, or someone manually undeployed,
+            //      or MetaAPI's own housekeeping kicked in. Plain /deploy
+            //      is enough.
+            // Throttle so we don't hammer MetaAPI: max one attempt per
+            // REDEPLOY_THROTTLE_MS per user. The check is fire-and-forget;
+            // the next poll cycle sees the new state and either continues
+            // normally (account back to CONNECTED) or retries after throttle.
+            const REDEPLOY_THROTTLE_MS = 3 * 60 * 1000;
+            const nowMs = Date.now();
+            const canRetry = !user.lastRedeployAttempt ||
+                (nowMs - user.lastRedeployAttempt) > REDEPLOY_THROTTLE_MS;
+
+            if (canRetry && accountInfo.state === 'DEPLOYED' && accountInfo.connectionStatus === 'DISCONNECTED') {
+                user.lastRedeployAttempt = nowMs;
+                console.log(`[trades] ${userId.slice(0,8)}: account DEPLOYED+DISCONNECTED, triggering redeploy cycle`);
+                redeployMetaApiAccount(user.metaApiAccountId).then(ok => {
+                    console.log(`[trades] ${userId.slice(0,8)}: redeploy ${ok ? 'completed' : 'failed'}`);
+                });
+            } else if (canRetry && (accountInfo.state === 'UNDEPLOYED' || accountInfo.state === 'UNDEPLOYING')) {
+                user.lastRedeployAttempt = nowMs;
+                console.log(`[trades] ${userId.slice(0,8)}: account ${accountInfo.state} but user is active, triggering deploy`);
+                deployMetaApiAccount(user.metaApiAccountId).catch(e =>
+                    console.error(`[trades] ${userId.slice(0,8)}: auto-deploy failed: ${e.message}`)
+                );
+            }
+            return;
+        }
 
         // Incremental fetch: only pull deals since last successful check (with 60s overlap for safety).
         // Falls back to today-midnight on first run or after a daily reset.
@@ -1297,6 +1385,15 @@ app.post('/connect-mt5/:userId', mt5Limiter, async (req, res) => {
         userStates[userId].mt5Server = server;
         userStates[userId].mt5Login = String(login);
         userStates[userId].mt5Connected = true;
+        // Surface "connecting" immediately so the iOS app can show the right
+        // state right after /connect-mt5 returns, before the first poll has
+        // had time to fetch real accountInfo. checkUserTrades overwrites this
+        // within 15s with the actual state from MetaAPI.
+        userStates[userId].mt5SyncStatus = 'connecting';
+        userStates[userId].mt5SyncStatusAt = new Date().toISOString();
+        // Manual reconnect resets the redeploy throttle so the polling loop
+        // doesn't refuse to help if a previous redeploy attempt was recent.
+        userStates[userId].lastRedeployAttempt = null;
         // Only clear the processed-deal log when switching to a different account.
         // Keeping it for same-account reconnects prevents today's closes from being double-counted.
         if (!isSameAccount) {
@@ -1363,6 +1460,8 @@ app.delete('/connect-mt5/:userId', async (req, res) => {
         user.mt5Connected = false;
         user.mt5Server = null;
         user.mt5Login = null;
+        user.mt5SyncStatus = 'not_connected';
+        user.mt5SyncStatusAt = new Date().toISOString();
         // Keep meta_api_account_id, mt5_server, mt5_login in Supabase so reconnect can reuse the account
 
         console.log(`MT5 disconnected for user ${userId}`);
@@ -1427,6 +1526,11 @@ app.get('/status/:userId', statusLimiter, async (req, res) => {
                     user.mt5Server = purchase.mt5_server;
                     user.mt5Login = purchase.mt5_login;
                     user.mt5Connected = true;
+                    // Connecting is the honest state: account is restored but
+                    // we don't yet know its live MetaAPI status. First poll
+                    // overwrites with the real value within 15s.
+                    user.mt5SyncStatus = 'connecting';
+                    user.mt5SyncStatusAt = new Date().toISOString();
                     console.log(`[status] Restored MT5 connection for ${userId}`);
                     deployMetaApiAccount(purchase.meta_api_account_id).catch(e =>
                         console.log(`[status] Redeploy warning for ${userId}:`, e.message)
@@ -1512,6 +1616,14 @@ app.get('/status/:userId', statusLimiter, async (req, res) => {
             mt5Connected: user.mt5Connected,
             mt5Server: user.mt5Server ?? null,
             mt5Login: user.mt5Login ?? null,
+            // MT5 sync status surfaced so the iOS app can distinguish
+            // "we're still syncing, hang on" from "broker link is dropped,
+            // tap to reconnect" from "everything is fine". Updated every
+            // poll cycle by checkUserTrades. Values:
+            //   not_connected | connecting | deploying | synchronizing
+            //   | connected | disconnected | undeployed | unknown
+            mt5SyncStatus: user.mt5SyncStatus ?? 'not_connected',
+            mt5SyncStatusAt: user.mt5SyncStatusAt ?? null,
             maxTrades: user.maxTrades,
             countWinningTrades: user.countWinningTrades ?? false,
             todayDeals: user.todayDeals ?? [],
@@ -1718,6 +1830,9 @@ app.get('/admin/user-state/:userId', async (req, res) => {
         mt5Region: user.mt5Region,
         mt5Server: user.mt5Server,
         mt5Login: user.mt5Login,
+        mt5SyncStatus: user.mt5SyncStatus,
+        mt5SyncStatusAt: user.mt5SyncStatusAt,
+        lastRedeployAttempt: user.lastRedeployAttempt ? new Date(user.lastRedeployAttempt).toISOString() : null,
         tradesCount: user.tradesCount,
         maxTrades: user.maxTrades,
         isLocked: user.isLocked,
