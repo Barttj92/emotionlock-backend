@@ -639,24 +639,55 @@ async function checkUserTrades(userId) {
             // First poll after connecting or server restart.
             // Fetch all of today's deals to:
             // 1. Seed processedDealIds so the overlap window doesn't double-count.
-            // 2. Rebuild todayDeals for the status display without incrementing tradesCount
-            //    (tradesCount was already restored from Supabase).
+            // 2. Rebuild todayDeals for the status display.
+            // 3. Reconcile tradesCount: previously this branch ignored seen
+            //    closes on the assumption that tradesCount was already
+            //    restored from Supabase. That assumption breaks for a brand
+            //    new MT5 connect, where Supabase still says 0 but the user
+            //    has already placed and closed a trade while the MetaAPI
+            //    account was deploying (1-3 min window). Those trades got
+            //    added to processedDealIds and silently swallowed.
+            //    Fix: count valid closes in the seed and bump tradesCount
+            //    to max(tradesCount, seedCloseCount). Never decrement.
             const seedDeals = await getDeals(user.metaApiAccountId, user.mt5Region, todayMidnight.toISOString(), now.toISOString());
             user.todayDeals = [];
+            let seedCloseCount = 0;
             for (const deal of seedDeals) {
                 user.processedDealIds.add(deal.id);
                 const isTradeClose = deal.entryType === 'DEAL_ENTRY_OUT' || deal.entryType === 'DEAL_ENTRY_INOUT';
                 if (!isTradeClose || deal.type === 'DEAL_TYPE_BALANCE') continue;
                 const direction = deal.type === 'DEAL_TYPE_SELL' ? 'Long' : 'Short';
+                const dealProfit = deal.profit ?? null;
                 user.todayDeals.push({
                     symbol: deal.symbol || '',
                     direction,
                     price: deal.price ?? null,
-                    profit: deal.profit ?? null,
+                    profit: dealProfit,
                 });
+                // F4: countWinningTrades — match the normal-path semantics so
+                // reconcile honours the same rule the user configured.
+                const isWin = dealProfit !== null && dealProfit > 0;
+                if (user.countWinningTrades && dealProfit !== null && !isWin) continue;
+                seedCloseCount++;
             }
             user.lastDealCheck = now.toISOString();
-            debugLog(`[trades] ${userId.slice(0,8)}: first check — seeded ${seedDeals.length} deals, rebuilt ${user.todayDeals.length} todayDeals`);
+
+            if (seedCloseCount > user.tradesCount) {
+                const before = user.tradesCount;
+                user.tradesCount = seedCloseCount;
+                console.log(`[trades] ${userId.slice(0,8)}: seed reconciled tradesCount ${before} -> ${seedCloseCount} (MetaAPI shows ${seedCloseCount} closes today, Supabase had ${before})`);
+                saveDailyTrades(userId, user.tradesCount, user.lastReset).catch(() => {});
+                if (user.tradesCount >= user.maxTrades && !user.isLocked) {
+                    user.isLocked = true;
+                    debugLog(`User ${userId}: trade limit reached during seed reconcile`);
+                    // Skip push from this path: the user just opened the app
+                    // (that's what triggered /status -> initUser -> first poll),
+                    // so the next /status response will surface isLocked within
+                    // seconds. No need to double-notify.
+                }
+            }
+
+            debugLog(`[trades] ${userId.slice(0,8)}: first check — seeded ${seedDeals.length} deals, rebuilt ${user.todayDeals.length} todayDeals, ${seedCloseCount} valid closes, tradesCount=${user.tradesCount}`);
             return;
         }
 
