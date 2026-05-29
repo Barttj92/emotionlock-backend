@@ -454,6 +454,35 @@ async function getDeals(accountId, region, fromTime, toTime) {
     }
 }
 
+// Fetch the account's currently OPEN positions. Used to decide whether a
+// position is fully closed: if a positionId that had a close deal no longer
+// appears here, the whole position is closed (so the trade can be counted).
+// Returns an array of position objects on success, or null when the call
+// fails. null means "unknown" so callers can degrade safely instead of
+// mistaking a failed lookup for "no open positions".
+async function getOpenPositions(accountId, region) {
+    const url = `https://mt-client-api-v1.${region}.agiliumtrade.ai/users/current/accounts/${accountId}/positions`;
+    try {
+        const response = await fetch(url, {
+            headers: { 'auth-token': METAAPI_TOKEN }
+        });
+        if (!response.ok) {
+            const errText = await response.text();
+            console.log(`[getOpenPositions] HTTP ${response.status} for account ${accountId} region ${region}: ${errText.slice(0, 200)}`);
+            return null;
+        }
+        const data = await response.json();
+        if (!Array.isArray(data)) {
+            console.log(`[getOpenPositions] Unexpected response format for account ${accountId}:`, JSON.stringify(data).slice(0, 200));
+            return null;
+        }
+        return data;
+    } catch (e) {
+        console.log(`[getOpenPositions] Fetch error for account ${accountId}: ${e.message}`);
+        return null;
+    }
+}
+
 // Aggregate a subsequent partial close into the already-recorded trade.
 // A single position closed in multiple chunks produces multiple close deals
 // sharing one positionId. The first close creates the todayDeals entry and
@@ -468,6 +497,62 @@ function aggregatePartialClose(user, positionId, dealProfit) {
     if (!entry) return;
     if (dealProfit === null || dealProfit === undefined) return;
     entry.profit = (entry.profit ?? 0) + dealProfit;
+}
+
+// A trade is only counted once the WHOLE position is closed. While a position
+// is partially closed (still open with a remaining volume), its close deals
+// accumulate here in user.openPositions keyed by positionId. The trade is
+// neither counted nor shown in todayDeals until finalizeClosedPosition runs.
+// Profit is summed across partials (null = no financial data, left null).
+// symbol/direction/price are captured from the first close deal seen.
+function recordPartialClose(user, positionId, deal) {
+    if (!user.openPositions) user.openPositions = {};
+    let p = user.openPositions[positionId];
+    if (!p) {
+        p = user.openPositions[positionId] = {
+            symbol: deal.symbol || '',
+            direction: deal.type === 'DEAL_TYPE_SELL' ? 'Long' : 'Short',
+            price: deal.price ?? null,
+            profit: null,
+        };
+    }
+    const dealProfit = deal.profit ?? null;
+    if (dealProfit !== null && dealProfit !== undefined) {
+        p.profit = (p.profit ?? 0) + dealProfit;
+    }
+    return p;
+}
+
+// Finalize a fully-closed position: this is the single place where a trade is
+// actually counted. Moves the pending position into todayDeals, marks it in
+// processedPositionIds so overlap re-sends never recount it, and increments
+// tradesCount unless countWinningTrades is on and the TOTAL position P&L is
+// not a win. Does NOT persist (callers save once per poll). Returns true if
+// it incremented tradesCount.
+function finalizeClosedPosition(user, positionId) {
+    const p = user.openPositions ? user.openPositions[positionId] : null;
+    if (!p) return false;
+    delete user.openPositions[positionId];
+    if (!user.processedPositionIds) user.processedPositionIds = new Set();
+    user.processedPositionIds.add(positionId);
+    if (!user.todayDeals) user.todayDeals = [];
+
+    const totalProfit = p.profit;
+    user.todayDeals.push({
+        positionId,
+        symbol: p.symbol,
+        direction: p.direction,
+        price: p.price,
+        profit: totalProfit,
+    });
+
+    // countWinningTrades: losing/breakeven trades are shown but not counted.
+    // profit null = no financial data (e.g. some crypto), counted as a trade.
+    const isWin = totalProfit !== null && totalProfit > 0;
+    if (user.countWinningTrades && totalProfit !== null && !isWin) return false;
+
+    user.tradesCount++;
+    return true;
 }
 
 // =====================
@@ -546,6 +631,11 @@ function initUser(userId) {
             // processedDealIds. We still record every individual deal id so
             // the overlap window doesn't reprocess them.
             processedPositionIds: new Set(),
+            // Positions that have started closing but aren't fully closed yet.
+            // Keyed by positionId; profit accumulates across partial closes.
+            // A trade is only counted (moved to todayDeals + tradesCount++)
+            // once the whole position is closed. Cleared on daily reset.
+            openPositions: {},
             todayDeals: [],
             lastDealCheck: null,
             // MT5 sync status surfaced to the iOS app via /status so the UI can
@@ -578,6 +668,7 @@ function checkDailyReset(user, localDateStr) {
         user.lastReset = today;
         user.processedDealIds = new Set();
         user.processedPositionIds = new Set();
+        user.openPositions = {};
         user.todayDeals = [];
     }
 }
@@ -763,51 +854,43 @@ async function checkUserTrades(userId) {
             //    Fix: count valid closes in the seed and bump tradesCount
             //    to max(tradesCount, seedCloseCount). Never decrement.
             const seedDeals = await getDeals(user.metaApiAccountId, user.mt5Region, todayMidnight.toISOString(), now.toISOString());
+            // Rebuild today's view from scratch since the seed represents the
+            // full picture of today's deals as MetaAPI sees them.
             user.todayDeals = [];
-            // Rebuild processedPositionIds from scratch since seed represents
-            // the full picture of today's deals as MetaAPI sees them.
             user.processedPositionIds = new Set();
-            let seedCloseCount = 0;
+            user.openPositions = {};
+
+            // Phase 1: accumulate every close into its pending position.
             for (const deal of seedDeals) {
                 user.processedDealIds.add(deal.id);
                 const isTradeClose = deal.entryType === 'DEAL_ENTRY_OUT' || deal.entryType === 'DEAL_ENTRY_INOUT';
                 if (!isTradeClose || deal.type === 'DEAL_TYPE_BALANCE') continue;
-
-                // Partial-fill collapse: only the first close of each unique
-                // positionId is counted (a 1-lot order split across 2 partials
-                // = 1 trade, not 2). Subsequent partials are summed into the
-                // first close's overview entry so the rebuilt P&L reflects the
-                // whole position. Fallback to deal.id when positionId is missing
-                // so we don't accidentally collapse unrelated deals.
                 const positionId = deal.positionId || `_deal_${deal.id}`;
-                const dealProfit = deal.profit ?? null;
-                if (user.processedPositionIds.has(positionId)) {
-                    aggregatePartialClose(user, positionId, dealProfit);
-                    continue;
-                }
-                user.processedPositionIds.add(positionId);
-
-                const direction = deal.type === 'DEAL_TYPE_SELL' ? 'Long' : 'Short';
-                user.todayDeals.push({
-                    positionId,
-                    symbol: deal.symbol || '',
-                    direction,
-                    price: deal.price ?? null,
-                    profit: dealProfit,
-                });
-                // F4: countWinningTrades — match the normal-path semantics so
-                // reconcile honours the same rule the user configured.
-                const isWin = dealProfit !== null && dealProfit > 0;
-                if (user.countWinningTrades && dealProfit !== null && !isWin) continue;
-                seedCloseCount++;
+                recordPartialClose(user, positionId, deal);
             }
+
+            // Phase 2: count only positions that are fully closed (not in the
+            // live positions list). Positions still partially open stay pending
+            // in user.openPositions and get counted on a later poll when closed.
+            const seedLivePositions = await getOpenPositions(user.metaApiAccountId, user.mt5Region);
+            const seedLiveIds = seedLivePositions ? new Set(seedLivePositions.map(p => String(p.id))) : null;
+            // Never decrement: tradesCount may already hold a higher value
+            // restored from Supabase. Recompute from scratch, then take the max.
+            const restoredCount = user.tradesCount;
+            user.tradesCount = 0;
+            for (const positionId of Object.keys(user.openPositions)) {
+                const stillOpen = seedLiveIds !== null && seedLiveIds.has(String(positionId));
+                if (stillOpen) continue;
+                finalizeClosedPosition(user, positionId);
+            }
+            const seedCloseCount = user.tradesCount; // fully-closed, count-eligible positions today
             user.lastDealCheck = now.toISOString();
 
-            if (seedCloseCount > user.tradesCount) {
-                const before = user.tradesCount;
-                user.tradesCount = seedCloseCount;
-                console.log(`[trades] ${userId.slice(0,8)}: seed reconciled tradesCount ${before} -> ${seedCloseCount} (MetaAPI shows ${seedCloseCount} closes today, Supabase had ${before})`);
-                saveDailyTrades(userId, user.tradesCount, user.lastReset).catch(() => {});
+            if (seedCloseCount >= restoredCount) {
+                if (seedCloseCount !== restoredCount) {
+                    console.log(`[trades] ${userId.slice(0,8)}: seed reconciled tradesCount ${restoredCount} -> ${seedCloseCount} (MetaAPI shows ${seedCloseCount} fully-closed positions today)`);
+                    saveDailyTrades(userId, user.tradesCount, user.lastReset).catch(() => {});
+                }
                 if (user.tradesCount >= user.maxTrades && !user.isLocked) {
                     user.isLocked = true;
                     debugLog(`User ${userId}: trade limit reached during seed reconcile`);
@@ -816,9 +899,13 @@ async function checkUserTrades(userId) {
                     // so the next /status response will surface isLocked within
                     // seconds. No need to double-notify.
                 }
+            } else {
+                // Recomputed count is lower than the restored value (e.g. a
+                // position is still partially open this session). Never decrement.
+                user.tradesCount = restoredCount;
             }
 
-            debugLog(`[trades] ${userId.slice(0,8)}: first check — seeded ${seedDeals.length} deals, rebuilt ${user.todayDeals.length} todayDeals, ${seedCloseCount} valid closes, tradesCount=${user.tradesCount}`);
+            debugLog(`[trades] ${userId.slice(0,8)}: first check — seeded ${seedDeals.length} deals, ${Object.keys(user.openPositions).length} still-open position(s), ${seedCloseCount} fully-closed, tradesCount=${user.tradesCount}`);
             return;
         }
 
@@ -842,6 +929,12 @@ async function checkUserTrades(userId) {
 
         let newTradesDetected = false;
 
+        // Phase 1: accumulate close deals per position. A trade is NOT counted
+        // here. Partial closes of the same position are summed into a pending
+        // entry (user.openPositions) and only counted once the whole position
+        // is closed (phase 2). Positions already counted just fold any late
+        // partial profit into their existing overview entry.
+        const touchedPositions = new Set();
         for (const deal of deals) {
             if (user.processedDealIds.has(deal.id)) continue;
 
@@ -855,58 +948,55 @@ async function checkUserTrades(userId) {
 
             user.processedDealIds.add(deal.id);
 
-            // Partial-fill collapse: a single trade may close in multiple
-            // chunks (broker-side splitting), each producing its own deal but
-            // all sharing the same positionId. Count only the first close of
-            // each position (1 trade = 1 close decision, not N partial fills).
-            // Subsequent partials are NOT dropped: their profit is summed into
-            // the first close's overview entry so the displayed P&L reflects
-            // the whole position. Fallback to deal.id keeps unrelated deals
-            // from collapsing if positionId is missing.
+            // Fallback to deal.id when positionId is missing so unrelated deals
+            // don't collapse together. A synthetic _deal_ id never matches a
+            // live position, so it's treated as immediately fully closed below.
             const positionId = deal.positionId || `_deal_${deal.id}`;
             const dealProfit = deal.profit ?? null;
-            const direction = deal.type === 'DEAL_TYPE_SELL' ? 'Long' : 'Short';
 
             if (user.processedPositionIds.has(positionId)) {
+                // Already counted (or finalized via fallback): fold late profit in.
                 aggregatePartialClose(user, positionId, dealProfit);
-                debugLog(`[trades] ${userId.slice(0,8)}: aggregated partial fill into position ${positionId} (deal ${deal.id} profit=${dealProfit})`);
-                continue;
-            }
-            user.processedPositionIds.add(positionId);
-
-            // F4: countWinningTrades — skip losing/breakeven trades when enabled.
-            // profit null = no financial data (e.g. crypto deals), counted as a trade.
-            const isWin = dealProfit !== null && dealProfit > 0;
-            if (user.countWinningTrades && dealProfit !== null && !isWin) {
-                // Mark processed so the overlap window does not recheck it, but do not increment.
-                user.todayDeals.push({
-                    positionId,
-                    symbol: deal.symbol || '',
-                    direction,
-                    price: deal.price ?? null,
-                    profit: dealProfit,
-                });
+                debugLog(`[trades] ${userId.slice(0,8)}: late partial folded into counted position ${positionId} (deal ${deal.id} profit=${dealProfit})`);
                 continue;
             }
 
-            user.tradesCount++;
-            newTradesDetected = true;
+            recordPartialClose(user, positionId, deal);
+            touchedPositions.add(positionId);
+        }
 
-            // Store trade details for today's overview in the status response.
-            // direction: closing SELL deal = was Long position, closing BUY deal = was Short.
-            if (!user.todayDeals) user.todayDeals = [];
-            user.todayDeals.push({
-                positionId,
-                symbol: deal.symbol || '',
-                direction,
-                price: deal.price ?? null,
-                profit: dealProfit,
-            });
+        // Phase 2: count positions that are now FULLY closed. A position is
+        // fully closed when it no longer appears in the live MetaAPI positions
+        // list. We only query positions when at least one close happened this
+        // poll, to avoid an extra API call on idle polls.
+        if (touchedPositions.size > 0) {
+            const livePositions = await getOpenPositions(user.metaApiAccountId, user.mt5Region);
+            // null = positions lookup failed. We can't verify full close, so we
+            // degrade to the safe-for-discipline behaviour: count the close now
+            // rather than risk never locking. liveIds null triggers that path.
+            const liveIds = livePositions ? new Set(livePositions.map(p => String(p.id))) : null;
+            if (liveIds === null) {
+                console.log(`[trades] ${userId.slice(0,8)}: positions lookup failed, finalizing ${touchedPositions.size} position(s) as fallback (count-on-close)`);
+            }
 
-            // Persist updated count to Supabase so a server restart doesn't reset it mid-day
-            saveDailyTrades(userId, user.tradesCount, user.lastReset).catch(() => {});
+            for (const positionId of touchedPositions) {
+                const stillOpen = liveIds !== null && liveIds.has(String(positionId));
+                if (stillOpen) {
+                    debugLog(`[trades] ${userId.slice(0,8)}: position ${positionId} partially closed, still open, waiting for full close`);
+                    continue;
+                }
+                const counted = finalizeClosedPosition(user, positionId);
+                if (counted) {
+                    newTradesDetected = true;
+                    console.log(`User ${userId}: position ${positionId} fully closed, trade counted. Total: ${user.tradesCount}/${user.maxTrades}`);
+                }
+            }
 
-            console.log(`User ${userId}: trade close counted. Total: ${user.tradesCount}/${user.maxTrades} (deal ${deal.id} profit=${deal.profit})`);
+            // Persist once per poll if anything was counted, so a server restart
+            // doesn't reset the count mid-day.
+            if (newTradesDetected) {
+                saveDailyTrades(userId, user.tradesCount, user.lastReset).catch(() => {});
+            }
         }
 
         if (newTradesDetected && user.tradesCount >= user.maxTrades && !user.isLocked) {
@@ -1517,6 +1607,7 @@ app.post('/connect-mt5/:userId', mt5Limiter, async (req, res) => {
         if (!isSameAccount) {
             userStates[userId].processedDealIds = new Set();
             userStates[userId].processedPositionIds = new Set();
+            userStates[userId].openPositions = {};
             userStates[userId].tradesCount = 0;
             saveDailyTrades(userId, 0, userStates[userId].lastReset).catch(() => {});
         }
@@ -2352,6 +2443,8 @@ app.post('/purchase/:userId', async (req, res) => {
                     u.isLocked = false;
                     u.emergencyUnlocked = false;
                     u.processedDealIds = new Set();
+                    u.processedPositionIds = new Set();
+                    u.openPositions = {};
                     u.todayDeals = [];
                     // Persist the cleared counters so a server restart doesn't
                     // resurrect the old count from Supabase.
