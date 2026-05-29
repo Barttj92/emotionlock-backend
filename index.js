@@ -454,6 +454,22 @@ async function getDeals(accountId, region, fromTime, toTime) {
     }
 }
 
+// Aggregate a subsequent partial close into the already-recorded trade.
+// A single position closed in multiple chunks produces multiple close deals
+// sharing one positionId. The first close creates the todayDeals entry and
+// counts as 1 trade; later partials are summed into that same entry here so
+// the displayed P&L reflects the whole position instead of only the first
+// chunk. The trade count is never touched (1 position = 1 trade).
+// Profit handling: sum only non-null values. If both existing and incoming
+// profit are null, leave it null (no financial data, e.g. some crypto deals).
+function aggregatePartialClose(user, positionId, dealProfit) {
+    if (!user.todayDeals) return;
+    const entry = user.todayDeals.find(d => d.positionId === positionId);
+    if (!entry) return;
+    if (dealProfit === null || dealProfit === undefined) return;
+    entry.profit = (entry.profit ?? 0) + dealProfit;
+}
+
 // =====================
 // License codes
 // =====================
@@ -758,18 +774,22 @@ async function checkUserTrades(userId) {
                 if (!isTradeClose || deal.type === 'DEAL_TYPE_BALANCE') continue;
 
                 // Partial-fill collapse: only the first close of each unique
-                // positionId is shown in todayDeals and counted. Subsequent
-                // partials (same trade, multiple chunks) are silently consumed
-                // so a 1-lot order split across 2 partials = 1 trade, not 2.
-                // Fallback to deal.id when positionId is missing so we don't
-                // accidentally collapse unrelated deals.
+                // positionId is counted (a 1-lot order split across 2 partials
+                // = 1 trade, not 2). Subsequent partials are summed into the
+                // first close's overview entry so the rebuilt P&L reflects the
+                // whole position. Fallback to deal.id when positionId is missing
+                // so we don't accidentally collapse unrelated deals.
                 const positionId = deal.positionId || `_deal_${deal.id}`;
-                if (user.processedPositionIds.has(positionId)) continue;
+                const dealProfit = deal.profit ?? null;
+                if (user.processedPositionIds.has(positionId)) {
+                    aggregatePartialClose(user, positionId, dealProfit);
+                    continue;
+                }
                 user.processedPositionIds.add(positionId);
 
                 const direction = deal.type === 'DEAL_TYPE_SELL' ? 'Long' : 'Short';
-                const dealProfit = deal.profit ?? null;
                 user.todayDeals.push({
+                    positionId,
                     symbol: deal.symbol || '',
                     direction,
                     price: deal.price ?? null,
@@ -837,26 +857,30 @@ async function checkUserTrades(userId) {
 
             // Partial-fill collapse: a single trade may close in multiple
             // chunks (broker-side splitting), each producing its own deal but
-            // all sharing the same positionId. Count and surface only the
-            // first close of each position; consume the rest silently so the
-            // user's discipline tally matches their intent (1 trade = 1 close
-            // decision, not N partial fills). Fallback to deal.id keeps
-            // unrelated deals from collapsing if positionId is missing.
+            // all sharing the same positionId. Count only the first close of
+            // each position (1 trade = 1 close decision, not N partial fills).
+            // Subsequent partials are NOT dropped: their profit is summed into
+            // the first close's overview entry so the displayed P&L reflects
+            // the whole position. Fallback to deal.id keeps unrelated deals
+            // from collapsing if positionId is missing.
             const positionId = deal.positionId || `_deal_${deal.id}`;
+            const dealProfit = deal.profit ?? null;
+            const direction = deal.type === 'DEAL_TYPE_SELL' ? 'Long' : 'Short';
+
             if (user.processedPositionIds.has(positionId)) {
-                debugLog(`[trades] ${userId.slice(0,8)}: skipping partial fill for already-counted position ${positionId} (deal ${deal.id})`);
+                aggregatePartialClose(user, positionId, dealProfit);
+                debugLog(`[trades] ${userId.slice(0,8)}: aggregated partial fill into position ${positionId} (deal ${deal.id} profit=${dealProfit})`);
                 continue;
             }
             user.processedPositionIds.add(positionId);
 
             // F4: countWinningTrades — skip losing/breakeven trades when enabled.
             // profit null = no financial data (e.g. crypto deals), counted as a trade.
-            const dealProfit = deal.profit ?? null;
             const isWin = dealProfit !== null && dealProfit > 0;
             if (user.countWinningTrades && dealProfit !== null && !isWin) {
                 // Mark processed so the overlap window does not recheck it, but do not increment.
-                const direction = deal.type === 'DEAL_TYPE_SELL' ? 'Long' : 'Short';
                 user.todayDeals.push({
+                    positionId,
                     symbol: deal.symbol || '',
                     direction,
                     price: deal.price ?? null,
@@ -870,13 +894,13 @@ async function checkUserTrades(userId) {
 
             // Store trade details for today's overview in the status response.
             // direction: closing SELL deal = was Long position, closing BUY deal = was Short.
-            const direction = deal.type === 'DEAL_TYPE_SELL' ? 'Long' : 'Short';
             if (!user.todayDeals) user.todayDeals = [];
             user.todayDeals.push({
+                positionId,
                 symbol: deal.symbol || '',
                 direction,
                 price: deal.price ?? null,
-                profit: deal.profit ?? null,
+                profit: dealProfit,
             });
 
             // Persist updated count to Supabase so a server restart doesn't reset it mid-day
@@ -1721,7 +1745,14 @@ app.get('/status/:userId', statusLimiter, async (req, res) => {
             mt5SyncStatusAt: user.mt5SyncStatusAt ?? null,
             maxTrades: user.maxTrades,
             countWinningTrades: user.countWinningTrades ?? false,
-            todayDeals: user.todayDeals ?? [],
+            // Explicitly serialize: positionId is internal (used only to
+            // aggregate partial closes), never exposed to the client.
+            todayDeals: (user.todayDeals ?? []).map(d => ({
+                symbol: d.symbol,
+                direction: d.direction,
+                price: d.price,
+                profit: d.profit,
+            })),
             // App-level free trial (1 week from first MT5 connect).
             trialActive,
             trialStartedAt: subState.appTrialStartedAt ? new Date(subState.appTrialStartedAt).toISOString() : null,
