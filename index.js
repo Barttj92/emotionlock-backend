@@ -2283,6 +2283,61 @@ app.post('/reset-after-onboarding/:userId', async (req, res) => {
     }
 });
 
+// Schema for the mandatory "How did you hear from us" onboarding answer.
+// Free text, trimmed, capped so a malicious client can't push large blobs.
+const attributionSchema = z.object({
+    // Echo of the userId, same proof-of-possession pattern as
+    // /reset-after-onboarding. Stops passive path observers from writing.
+    confirm: z.string().min(1).max(100),
+    source:  z.string().trim().min(1).max(500),
+});
+
+// Record the user's answer to the onboarding "How did you hear from us" field.
+// Stored in its own `attributions` table (NOT purchases) on purpose: admin/stats
+// counts every purchases row as a paid €49.99 license, so attribution rows must
+// never live there. Captured at account creation, before any payment or MT5
+// connect, so we attribute every install regardless of whether it converts.
+//
+// Public endpoint, authenticated by the Keychain userId itself (same pattern as
+// /status and /reset-after-onboarding). Idempotent: the app may retry, and a
+// user editing their answer simply overwrites the existing row.
+app.post('/attribution/:userId', async (req, res) => {
+    const { userId } = req.params;
+    if (!userId || !UUID_V4_RE.test(userId)) {
+        return res.status(400).json({ error: 'Invalid userId format' });
+    }
+
+    const parsed = attributionSchema.safeParse(req.body);
+    if (!parsed.success) {
+        return res.status(400).json({
+            error: 'Invalid input.',
+            details: parsed.error.issues.map(i => i.message),
+        });
+    }
+    const { confirm, source } = parsed.data;
+    if (confirm !== userId) {
+        return res.status(403).json({ error: 'Forbidden: confirm field must match userId.' });
+    }
+
+    try {
+        const { error } = await supabase
+            .from('attributions')
+            .upsert(
+                { user_id: userId, source, updated_at: new Date().toISOString() },
+                { onConflict: 'user_id' }
+            );
+        if (error) {
+            console.error(`[attribution] Supabase upsert failed for ${userId}:`, error.message);
+            return res.status(500).json({ error: 'Failed to save. Please try again.' });
+        }
+        console.log(`[attribution] Recorded source for ${userId}`);
+        res.json({ success: true });
+    } catch (err) {
+        console.error(`[attribution] Error for ${userId}:`, err.message);
+        res.status(500).json({ error: 'Failed to save. Please try again.' });
+    }
+});
+
 // Schema for the Apple IAP purchase notification body. The iOS app calls
 // this endpoint from StoreKitManager after every entitlement refresh, so the
 // payload describes the *current* state Apple reports for this user, not a
