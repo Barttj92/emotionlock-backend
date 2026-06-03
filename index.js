@@ -2795,7 +2795,7 @@ app.post('/profile/:userId', async (req, res) => {
     const { userId } = req.params;
     if (!userId) return res.status(400).json({ error: 'Missing userId' });
 
-    const { firstName, lastName, email } = req.body ?? {};
+    const { firstName, lastName, email, referralSource } = req.body ?? {};
 
     if (!firstName || typeof firstName !== 'string' || firstName.trim().length < 1) {
         return res.status(400).json({ error: 'firstName is required' });
@@ -2948,6 +2948,25 @@ app.post('/profile/:userId', async (req, res) => {
                 app_trial_ends_at: inheritedTrialEndsAt,
             }, { onConflict: 'user_id' });
             invalidateSubscriptionCache(userId);
+        }
+
+        // Record the "How did you hear about us?" answer for affiliate
+        // attribution. Stored in its own `attributions` table (never in
+        // purchases, which the admin stats count as paid licenses). Trimmed and
+        // capped; skipped silently if empty so an older app build that omits the
+        // field still saves the profile. Non-fatal: a failure here never blocks
+        // account creation.
+        if (typeof referralSource === 'string' && referralSource.trim().length > 0) {
+            const cleanSource = referralSource.trim().slice(0, 500);
+            const { error: attrErr } = await supabase
+                .from('attributions')
+                .upsert(
+                    { user_id: userId, source: cleanSource, updated_at: new Date().toISOString() },
+                    { onConflict: 'user_id' }
+                );
+            if (attrErr) {
+                console.error(`[profile] Attribution upsert failed for ${userId}:`, attrErr.message);
+            }
         }
 
         console.log(`[profile] Saved profile for user ${userId}`);
