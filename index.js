@@ -66,6 +66,17 @@ const statusLimiter = rateLimit({
     message: { error: 'Too many requests. Please try again later.' },
 });
 
+// Onboarding funnel events: the app fires ~9 of these once, during the first
+// run. 120/hour per IP is far above any legitimate need and blocks UUID-spraying
+// scanners from polluting the funnel table.
+const onboardingEventLimiter = rateLimit({
+    windowMs: 60 * 60 * 1000, // 1 hour
+    max: 120,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { error: 'Too many requests. Please try again later.' },
+});
+
 // =====================
 // Supabase setup
 // =====================
@@ -2335,6 +2346,73 @@ app.post('/attribution/:userId', async (req, res) => {
     } catch (err) {
         console.error(`[attribution] Error for ${userId}:`, err.message);
         res.status(500).json({ error: 'Failed to save. Please try again.' });
+    }
+});
+
+// Allowed first-run funnel steps, in flow order. Kept in sync with the iOS
+// OnboardingStep enum (AppConstants.swift). An unknown step is rejected so a
+// buggy or malicious client can't invent arbitrary funnel stages.
+const ONBOARDING_STEPS = [
+    'welcome',
+    'how_it_works',
+    'security',
+    'set_limit',
+    'ready',
+    'onboarding_completed',
+    'account_created',
+    'mt5_connect_shown',
+    'mt5_connected',
+];
+
+const onboardingEventSchema = z.object({
+    // Same proof-of-possession echo as /attribution and /reset-after-onboarding.
+    confirm: z.string().min(1).max(100),
+    step:    z.enum(ONBOARDING_STEPS),
+});
+
+// Record that an install reached a given first-run step. Feeds the Command
+// Center onboarding funnel (per-screen drop-off).
+//
+// Public endpoint, authenticated by the Keychain userId itself (same pattern as
+// /attribution). Anonymous: no PII, just the UUID + step. Idempotent: the app
+// may fire the same step more than once (e.g. the user swipes back and forth),
+// so we upsert on (user_id, step) and ignore duplicates, keeping exactly one
+// row per user per step and preserving the earliest timestamp.
+app.post('/onboarding-event/:userId', onboardingEventLimiter, async (req, res) => {
+    const { userId } = req.params;
+    if (!userId || !UUID_V4_RE.test(userId)) {
+        return res.status(400).json({ error: 'Invalid userId format' });
+    }
+
+    const parsed = onboardingEventSchema.safeParse(req.body);
+    if (!parsed.success) {
+        return res.status(400).json({
+            error: 'Invalid input.',
+            details: parsed.error.issues.map(i => i.message),
+        });
+    }
+    const { confirm, step } = parsed.data;
+    if (confirm !== userId) {
+        return res.status(403).json({ error: 'Forbidden: confirm field must match userId.' });
+    }
+
+    try {
+        // Normalise to lowercase so the funnel query never has to worry about the
+        // Keychain UUID casing (stored uppercase in profiles, lowercase here).
+        const { error } = await supabase
+            .from('onboarding_events')
+            .upsert(
+                { user_id: userId.toLowerCase(), step },
+                { onConflict: 'user_id,step', ignoreDuplicates: true }
+            );
+        if (error) {
+            console.error(`[onboarding-event] Supabase upsert failed for ${userId} step=${step}:`, error.message);
+            return res.status(500).json({ error: 'Failed to save.' });
+        }
+        res.json({ success: true });
+    } catch (err) {
+        console.error(`[onboarding-event] Error for ${userId}:`, err.message);
+        res.status(500).json({ error: 'Failed to save.' });
     }
 });
 
