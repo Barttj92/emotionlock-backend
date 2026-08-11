@@ -1694,7 +1694,16 @@ app.post('/connect-mt5/:userId', mt5Limiter, async (req, res) => {
             console.log(`[connect-mt5] Starting 1-week free trial for user ${userId.slice(0,8)}, ends at ${trialEnd.toISOString()}`);
         }
         const { error: mt5SaveErr } = await supabase.from('purchases').upsert(mt5Patch, { onConflict: 'user_id' });
-        if (mt5SaveErr) console.error(`Failed to persist MT5 for ${userId}:`, mt5SaveErr.message);
+        if (mt5SaveErr) {
+            console.error(`Failed to persist MT5 for ${userId}:`, mt5SaveErr.message);
+            // Safeguard: we hebben een MetaAPI-account aangemaakt/gedeployed maar konden
+            // het niet in de database koppelen. Undeploy het account zodat het niet als
+            // wees blijft draaien en kosten maakt, en meld de app dat het koppelen faalde
+            // (bij een nieuwe poging wordt hetzelfde account hergebruikt via de naam-lookup).
+            undeployMetaApiAccount(accountId).catch(() => {});
+            logActivity(userId, 'mt5_connect_failed', { reason: 'db_persist_failed' });
+            return res.status(500).json({ error: 'connect_failed', message: 'Connecting failed. Please try again.' });
+        }
         logActivity(userId, 'mt5_connected', { server, login: String(login) });
         if (isFirstMt5Connect) logActivity(userId, 'trial_started', {});
         // Trial start (or any MT5 reconnect) is a state change worth invalidating
