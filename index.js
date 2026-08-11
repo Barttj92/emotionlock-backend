@@ -88,6 +88,20 @@ if (!SUPABASE_URL) {
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
+// ── Engagement activity logging (spoor 1) ──────────────────────────────────
+// Fire-and-forget: mag NOOIT een request-pad blokkeren of breken. activity_events
+// is een append-only log die het Command Center leest voor het engagement-rapport.
+async function logActivity(userId, type, metadata = {}) {
+    try {
+        await supabase.from('activity_events').insert({ user_id: userId, type, metadata });
+    } catch (_) { /* best-effort */ }
+}
+async function touchLastSeen(userId) {
+    try {
+        await supabase.from('purchases').update({ last_seen_at: new Date().toISOString() }).eq('user_id', userId);
+    } catch (_) { /* best-effort */ }
+}
+
 async function getStoredTokens(licenseCode) {
     const { data } = await supabase
         .from('purchases')
@@ -1007,11 +1021,13 @@ async function checkUserTrades(userId) {
             // doesn't reset the count mid-day.
             if (newTradesDetected) {
                 saveDailyTrades(userId, user.tradesCount, user.lastReset).catch(() => {});
+                logActivity(userId, 'trade', { total: user.tradesCount, max: user.maxTrades });
             }
         }
 
         if (newTradesDetected && user.tradesCount >= user.maxTrades && !user.isLocked) {
             user.isLocked = true;
+            logActivity(userId, 'limit_reached', { max: user.maxTrades });
             debugLog(`User ${userId}: trade limit reached, sending push`);
             await sendPushNotification(
                 user.deviceToken,
@@ -1679,6 +1695,8 @@ app.post('/connect-mt5/:userId', mt5Limiter, async (req, res) => {
         }
         const { error: mt5SaveErr } = await supabase.from('purchases').upsert(mt5Patch, { onConflict: 'user_id' });
         if (mt5SaveErr) console.error(`Failed to persist MT5 for ${userId}:`, mt5SaveErr.message);
+        logActivity(userId, 'mt5_connected', { server, login: String(login) });
+        if (isFirstMt5Connect) logActivity(userId, 'trial_started', {});
         // Trial start (or any MT5 reconnect) is a state change worth invalidating
         // the cache for so the next /status poll sees the fresh values.
         invalidateSubscriptionCache(userId);
@@ -1743,6 +1761,7 @@ app.delete('/connect-mt5/:userId', async (req, res) => {
         // Keep meta_api_account_id, mt5_server, mt5_login in Supabase so reconnect can reuse the account
 
         console.log(`MT5 disconnected for user ${userId}`);
+        logActivity(userId, 'mt5_disconnected', {});
         res.json({ success: true });
     } catch (err) {
         console.error(`MT5 disconnect error for ${userId}:`, err.message);
@@ -1763,6 +1782,22 @@ app.get('/status/:userId', statusLimiter, async (req, res) => {
         initUser(userId);
         const user = userStates[userId];
         checkDailyReset(user, localDate);
+
+        // Engagement (spoor 1): throttled "laatst gezien" + sessie-logging.
+        // /status wordt elke 5s gepolld, dus we schrijven last_seen hooguit eens
+        // per 5 min, en tellen een nieuwe sessie (app-open) pas na een gat van
+        // 30 min zonder polls. UUID-guard houdt scanner-probes uit de log.
+        if (UUID_V4_RE.test(userId)) {
+            const _nowMs = Date.now();
+            if (!user._lastSeenPersistMs || _nowMs - user._lastSeenPersistMs > 5 * 60 * 1000) {
+                user._lastSeenPersistMs = _nowMs;
+                touchLastSeen(userId);
+            }
+            if (!user._lastSessionMs || _nowMs - user._lastSessionMs > 30 * 60 * 1000) {
+                logActivity(userId, 'app_active', {});
+            }
+            user._lastSessionMs = _nowMs;
+        }
 
         // On first contact or server restart, sync state with Supabase.
         // checkWeeklyTokenReset runs AFTER this block so it sees the correct
