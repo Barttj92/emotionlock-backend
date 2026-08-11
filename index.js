@@ -2774,14 +2774,20 @@ async function handleAppleNotification(notification) {
     //    Keep this conservative: any state we are unsure about → leave the
     //    row alone instead of guessing.
     let newStatus = null;
+    // billing_state: a separate "payment problem" signal for the email automation
+    // engine (R2). undefined = leave the column untouched; null = clear it (recovered).
+    // This never drives access; subscription_status stays authoritative for that.
+    let billingState = undefined;
     if (isSubscription) {
         switch (notificationType) {
             case 'SUBSCRIBED':
                 // INITIAL_BUY with an intro offer = trial; otherwise active.
                 newStatus = (subtype === 'INITIAL_BUY' && offerType === 1) ? 'trialing' : 'active';
+                billingState = null; // fresh/healthy subscription
                 break;
             case 'DID_RENEW':
                 newStatus = 'active';
+                billingState = null; // payment recovered
                 break;
             case 'DID_FAIL_TO_RENEW':
                 // BILLING_RETRY: Apple still retries silently for up to 60 days.
@@ -2789,17 +2795,23 @@ async function handleAppleNotification(notification) {
                 // No subtype (auto-renew off + expired): straight to expired.
                 if (subtype === 'GRACE_PERIOD' || subtype === 'BILLING_RETRY') {
                     newStatus = 'active'; // keep access during retry / grace
+                    // Payment failed but access continues. Flag it for the email
+                    // engine so R2 (payment-issue) can reach out. Access is untouched.
+                    billingState = (subtype === 'GRACE_PERIOD') ? 'in_grace_period' : 'billing_retry';
                 } else {
                     newStatus = 'expired';
+                    billingState = null;
                 }
                 break;
             case 'EXPIRED':
             case 'GRACE_PERIOD_EXPIRED':
                 newStatus = 'expired';
+                billingState = null;
                 break;
             case 'REFUND':
             case 'REVOKE':
                 newStatus = 'expired';
+                billingState = null;
                 break;
             case 'DID_CHANGE_RENEWAL_STATUS':
                 // User toggled auto-renew on/off. Doesn't change current
@@ -2826,6 +2838,7 @@ async function handleAppleNotification(notification) {
     if (appAccountToken)       patch.app_account_token       = appAccountToken;
     if (expiresDate)           patch.trial_ends_at            = new Date(expiresDate).toISOString();
     if (newStatus)             patch.subscription_status      = newStatus;
+    if (billingState !== undefined) patch.billing_state         = billingState;
 
     // Refund on the LICENSE (one-time): wipe the license code so the app
     // paywalls the user. Don't touch subscription_status — that's a separate
