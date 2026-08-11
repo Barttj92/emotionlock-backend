@@ -3098,9 +3098,18 @@ app.post('/profile/:userId', async (req, res) => {
                 source:     'signup',
                 status:     'subscribed',
             };
-            const bodyCountry = (req.body?.country ?? '').toString().trim().toUpperCase().slice(0, 2);
+            // Country/locale for NL vs EN mail selection. Prefer the explicit values
+            // the app sends (available after a future app release); otherwise fall back
+            // to the request's Accept-Language header, which iOS sets automatically from
+            // the device language. This means Dutch users already get Dutch mails WITHOUT
+            // needing an app update.
+            const acceptLang = (req.headers['accept-language'] || '').split(',')[0].trim(); // e.g. "nl-NL"
+            const alLang = acceptLang.split('-')[0].toLowerCase();
+            const alRegion = (acceptLang.split('-')[1] || '').toUpperCase().slice(0, 2);
+            const fallbackCountry = alRegion || (alLang === 'nl' ? 'NL' : '');
+            const bodyCountry = ((req.body?.country ?? '').toString().trim().toUpperCase().slice(0, 2)) || fallbackCountry;
             if (bodyCountry) contactRow.country = bodyCountry; // 'NL'/'BE' -> Dutch mails
-            const bodyLocale = (req.body?.locale ?? '').toString().trim();
+            const bodyLocale = ((req.body?.locale ?? '').toString().trim()) || acceptLang;
             if (bodyLocale) contactRow.locale = bodyLocale;
             const { error: contactErr } = await supabase
                 .from('email_contacts')
