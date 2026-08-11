@@ -1166,6 +1166,34 @@ async function runTrialNotificationScheduler() {
                         .update({ trial_notified_24h_at: new Date().toISOString() })
                         .eq('user_id', row.user_id);
                     console.log(`[trial-push] 24h notice sent to ${row.user_id.slice(0,8)}`);
+                    // Admin signal: a user's trial is ~24h from expiring — a
+                    // conversion/churn moment worth knowing about. Piggybacks on
+                    // the once-only trial_notified_24h_at stamp above, so it can
+                    // never fire twice for the same user. Best-effort profile
+                    // lookup for a readable name/email.
+                    supabase
+                        .from('profiles')
+                        .select('first_name, last_name, email')
+                        .ilike('user_id', row.user_id)
+                        .maybeSingle()
+                        .then(({ data: prof }) => {
+                            const fullName = prof ? `${prof.first_name ?? ''} ${prof.last_name ?? ''}`.trim() : '';
+                            const customerEmail = prof?.email ?? 'unknown';
+                            notifyAdmin({
+                                subject: `Trial ending soon (~24h): ${fullName || 'a user'}`,
+                                lines: [
+                                    `${fullName || 'A user'}'s free trial ends in about 24 hours.`,
+                                    '',
+                                    `Email:        ${customerEmail}`,
+                                    `User ID:      ${row.user_id}`,
+                                    `Trial ends:   ${row.app_trial_ends_at}`,
+                                    `Time (notice):${adminNotifyTimestamp()} (Europe/Amsterdam)`,
+                                    '',
+                                    'View in Command Center: https://emotionlock.app/command',
+                                ],
+                            }).catch(() => {});
+                        })
+                        .catch(() => {});
                 } catch (e) {
                     console.error(`[trial-push] 24h send failed for ${row.user_id}:`, e.message);
                 }
@@ -1660,6 +1688,35 @@ app.post('/connect-mt5/:userId', mt5Limiter, async (req, res) => {
             success: true,
             message: 'Connecting... it may take a few minutes to fully sync.'
         });
+
+        // Fire-and-forget admin notification: a user just connected MT5 for the
+        // first time, which starts their 1-week free trial. Only on the FIRST
+        // connect (isFirstMt5Connect) so reconnects never re-notify. Best-effort
+        // profile lookup so the email carries a name/email, not just a user_id.
+        if (isFirstMt5Connect) {
+            supabase
+                .from('profiles')
+                .select('first_name, last_name, email')
+                .ilike('user_id', userId)
+                .maybeSingle()
+                .then(({ data: prof }) => {
+                    const fullName = prof ? `${prof.first_name ?? ''} ${prof.last_name ?? ''}`.trim() : '';
+                    const customerEmail = prof?.email ?? 'unknown';
+                    notifyAdmin({
+                        subject: `Trial started (MT5 connected): ${fullName || 'a user'}`,
+                        lines: [
+                            `${fullName || 'A user'} just connected MT5 — their 7-day free trial has started.`,
+                            '',
+                            `Email:   ${customerEmail}`,
+                            `User ID: ${userId}`,
+                            `Time:    ${adminNotifyTimestamp()} (Europe/Amsterdam)`,
+                            '',
+                            'View in Command Center: https://emotionlock.app/command',
+                        ],
+                    }).catch(() => {});
+                })
+                .catch(() => {});
+        }
 
     } catch (err) {
         console.error(`MT5 connect error for ${userId}:`, err.message);
@@ -3016,6 +3073,30 @@ app.post('/profile/:userId', async (req, res) => {
             return res.status(500).json({ error: 'Failed to save profile. Please try again.' });
         }
 
+        // Sync into email_contacts so the e-mail automation engine has this user.
+        // Canonical key = lowercased Keychain UUID (matches the email_user_state view).
+        // Fire-and-forget: a failure here must never break profile creation.
+        try {
+            const contactRow = {
+                email:      cleanEmail,
+                user_id:    String(userId).toLowerCase(),
+                first_name: cleanFirstName,
+                last_name:  cleanLastName,
+                source:     'signup',
+                status:     'subscribed',
+            };
+            const bodyCountry = (req.body?.country ?? '').toString().trim().toUpperCase().slice(0, 2);
+            if (bodyCountry) contactRow.country = bodyCountry; // 'NL'/'BE' -> Dutch mails
+            const bodyLocale = (req.body?.locale ?? '').toString().trim();
+            if (bodyLocale) contactRow.locale = bodyLocale;
+            const { error: contactErr } = await supabase
+                .from('email_contacts')
+                .upsert(contactRow, { onConflict: 'email' });
+            if (contactErr) console.error('[profile] email_contacts sync failed:', contactErr.message);
+        } catch (e) {
+            console.error('[profile] email_contacts sync threw:', e.message);
+        }
+
         // Propagate the inherited trial window to this userId's purchases row.
         // Upsert because the row may not exist yet (purchases is normally
         // created on first /connect-mt5 or first /purchase).
@@ -3066,6 +3147,9 @@ app.post('/profile/:userId', async (req, res) => {
                     'View in Command Center: https://emotionlock.app/command',
                 ],
             }).catch(() => {});
+            // Welcome email to the new user. Fire-and-forget, English copy.
+            // Only on the first save so profile edits never re-trigger it.
+            sendWelcomeEmail({ to: cleanEmail, firstName: cleanFirstName }).catch(() => {});
         }
     } catch (err) {
         console.error('[profile] Unexpected error:', err);
@@ -3384,6 +3468,84 @@ async function notifyAdmin({ subject, lines }) {
         }
     } catch (err) {
         console.error('[notify] Error sending admin notification:', err?.message ?? err);
+    }
+}
+
+// Sends a one-time welcome email to a newly signed-up user via Resend.
+// Mirrors notifyAdmin's fail-safe design: never throws, silently no-ops when
+// RESEND_API_KEY is missing so local dev without the key keeps working, and
+// is called fire-and-forget from /profile so it never delays the iOS app.
+// English copy on purpose — the app UI is English and users can be anywhere.
+async function sendWelcomeEmail({ to, firstName }) {
+    if (!process.env.RESEND_API_KEY) {
+        debugLog('[welcome] RESEND_API_KEY not set, skipping welcome email.');
+        return;
+    }
+    if (!to || typeof to !== 'string' || !to.includes('@')) {
+        debugLog('[welcome] No valid recipient, skipping welcome email.');
+        return;
+    }
+    const name = (firstName && String(firstName).trim()) || 'there';
+    const subject = 'Welcome to EmotionLock';
+    const text = [
+        `Hi ${name},`,
+        '',
+        'Welcome to EmotionLock — and thanks for creating your account.',
+        '',
+        "EmotionLock protects you from yourself: it caps how many trades you can take, so one emotional day can't wipe out weeks of discipline.",
+        '',
+        'Here is how to get started:',
+        '1. Connect your MT5 account in read-only mode (we can never trade for you).',
+        '2. Set your daily trade limit.',
+        '3. That is it — your free week starts the moment you connect, no card needed.',
+        '',
+        'Your trades stay yours. Your investor password is never stored on our servers, and read-only is enforced at the MT5 protocol level.',
+        '',
+        'Questions? Just reply to this email.',
+        '',
+        'Trade with discipline,',
+        'Bart — EmotionLock',
+    ].join('\n');
+    const html = `
+    <div style="font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;max-width:520px;margin:0 auto;color:#1a1a1a;line-height:1.55;">
+      <p style="font-size:16px;">Hi ${name},</p>
+      <p style="font-size:16px;">Welcome to <strong>EmotionLock</strong> — and thanks for creating your account.</p>
+      <p style="font-size:16px;">EmotionLock protects you from yourself: it caps how many trades you can take, so one emotional day can't wipe out weeks of discipline.</p>
+      <p style="font-size:16px;margin-bottom:6px;"><strong>Here's how to get started:</strong></p>
+      <ol style="font-size:16px;padding-left:20px;margin-top:0;">
+        <li>Connect your MT5 account in read-only mode (we can never trade for you).</li>
+        <li>Set your daily trade limit.</li>
+        <li>That's it — your free week starts the moment you connect, no card needed.</li>
+      </ol>
+      <p style="font-size:14px;color:#555;">Your trades stay yours. Your investor password is never stored on our servers, and read-only is enforced at the MT5 protocol level.</p>
+      <p style="font-size:16px;">Questions? Just reply to this email.</p>
+      <p style="font-size:16px;margin-bottom:2px;">Trade with discipline,</p>
+      <p style="font-size:16px;margin-top:0;">Bart — EmotionLock</p>
+    </div>`;
+    try {
+        const res = await fetch('https://api.resend.com/emails', {
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${process.env.RESEND_API_KEY}`,
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+                from: 'Bart at EmotionLock <noreply@emotionlock.app>',
+                to: [to],
+                reply_to: process.env.ADMIN_EMAIL || 'janssenbart92@gmail.com',
+                subject,
+                text,
+                html,
+            }),
+        });
+        if (!res.ok) {
+            const err = await res.text();
+            console.error('[welcome] Failed to send welcome email:', err);
+        } else {
+            console.log(`[welcome] Welcome email sent to ${to}`);
+        }
+    } catch (err) {
+        console.error('[welcome] Error sending welcome email:', err?.message ?? err);
     }
 }
 
