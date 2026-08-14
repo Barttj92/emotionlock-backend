@@ -2611,6 +2611,14 @@ app.post('/purchase/:userId', async (req, res) => {
             // by prefixing with IAP-. Apple's transactionId is globally unique
             // per receipt so this stays idempotent across retries.
             patch.license_code = `IAP-${transactionId}`;
+            // Stamp the moment of the FIRST license purchase. created_at is the
+            // signup/profile-setup time, not the purchase time, so revenue
+            // reporting must not date earnings on created_at. Only set on the
+            // first purchase so restores and entitlement refreshes never move
+            // an existing purchase date forward.
+            if (!existing || !existing.license_code) {
+                patch.license_purchased_at = new Date().toISOString();
+            }
         } else {
             // Subscription state. Always reflect what Apple just reported,
             // including downgrades to 'expired' so the Command Center can
