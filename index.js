@@ -3298,6 +3298,20 @@ app.delete('/delete-account/:userId', async (req, res) => {
             console.error(`[delete-account] Supabase profiles delete failed for ${userId}:`, profileErr.message);
         }
 
+        // Email marketing state. We do NOT delete the email_contacts row: the
+        // send history in email_sends/email_automation_runs references it, and
+        // dropping it would silently rewrite the reporting numbers. Setting the
+        // status to 'unsubscribed' is enough to stop every future mail, because
+        // email_claim_automation_targets only ever selects subscribed contacts.
+        // Without this, a deleted account keeps receiving automation mails.
+        const { error: contactErr } = await supabase
+            .from('email_contacts')
+            .update({ status: 'unsubscribed' })
+            .eq('user_id', String(userId).toLowerCase());
+        if (contactErr) {
+            console.error(`[delete-account] email_contacts unsubscribe failed for ${userId}:`, contactErr.message);
+        }
+
         console.log(`Account deleted for user ${userId}`);
         res.json({ success: true });
     } catch (err) {
