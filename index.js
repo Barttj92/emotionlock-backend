@@ -2463,6 +2463,11 @@ const ONBOARDING_STEPS = [
     'account_created',
     'mt5_connect_shown',
     'mt5_connected',
+    // Not a first-run screen: fired whenever the user has at least one app
+    // selected in Settings > Blocked apps. Drives the blocked_apps_set column
+    // in email_user_state, so the A6 reminder only reaches users who never
+    // picked any apps. Idempotent like every other step.
+    'blocked_apps_set',
 ];
 
 const onboardingEventSchema = z.object({
