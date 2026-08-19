@@ -2461,12 +2461,20 @@ const ONBOARDING_STEPS = [
     'ready',
     'onboarding_completed',
     'account_created',
+    // Post-account steps, in the order the user walks them.
+    'permissions_shown',
+    'blocked_apps_shown',
     'mt5_connect_shown',
     'mt5_connected',
-    // Not a first-run screen: fired whenever the user has at least one app
-    // selected in Settings > Blocked apps. Drives the blocked_apps_set column
-    // in email_user_state, so the A6 reminder only reaches users who never
-    // picked any apps. Idempotent like every other step.
+    // Outcomes rather than screens. Deliberately NOT part of the ordered
+    // funnel in the Command Center: that funnel counts a user at every earlier
+    // step, so a refusal would be reported as a grant.
+    'screentime_granted',
+    'notifications_granted',
+    // Fired whenever the user has at least one app selected in
+    // Settings > Blocked apps, including long after onboarding. Drives the
+    // blocked_apps_set column in email_user_state, so the A6 reminder only
+    // reaches users who never picked any apps.
     'blocked_apps_set',
 ];
 
