@@ -264,8 +264,12 @@ if (process.env.APNS_KEY_BASE64) {
     }
 }
 
+// Returns { ok, error? } so callers that care (e.g. the admin send-push
+// endpoint) can report per-recipient success/failure. Existing call sites
+// that don't use the return value are unaffected.
 async function sendPushNotification(deviceToken, title, body) {
-    if (!apn || !apnProvider || !deviceToken) return;
+    if (!apn || !apnProvider) return { ok: false, error: 'APNs not configured' };
+    if (!deviceToken) return { ok: false, error: 'No device token' };
     const notification = new apn.Notification();
     notification.expiry = Math.floor(Date.now() / 1000) + 3600;
     notification.badge = 1;
@@ -275,12 +279,15 @@ async function sendPushNotification(deviceToken, title, body) {
     try {
         const result = await apnProvider.send(notification, deviceToken);
         if (result.failed.length > 0) {
+            const reason = result.failed[0].response?.reason || 'Unknown APNs failure';
             console.log('Push failed:', result.failed[0].response);
-        } else {
-            console.log('Push sent successfully');
+            return { ok: false, error: reason };
         }
+        console.log('Push sent successfully');
+        return { ok: true };
     } catch (err) {
         console.error('Push error:', err.message);
+        return { ok: false, error: err.message };
     }
 }
 
@@ -2311,6 +2318,106 @@ app.post('/admin/fix-user/:userId', async (req, res) => {
     }
 
     res.json({ success: true, userId, applied: updates });
+});
+
+// Admin: send a push notification to one or more users, from the Command
+// Center Push tab. The website resolves *which* userIds to target (individual
+// pick, or a Users-tab filter applied client-side) — this endpoint only knows
+// how to look up device tokens and send. Device tokens never leave the
+// backend: the response reports per-user status only.
+// Cap kept well under the global express.json 10kb body limit (see "F9"
+// above): ~150 UUID userIds plus title/body comfortably fits under 10kb.
+// Revisit both together if the body limit ever changes.
+const sendPushSchema = z.object({
+    userIds: z.array(z.string().trim().min(1)).min(1).max(150),
+    title: z.string().trim().min(1).max(100),
+    body: z.string().trim().min(1).max(200),
+    // Descriptive label only (e.g. 'individual', 'trial_active', 'all_push_enabled'),
+    // stored for the history view — not used to re-resolve the audience.
+    segment: z.string().trim().max(100).optional(),
+    sentBy: z.string().trim().max(200).optional(),
+});
+
+app.post('/admin/send-push', async (req, res) => {
+    const adminKey = req.headers['x-admin-key'];
+    if (!isValidAdminKey(adminKey)) return res.status(401).json({ error: 'Unauthorized' });
+
+    const parsed = sendPushSchema.safeParse(req.body);
+    if (!parsed.success) {
+        return res.status(400).json({ error: 'Invalid request', details: parsed.error.flatten() });
+    }
+    const { title, body, segment, sentBy } = parsed.data;
+    // Dedupe while preserving order (a filter + manual add could overlap).
+    const userIds = [...new Set(parsed.data.userIds)];
+
+    if (!apnProvider) {
+        return res.status(503).json({ error: 'Push notifications are not configured on the server.' });
+    }
+
+    try {
+        // Fetch device tokens for the whole table once rather than per-user —
+        // the table is small and user_id casing differs across sources (profiles
+        // uppercase, purchases lowercase, see other routes), so an exact .in()
+        // match against purchases.user_id can silently miss rows. Building a
+        // lowercased lookup map here matches the pattern used elsewhere in this
+        // file (e.g. the trial-push scheduler) instead of trusting exact casing.
+        const { data: rows, error: fetchErr } = await supabase.from('purchases').select('user_id, device_token');
+        if (fetchErr) {
+            console.error('[send-push] Failed to fetch device tokens:', fetchErr.message);
+            return res.status(500).json({ error: 'Failed to look up recipients.' });
+        }
+        const tokenByUserId = new Map();
+        for (const row of rows || []) {
+            if (row.user_id) tokenByUserId.set(String(row.user_id).toLowerCase(), row.device_token || null);
+        }
+
+        // Sequential on purpose: current user counts are small (tens, not
+        // thousands). If the user base grows a lot, batch these with
+        // Promise.all in chunks instead of sending one-by-one.
+        const recipients = [];
+        let successCount = 0, failedCount = 0, skippedCount = 0;
+        for (const userId of userIds) {
+            const token = tokenByUserId.get(userId.toLowerCase());
+            if (!token) {
+                skippedCount++;
+                recipients.push({ user_id: userId, status: 'skipped', error: 'No device token' });
+                continue;
+            }
+            const result = await sendPushNotification(token, title, body);
+            if (result.ok) {
+                successCount++;
+                recipients.push({ user_id: userId, status: 'sent' });
+            } else {
+                failedCount++;
+                recipients.push({ user_id: userId, status: 'failed', error: result.error });
+            }
+        }
+
+        const { error: logErr } = await supabase.from('push_sends').insert({
+            title,
+            body,
+            segment: segment || null,
+            recipient_count: userIds.length,
+            success_count: successCount,
+            failed_count: failedCount,
+            skipped_count: skippedCount,
+            recipients,
+            sent_by: sentBy || null,
+        });
+        if (logErr) console.error('[send-push] Failed to log send:', logErr.message);
+
+        console.log(`[send-push] "${title}" -> ${userIds.length} recipients: ${successCount} sent, ${failedCount} failed, ${skippedCount} skipped`);
+        res.json({
+            success: true,
+            recipientCount: userIds.length,
+            successCount,
+            failedCount,
+            skippedCount,
+        });
+    } catch (err) {
+        console.error('[send-push] Unexpected error:', err.message);
+        res.status(500).json({ error: 'Failed to send push notifications.' });
+    }
 });
 
 // Reset operational state after a fresh install / re-onboarding.
