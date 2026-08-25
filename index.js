@@ -267,7 +267,13 @@ if (process.env.APNS_KEY_BASE64) {
 // Returns { ok, error? } so callers that care (e.g. the admin send-push
 // endpoint) can report per-recipient success/failure. Existing call sites
 // that don't use the return value are unaffected.
-async function sendPushNotification(deviceToken, title, body) {
+//
+// extraPayload is merged into the raw APNs payload (outside "aps"), which is
+// how custom data reaches the iOS app's userInfo dictionary. The admin
+// send-push endpoint uses this to carry { pushSendId, deepLink } so a tap can
+// be attributed back to a specific send and optionally deep-link in-app.
+// Existing callers that don't pass it are unaffected (empty payload).
+async function sendPushNotification(deviceToken, title, body, extraPayload = {}) {
     if (!apn || !apnProvider) return { ok: false, error: 'APNs not configured' };
     if (!deviceToken) return { ok: false, error: 'No device token' };
     const notification = new apn.Notification();
@@ -276,6 +282,7 @@ async function sendPushNotification(deviceToken, title, body) {
     notification.sound = 'default';
     notification.alert = { title, body };
     notification.topic = process.env.APNS_BUNDLE_ID || 'com.emotionlock.EmotionLock';
+    notification.payload = extraPayload;
     try {
         const result = await apnProvider.send(notification, deviceToken);
         if (result.failed.length > 0) {
@@ -2328,6 +2335,11 @@ app.post('/admin/fix-user/:userId', async (req, res) => {
 // Cap kept well under the global express.json 10kb body limit (see "F9"
 // above): ~150 UUID userIds plus title/body comfortably fits under 10kb.
 // Revisit both together if the body limit ever changes.
+// Fixed set of in-app destinations a tap can jump to — matches the sheets
+// ContentView already knows how to present (showSettings/showStats/
+// showMT5Connect). 'none' means "just open the app", the default.
+const PUSH_DEEP_LINKS = ['none', 'settings', 'stats', 'mt5_connect'];
+
 const sendPushSchema = z.object({
     userIds: z.array(z.string().trim().min(1)).min(1).max(150),
     title: z.string().trim().min(1).max(100),
@@ -2336,6 +2348,7 @@ const sendPushSchema = z.object({
     // stored for the history view — not used to re-resolve the audience.
     segment: z.string().trim().max(100).optional(),
     sentBy: z.string().trim().max(200).optional(),
+    deepLink: z.enum(PUSH_DEEP_LINKS).optional().default('none'),
 });
 
 app.post('/admin/send-push', async (req, res) => {
@@ -2346,12 +2359,36 @@ app.post('/admin/send-push', async (req, res) => {
     if (!parsed.success) {
         return res.status(400).json({ error: 'Invalid request', details: parsed.error.flatten() });
     }
-    const { title, body, segment, sentBy } = parsed.data;
+    const { title, body, segment, sentBy, deepLink } = parsed.data;
     // Dedupe while preserving order (a filter + manual add could overlap).
     const userIds = [...new Set(parsed.data.userIds)];
 
     if (!apnProvider) {
         return res.status(503).json({ error: 'Push notifications are not configured on the server.' });
+    }
+
+    // Generated up front (rather than letting Postgres default it on insert)
+    // because every notification's payload needs to carry this id *before*
+    // any device receives it — that's how a later tap in /push-opened gets
+    // attributed back to this specific send. The row is inserted now as a
+    // placeholder and updated with final counts once sending finishes.
+    const pushSendId = crypto.randomUUID();
+    const { error: insertErr } = await supabase.from('push_sends').insert({
+        id: pushSendId,
+        title,
+        body,
+        segment: segment || null,
+        deep_link: deepLink,
+        recipient_count: userIds.length,
+        success_count: 0,
+        failed_count: 0,
+        skipped_count: 0,
+        recipients: [],
+        sent_by: sentBy || null,
+    });
+    if (insertErr) {
+        console.error('[send-push] Failed to create send record:', insertErr.message);
+        return res.status(500).json({ error: 'Failed to start the send.' });
     }
 
     try {
@@ -2383,7 +2420,7 @@ app.post('/admin/send-push', async (req, res) => {
                 recipients.push({ user_id: userId, status: 'skipped', error: 'No device token' });
                 continue;
             }
-            const result = await sendPushNotification(token, title, body);
+            const result = await sendPushNotification(token, title, body, { pushSendId, deepLink });
             if (result.ok) {
                 successCount++;
                 recipients.push({ user_id: userId, status: 'sent' });
@@ -2393,18 +2430,13 @@ app.post('/admin/send-push', async (req, res) => {
             }
         }
 
-        const { error: logErr } = await supabase.from('push_sends').insert({
-            title,
-            body,
-            segment: segment || null,
-            recipient_count: userIds.length,
+        const { error: updateErr } = await supabase.from('push_sends').update({
             success_count: successCount,
             failed_count: failedCount,
             skipped_count: skippedCount,
             recipients,
-            sent_by: sentBy || null,
-        });
-        if (logErr) console.error('[send-push] Failed to log send:', logErr.message);
+        }).eq('id', pushSendId);
+        if (updateErr) console.error('[send-push] Failed to finalize send record:', updateErr.message);
 
         console.log(`[send-push] "${title}" -> ${userIds.length} recipients: ${successCount} sent, ${failedCount} failed, ${skippedCount} skipped`);
         res.json({
@@ -2418,6 +2450,39 @@ app.post('/admin/send-push', async (req, res) => {
         console.error('[send-push] Unexpected error:', err.message);
         res.status(500).json({ error: 'Failed to send push notifications.' });
     }
+});
+
+// PUBLIC ROUTE: called by the iOS app when a user taps a push notification
+// (userNotificationCenter(_:didReceive:) in AppDelegate). No admin key here —
+// this comes from the user's own phone, not Command Center — so it's
+// rate-limited like the other public write endpoints instead. Records at most
+// one open per (pushSendId, userId) via the unique index; repeated taps on
+// the same notification are silently ignored rather than erroring.
+const pushOpenedLimiter = rateLimit({
+    windowMs: 60 * 60 * 1000,
+    max: 30,
+    standardHeaders: true,
+    legacyHeaders: false,
+});
+const pushOpenedSchema = z.object({
+    pushSendId: z.string().uuid(),
+    userId: z.string().trim().min(1).max(100),
+});
+app.post('/push-opened', pushOpenedLimiter, async (req, res) => {
+    const parsed = pushOpenedSchema.safeParse(req.body);
+    if (!parsed.success) {
+        return res.status(400).json({ error: 'Invalid request' });
+    }
+    const { pushSendId, userId } = parsed.data;
+    const { error } = await supabase.from('push_opens').upsert(
+        { push_send_id: pushSendId, user_id: userId },
+        { onConflict: 'push_send_id,user_id', ignoreDuplicates: true }
+    );
+    if (error) {
+        console.error('[push-opened] Failed to record open:', error.message);
+        return res.status(500).json({ error: 'Failed to record open.' });
+    }
+    res.json({ success: true });
 });
 
 // Reset operational state after a fresh install / re-onboarding.
