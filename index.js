@@ -2642,6 +2642,10 @@ const ONBOARDING_STEPS = [
     // funnel in the Command Center: that funnel counts a user at every earlier
     // step, so a refusal would be reported as a grant.
     'screentime_granted',
+    // Fired when the user tapped Continue on the permissions screen while
+    // Screen Time was still not granted — an explicit skip. Also excluded
+    // from ONBOARDING_ORDER for the same reason as screentime_granted.
+    'screentime_skipped',
     'notifications_granted',
     // Fired whenever the user has at least one app selected in
     // Settings > Blocked apps, including long after onboarding. Drives the
