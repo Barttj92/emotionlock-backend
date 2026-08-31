@@ -337,7 +337,14 @@ async function createMetaApiAccount(server, login, password, name) {
         const err = await response.text();
         throw new Error(`MetaApi create account failed: ${err}`);
     }
-    return response.json();
+    const account = await response.json();
+    // We explicitly request reliability:'regular' above (see comment), but the
+    // MetaAPI dashboard has been observed showing "high reliability" for
+    // accounts created this way. Log what MetaAPI actually confirms back so
+    // we can see per account, straight from Railway logs, whether our request
+    // is honored or silently overridden server-side — no dashboard click needed.
+    console.log(`[metaapi] Created account ${account.id} for "${name}": reliability=${account.reliability ?? 'not present in response'}`);
+    return account;
 }
 
 async function deployMetaApiAccount(accountId) {
