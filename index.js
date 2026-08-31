@@ -2260,6 +2260,11 @@ app.get('/admin/metaapi-accounts', async (req, res) => {
             state: a.state,
             connectionStatus: a.connectionStatus,
             region: a.region,
+            // Surfacing the raw fields MetaAPI actually persisted for this
+            // account, straight from their own account object, no dashboard
+            // badge or invoice needed to confirm what tier we're really on.
+            reliability: a.reliability,
+            regions: a.regions,
         })));
     } catch (err) {
         res.status(500).json({ error: err.message });
