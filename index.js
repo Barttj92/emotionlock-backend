@@ -18,6 +18,13 @@ if (!process.env.SUPABASE_SERVICE_ROLE_KEY) {
 
 const app = express();
 
+// Railway sits its own reverse proxy in front of the app (single hop), so
+// Express needs to trust it to read the real client IP from X-Forwarded-For.
+// Without this, express-rate-limit logs a ValidationError and falls back to
+// an unreliable key, meaning the /connect-mt5, /unlock etc. per-IP limits
+// are not counting the actual client IP.
+app.set('trust proxy', 1);
+
 // =====================
 // Security middleware
 // =====================
@@ -344,6 +351,27 @@ async function deployMetaApiAccount(accountId) {
     }
 }
 
+// MetaAPI's own infra needs a moment to propagate a freshly created account
+// before /deploy can see it — deploying immediately after create can 404
+// with a NotFoundError even though the account genuinely exists. Retries
+// only on that specific error (not on real failures like bad auth) with a
+// short backoff, so a slow propagation window doesn't fail the whole
+// connect attempt and doesn't cause createOrRecoverMetaApiAccount to spin
+// up a second, duplicate account on the user's next retry.
+async function deployMetaApiAccountWithRetry(accountId, attempts = 4, delayMs = 3000) {
+    for (let i = 0; i < attempts; i++) {
+        try {
+            await deployMetaApiAccount(accountId);
+            return;
+        } catch (e) {
+            const isPropagationLag = /NotFoundError/i.test(e.message);
+            if (!isPropagationLag || i === attempts - 1) throw e;
+            console.log(`[metaapi] Deploy not-found for ${accountId} (propagation lag), retrying in ${delayMs}ms (attempt ${i + 1}/${attempts})`);
+            await new Promise(r => setTimeout(r, delayMs));
+        }
+    }
+}
+
 async function undeployMetaApiAccount(accountId) {
     try {
         await fetch(`${PROVISIONING_API}/users/current/accounts/${accountId}/undeploy`, {
@@ -381,7 +409,7 @@ async function redeployMetaApiAccount(accountId) {
         // Short wait so MetaAPI registers the undeploy before we redeploy.
         // Empirically 3-5s is enough; we use 5s to be safe on a slow region.
         await new Promise(r => setTimeout(r, 5000));
-        await deployMetaApiAccount(accountId);
+        await deployMetaApiAccountWithRetry(accountId);
         return true;
     } catch (e) {
         console.error(`[redeploy] Failed for ${accountId}: ${e.message}`);
@@ -455,7 +483,7 @@ async function createOrRecoverMetaApiAccount(server, login, password, userId) {
                           String(orphan.login || '') === String(login);
         if (sameCreds) {
             console.log(`[metaapi] Recovered orphan account ${orphan.id} by name for user ${userId}`);
-            await deployMetaApiAccount(orphan.id);
+            await deployMetaApiAccountWithRetry(orphan.id);
             return { id: orphan.id, region: orphan.region || null, recovered: true };
         }
         console.log(`[metaapi] Stale orphan account ${orphan.id} for user ${userId}, deleting before create`);
@@ -466,7 +494,10 @@ async function createOrRecoverMetaApiAccount(server, login, password, userId) {
         }
     }
     const account = await createMetaApiAccount(server, String(login), password, name);
-    await deployMetaApiAccount(account.id);
+    // Short wait before the first deploy attempt — see
+    // deployMetaApiAccountWithRetry for why this matters right after create.
+    await new Promise(r => setTimeout(r, 3000));
+    await deployMetaApiAccountWithRetry(account.id);
     return { id: account.id, region: account.region || null, recovered: false };
 }
 
