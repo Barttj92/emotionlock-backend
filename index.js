@@ -2776,7 +2776,41 @@ app.post('/purchase/:userId', async (req, res) => {
         }
         if (!profile) {
             // Quiet 404 instead of a noisy log so we don't fill Railway logs
-            // with every scanner probe.
+            // with every scanner probe. BUT: if this userId already has a real
+            // purchases row (i.e. it's a known app install — MT5 connected,
+            // trial running — not a scanner sending random UUIDs), someone we
+            // actually recognise just had a real Apple purchase silently
+            // rejected here because their local onboarding flag skipped
+            // ProfileSetupView (the resetApp() bug, fixed 2026-08-30, but not
+            // retroactive for installs already affected). Apple already
+            // charged them and finished the transaction client-side — this
+            // is the one place left that can catch it, so alert immediately
+            // instead of relying on license_purchased_at, which never gets
+            // set for these users precisely because this gate blocks it.
+            supabase
+                .from('purchases')
+                .select('user_id, mt5_login, mt5_server, app_trial_started_at, created_at')
+                .eq('user_id', userId)
+                .maybeSingle()
+                .then(({ data: knownUser }) => {
+                    if (!knownUser) return; // genuine scanner noise, stay quiet
+                    notifyAdmin({
+                        subject: `[EmotionLock] Blocked purchase — no profile for known user ${userId.slice(0, 8)}`,
+                        lines: [
+                            `A real Apple IAP purchase attempt for product "${productId}" (type: ${type}, tx: ${transactionId}) was REJECTED because user ${userId} has no profiles row (no name/email on file).`,
+                            '',
+                            `This is a known app install, not scanner noise: MT5 login ${knownUser.mt5_login ?? 'n/a'} on ${knownUser.mt5_server ?? 'n/a'}, trial started ${knownUser.app_trial_started_at ?? 'never'}, account created ${knownUser.created_at}.`,
+                            '',
+                            `Apple has already charged the customer and finished the transaction on the app side — this purchase will NOT show up in the Command Center or revenue numbers unless handled manually.`,
+                            '',
+                            `User ID: ${userId}`,
+                            `Time (Europe/Amsterdam): ${adminNotifyTimestamp()}`,
+                            '',
+                            `See backlog item "Profiel-veld + push voor orphan-accounts die alsnog kopen" for the planned fix.`,
+                        ],
+                    }).catch(() => {});
+                })
+                .catch(() => {});
             return res.status(404).json({ error: 'Unknown user. Complete profile setup first.' });
         }
 
