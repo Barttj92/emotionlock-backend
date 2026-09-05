@@ -195,7 +195,7 @@ async function getSubscriptionState(userId) {
     return state;
 }
 
-// True iff the user is currently in their 1-week free trial window.
+// True iff the user is currently in their 4-day free trial window.
 function isAppTrialActive(state) {
     if (!state || !state.appTrialEndsAt) return false;
     return state.appTrialEndsAt > Date.now();
@@ -203,8 +203,8 @@ function isAppTrialActive(state) {
 
 // True when the user is entitled to use trade-tracking features right now.
 // Rules:
-//   - In-app 1-week trial active: always allowed (covers brand new users who
-//     haven't paid yet but are inside their free week).
+//   - In-app 4-day trial active: always allowed (covers brand new users who
+//     haven't paid yet but are inside their free trial).
 //   - 'active' or 'trialing': always allowed.
 //   - 'expired' BUT trial_ends_at is still in the future: Apple sometimes
 //     reports 'expired' during a billing retry window before the access
@@ -212,7 +212,7 @@ function isAppTrialActive(state) {
 //     of truth and keep the user active until then.
 //   - 'expired' AND past trial_ends_at: blocked, UNLESS the in-app trial is
 //     still running (rare edge case where someone subscribed, cancelled and
-//     is back inside the original 7-day trial — let them finish it).
+//     is back inside the original 4-day trial — let them finish it).
 //   - App trial expired AND no active sub: blocked.
 //   - status null AND app trial not started yet: treat as access. Brand new
 //     user who hasn't connected MT5 yet — they're allowed to reach
@@ -227,13 +227,13 @@ async function isSubscriptionActive(userId) {
         // Edge case: returning user whose old Apple ID had a cancelled sub
         // but who has NEVER started the in-app trial under this user_id.
         // Without this branch they can't reach /connect-mt5 to start their
-        // first free week. We grant access here exactly like pre-trial below.
+        // first free trial. We grant access here exactly like pre-trial below.
         if (!state.appTrialStartedAt) return true;
         return false;
     }
     // status === null
     // If the in-app trial has already started AND ended without a paid sub,
-    // the user is past their free week and must subscribe.
+    // the user is past their free trial and must subscribe.
     if (state.appTrialEndsAt && state.appTrialEndsAt <= Date.now()) return false;
     // Pre-trial (no MT5 connect yet) and no Apple data: allow. The trial will
     // start the moment they call /connect-mt5.
@@ -1191,7 +1191,7 @@ setTimeout(() => {
 // Trial expiry push scheduler
 // =====================
 // Sends two pushes ahead of every user's app_trial_ends_at:
-//   - 24h before: "Your free week ends tomorrow"
+//   - 24h before: "Your free trial ends tomorrow"
 //   - 1h before:  "Your free trial expires in 1 hour"
 //
 // Each push is idempotent: the *_at column is stamped on send and the query
@@ -1589,7 +1589,7 @@ app.post('/connect-mt5/:userId', mt5Limiter, async (req, res) => {
     try {
         // Check Supabase for an existing MetaAPI account for this user.
         // Also pull app_trial_started_at so we know whether this connect is
-        // the moment that should start the 1-week free trial clock.
+        // the moment that should start the 4-day free trial clock.
         const { data: savedAccount } = await supabase
             .from('purchases')
             .select('meta_api_account_id, mt5_server, mt5_login, app_trial_started_at, app_trial_ends_at')
@@ -1728,7 +1728,7 @@ app.post('/connect-mt5/:userId', mt5Limiter, async (req, res) => {
         // next server restart. The unique index on user_id (partial,
         // WHERE user_id IS NOT NULL) makes this safe.
         //
-        // First-ever MT5 connect for this user starts the 1-week free trial.
+        // First-ever MT5 connect for this user starts the 4-day free trial.
         // We only set the trial timestamps if they're null on the existing row
         // — never overwrite, so reconnects do not extend the trial.
         const mt5Patch = {
@@ -1740,10 +1740,10 @@ app.post('/connect-mt5/:userId', mt5Limiter, async (req, res) => {
         const isFirstMt5Connect = !savedAccount?.app_trial_started_at;
         if (isFirstMt5Connect) {
             const trialStart = new Date();
-            const trialEnd = new Date(trialStart.getTime() + 7 * 24 * 60 * 60 * 1000);
+            const trialEnd = new Date(trialStart.getTime() + 4 * 24 * 60 * 60 * 1000);
             mt5Patch.app_trial_started_at = trialStart.toISOString();
             mt5Patch.app_trial_ends_at = trialEnd.toISOString();
-            console.log(`[connect-mt5] Starting 1-week free trial for user ${userId.slice(0,8)}, ends at ${trialEnd.toISOString()}`);
+            console.log(`[connect-mt5] Starting 4-day free trial for user ${userId.slice(0,8)}, ends at ${trialEnd.toISOString()}`);
         }
         const { error: mt5SaveErr } = await supabase.from('purchases').upsert(mt5Patch, { onConflict: 'user_id' });
         if (mt5SaveErr) {
@@ -1769,7 +1769,7 @@ app.post('/connect-mt5/:userId', mt5Limiter, async (req, res) => {
         });
 
         // Fire-and-forget admin notification: a user just connected MT5 for the
-        // first time, which starts their 1-week free trial. Only on the FIRST
+        // first time, which starts their 4-day free trial. Only on the FIRST
         // connect (isFirstMt5Connect) so reconnects never re-notify. Best-effort
         // profile lookup so the email carries a name/email, not just a user_id.
         if (isFirstMt5Connect) {
@@ -1784,7 +1784,7 @@ app.post('/connect-mt5/:userId', mt5Limiter, async (req, res) => {
                     notifyAdmin({
                         subject: `Trial started (MT5 connected): ${fullName || 'a user'}`,
                         lines: [
-                            `${fullName || 'A user'} just connected MT5 — their 7-day free trial has started.`,
+                            `${fullName || 'A user'} just connected MT5 — their 4-day free trial has started.`,
                             '',
                             `Email:   ${customerEmail}`,
                             `User ID: ${userId}`,
@@ -2008,7 +2008,7 @@ app.get('/status/:userId', statusLimiter, async (req, res) => {
                 price: d.price,
                 profit: d.profit,
             })),
-            // App-level free trial (1 week from first MT5 connect).
+            // App-level free trial (4 days from first MT5 connect).
             trialActive,
             trialStartedAt: subState.appTrialStartedAt ? new Date(subState.appTrialStartedAt).toISOString() : null,
             trialEndsAt: trialEndsAt ? new Date(trialEndsAt).toISOString() : null,
@@ -3311,9 +3311,9 @@ app.post('/profile/:userId', async (req, res) => {
         // Email-based trial inheritance.
         //
         // Scenario: user installs the app, signs up with email X, starts their
-        // 7-day trial, deletes the app, reinstalls with a different Apple ID,
+        // 4-day trial, deletes the app, reinstalls with a different Apple ID,
         // re-signs up with the same email X. Keychain hands them a fresh
-        // userId, so they would otherwise get a fresh 7-day trial. We block
+        // userId, so they would otherwise get a fresh 4-day trial. We block
         // that by looking up the email on a different userId and, if found,
         // copying the original app_trial_started_at / app_trial_ends_at over
         // to the new userId's purchases row.
@@ -3659,7 +3659,7 @@ async function sendWelcomeEmail({ to, firstName }) {
         'Here is how to get started:',
         '1. Connect your MT5 account in read-only mode (we can never trade for you).',
         '2. Set your daily trade limit.',
-        '3. That is it — your free week starts the moment you connect, no card needed.',
+        '3. That is it — your free trial starts the moment you connect, no card needed.',
         '',
         'Your trades stay yours. Your investor password is never stored on our servers, and read-only is enforced at the MT5 protocol level.',
         '',
@@ -3677,7 +3677,7 @@ async function sendWelcomeEmail({ to, firstName }) {
       <ol style="font-size:16px;padding-left:20px;margin-top:0;">
         <li>Connect your MT5 account in read-only mode (we can never trade for you).</li>
         <li>Set your daily trade limit.</li>
-        <li>That's it — your free week starts the moment you connect, no card needed.</li>
+        <li>That's it — your free trial starts the moment you connect, no card needed.</li>
       </ol>
       <p style="font-size:14px;color:#555;">Your trades stay yours. Your investor password is never stored on our servers, and read-only is enforced at the MT5 protocol level.</p>
       <p style="font-size:16px;">Questions? Just reply to this email.</p>
