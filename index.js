@@ -347,6 +347,43 @@ async function createMetaApiAccount(server, login, password, name) {
     return account;
 }
 
+// Turns a raw MetaAPI error into a message the iOS app can show the user
+// as-is, instead of the one generic "please try again" every /connect-mt5
+// failure used to return regardless of cause. createMetaApiAccount() and
+// deployMetaApiAccount() both throw `new Error(\`... : ${responseBodyText}\`)`
+// where responseBodyText is MetaAPI's raw JSON error body, e.g.:
+//   {"error":"ValidationError","message":".dat file for server X not found...","details":{"code":"E_SRV_NOT_FOUND"}}
+// We only special-case error shapes we recognize with confidence; anything
+// else falls back to the original generic message so we never show a
+// wrong or misleading "specific" reason.
+function friendlyMt5ConnectError(err) {
+    const fallback = 'Failed to connect MT5 account. Please try again.';
+    const raw = err?.message || '';
+    const jsonStart = raw.indexOf('{');
+    if (jsonStart === -1) return fallback;
+    let parsed;
+    try {
+        parsed = JSON.parse(raw.slice(jsonStart));
+    } catch {
+        return fallback;
+    }
+    const code = parsed?.details?.code;
+    const errorType = parsed?.error;
+    if (code === 'E_SRV_NOT_FOUND') {
+        return 'Server name not recognized by the broker. Please check the exact server name in your MT5 app (Settings → Server) — including spaces and capitalization — and try again.';
+    }
+    if (errorType === 'TooManyRequestsError') {
+        return 'The broker connection service is temporarily busy. Please wait a few minutes and try again.';
+    }
+    if (errorType === 'TimeoutError') {
+        return 'The connection to your broker timed out. Please try again in a moment.';
+    }
+    if (errorType === 'ValidationError') {
+        return 'Could not verify your MT5 account details. Please double-check the server, account number and password.';
+    }
+    return fallback;
+}
+
 async function deployMetaApiAccount(accountId) {
     const response = await fetch(`${PROVISIONING_API}/users/current/accounts/${accountId}/deploy`, {
         method: 'POST',
@@ -1799,7 +1836,7 @@ app.post('/connect-mt5/:userId', mt5Limiter, async (req, res) => {
 
     } catch (err) {
         console.error(`MT5 connect error for ${userId}:`, err.message);
-        res.status(500).json({ error: 'Failed to connect MT5 account. Please try again.' });
+        res.status(500).json({ error: friendlyMt5ConnectError(err) });
     }
 });
 
