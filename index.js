@@ -329,32 +329,26 @@ async function sendPushNotification(deviceToken, title, body, extraPayload = {})
 const METAAPI_TOKEN = process.env.METAAPI_TOKEN;
 const PROVISIONING_API = 'https://mt-provisioning-api-v1.agiliumtrade.agiliumtrade.ai';
 
-// MetaAPI answers 202 Accepted (not 201) while it is still auto-detecting
-// the broker's server settings, e.g. the first time anyone connects to a
-// given server. The 202 body is NOT an account: it is a message envelope with
-// a numeric "id" (e.g. 3747). We used to treat that as the account id and
-// then fail on deploy with "Trading account with id 3747 not found". Per the
-// MetaAPI docs the same POST must be repeated after Retry-After seconds; a 202
-// means nothing was created, so repeating cannot produce a duplicate.
-const METAAPI_CREATE_BUDGET_MS = 50 * 1000; // iOS gives /connect-mt5 90s in total
-const METAAPI_CREATE_MAX_WAIT_MS = 20 * 1000;
-
+// MetaAPI answers 202 Accepted (not 201) while it is still validating the
+// connection to the broker ("Account connection validation is in progress,
+// please retry in 60 seconds"). The 202 body is NOT an account: it is a
+// message envelope with a numeric "id". We used to treat that as the account
+// id and then fail on deploy with "Trading account with id 3747 not found".
+//
+// We do NOT retry inside this request. The create POST itself already takes
+// 30-40s and MetaAPI asks for a 60s pause, which does not fit in the 90s the
+// iOS app waits for /connect-mt5. Retrying earlier than MetaAPI asks (we did
+// that at first, every 10s) only pushes its recommendedRetryTime further out.
+// So: report "pending" and let the user try again after a minute; a 202 means
+// nothing was created, so the next attempt cannot produce a duplicate.
 async function createMetaApiAccount(server, login, password, name) {
-    const startedAt = Date.now();
-    for (;;) {
-        const response = await postCreateMetaApiAccount(server, login, password, name);
-        if (response.status !== 202) {
-            return parseCreatedMetaApiAccount(response, name);
-        }
-        const retryAfterSec = Number(response.headers.get('retry-after')) || 10;
-        const waitMs = Math.min(retryAfterSec * 1000, METAAPI_CREATE_MAX_WAIT_MS);
+    const response = await postCreateMetaApiAccount(server, login, password, name);
+    if (response.status === 202) {
         const body = await response.text().catch(() => '');
-        console.log(`[metaapi] Create for "${name}" accepted (202), broker settings still detecting. Retrying in ${waitMs}ms. ${body}`);
-        if (Date.now() - startedAt + waitMs > METAAPI_CREATE_BUDGET_MS) {
-            throw new Error(`MetaApi create account pending: {"error":"BrokerSettingsDetection","message":"Broker server settings are still being detected"}`);
-        }
-        await new Promise(r => setTimeout(r, waitMs));
+        console.log(`[metaapi] Create for "${name}" accepted (202), broker connection validation in progress. ${body}`);
+        throw new Error(`MetaApi create account pending: {"error":"BrokerSettingsDetection","message":"Broker connection validation in progress"}`);
     }
+    return parseCreatedMetaApiAccount(response, name);
 }
 
 async function parseCreatedMetaApiAccount(response, name) {
