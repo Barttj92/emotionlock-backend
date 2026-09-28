@@ -978,6 +978,7 @@ async function checkUserTrades(userId) {
 
         const isReady = accountInfo.state === 'DEPLOYED' &&
             (accountInfo.connectionStatus === 'CONNECTED' || accountInfo.connectionStatus === 'SYNCHRONIZING');
+        if (isReady) user.disconnectedSince = null;
 
         debugLog(`[trades] ${userId.slice(0,8)}: state=${accountInfo.state} status=${accountInfo.connectionStatus} region=${user.mt5Region} ready=${isReady}`);
 
@@ -997,14 +998,34 @@ async function checkUserTrades(userId) {
             // REDEPLOY_THROTTLE_MS per user. The check is fire-and-forget;
             // the next poll cycle sees the new state and either continues
             // normally (account back to CONNECTED) or retries after throttle.
-            const REDEPLOY_THROTTLE_MS = 3 * 60 * 1000;
+            //
+            // DISCONNECTED is also the normal state for a freshly (re)deployed
+            // account while MetaAPI is still connecting to the broker, which
+            // can take several minutes on a server it has not seen before. We
+            // used to redeploy every 3 minutes from the very first DISCONNECTED
+            // poll, which restarted that connection attempt each time, so a new
+            // account could never finish connecting. Now we only intervene
+            // after the account has been DISCONNECTED continuously for
+            // DISCONNECTED_GRACE_MS, and at most once per REDEPLOY_THROTTLE_MS.
+            const REDEPLOY_THROTTLE_MS = 10 * 60 * 1000;
+            const DISCONNECTED_GRACE_MS = 10 * 60 * 1000;
             const nowMs = Date.now();
             const canRetry = !user.lastRedeployAttempt ||
                 (nowMs - user.lastRedeployAttempt) > REDEPLOY_THROTTLE_MS;
 
-            if (canRetry && accountInfo.state === 'DEPLOYED' && accountInfo.connectionStatus === 'DISCONNECTED') {
+            const isDisconnected = accountInfo.state === 'DEPLOYED' && accountInfo.connectionStatus === 'DISCONNECTED';
+            if (isDisconnected) {
+                if (!user.disconnectedSince) user.disconnectedSince = nowMs;
+            } else {
+                user.disconnectedSince = null;
+            }
+            const disconnectedLongEnough = isDisconnected &&
+                (nowMs - user.disconnectedSince) > DISCONNECTED_GRACE_MS;
+
+            if (canRetry && disconnectedLongEnough) {
                 user.lastRedeployAttempt = nowMs;
-                console.log(`[trades] ${userId.slice(0,8)}: account DEPLOYED+DISCONNECTED, triggering redeploy cycle`);
+                user.disconnectedSince = null; // fresh grace window after the redeploy
+                console.log(`[trades] ${userId.slice(0,8)}: account DEPLOYED+DISCONNECTED for over ${DISCONNECTED_GRACE_MS / 60000} min, triggering redeploy cycle`);
                 redeployMetaApiAccount(user.metaApiAccountId).then(ok => {
                     console.log(`[trades] ${userId.slice(0,8)}: redeploy ${ok ? 'completed' : 'failed'}`);
                 });
