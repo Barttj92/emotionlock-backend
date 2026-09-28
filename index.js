@@ -154,6 +154,22 @@ const SUBSCRIPTION_CACHE_TTL_MS = 60 * 1000;
 // re-subscribe within 48h keep their MT5 connection without reconnect setup.
 const SUBSCRIPTION_GRACE_MS = 48 * 60 * 60 * 1000;
 
+// Internal test devices with permanent access (the founder's own phone(s)).
+// Comma-separated Keychain userIds in the Railway env var
+// UNLIMITED_ACCESS_USER_IDS. Kept out of source on purpose: no userIds in git,
+// and adding/removing a device is a Railway variable change, not a deploy.
+// These users bypass every subscription/trial gate AND the cost-cleanup jobs
+// that would otherwise undeploy their MetaAPI account after the trial.
+const UNLIMITED_ACCESS_USER_IDS = new Set(
+    (process.env.UNLIMITED_ACCESS_USER_IDS || '')
+        .split(',')
+        .map(id => id.trim().toLowerCase())
+        .filter(Boolean)
+);
+function hasUnlimitedAccess(userId) {
+    return !!userId && UNLIMITED_ACCESS_USER_IDS.has(String(userId).toLowerCase());
+}
+
 const subscriptionCache = new Map();
 
 function invalidateSubscriptionCache(userId) {
@@ -218,6 +234,7 @@ function isAppTrialActive(state) {
 //     user who hasn't connected MT5 yet — they're allowed to reach
 //     /connect-mt5 which is what starts the trial.
 async function isSubscriptionActive(userId) {
+    if (hasUnlimitedAccess(userId)) return true;
     const state = await getSubscriptionState(userId);
     if (!state) return true;
     if (isAppTrialActive(state)) return true;
@@ -243,6 +260,7 @@ async function isSubscriptionActive(userId) {
 // Used by the periodic cleanup job to find users whose MetaAPI account can
 // be safely undeployed. Requires 'expired' status AND past the grace window.
 async function isPastGracePeriod(userId) {
+    if (hasUnlimitedAccess(userId)) return false;
     const state = await getSubscriptionState(userId);
     if (!state || state.status !== 'expired') return false;
     if (!state.trialEndsAt) return false;
@@ -1179,6 +1197,7 @@ async function cleanupExpiredMetaApiAccounts() {
         for (const row of (candidates ?? [])) {
             // Re-evaluate grace per row so the check matches isPastGracePeriod
             // exactly without trusting any cached value.
+            if (hasUnlimitedAccess(row.user_id)) continue;
             const trialEndsAt = row.trial_ends_at ? new Date(row.trial_ends_at).getTime() : null;
             if (!trialEndsAt) continue;
             if ((now - trialEndsAt) <= SUBSCRIPTION_GRACE_MS) continue;
@@ -1371,6 +1390,7 @@ async function runTrialNotificationScheduler() {
                 // they are a real paying customer, hands off their MT5.
                 const subActive = row.subscription_status === 'active' || row.subscription_status === 'trialing';
                 if (subActive && row.license_code) continue;
+                if (hasUnlimitedAccess(row.user_id)) continue;
                 try {
                     await undeployMetaApiAccount(row.meta_api_account_id);
                     await supabase
@@ -1873,6 +1893,12 @@ const UUID_V4_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9
 // PUBLIC ROUTE: status polling — called by the iOS app every 5s. UserId is the Keychain UUID
 //               (non-guessable). Returns only non-sensitive trade state.
 app.get('/status/:userId', statusLimiter, async (req, res) => {
+    // Live poll endpoint (iOS hits this every 5s) — never let a client, proxy
+    // or CDN cache a response here. No Cache-Control was set before, which
+    // let iOS's own URLCache serve a stale body for repeat GETs to the same
+    // URL (same userId, no query string), surviving app relaunch and making
+    // tradesCount/isLocked look frozen with no visible error.
+    res.set('Cache-Control', 'no-store');
     try {
         const { userId } = req.params;
         const localDate = req.headers['x-local-date'] || null;
@@ -2011,8 +2037,12 @@ app.get('/status/:userId', statusLimiter, async (req, res) => {
         // version because trial expiry crosses minute boundaries that the
         // 60s cache could miss.
         const subState = await getSubscriptionState(userId);
-        const trialActive = isAppTrialActive(subState);
-        const trialEndsAt = subState.appTrialEndsAt;
+        const unlimited = hasUnlimitedAccess(userId);
+        const trialActive = unlimited ? false : isAppTrialActive(subState);
+        // Unlimited test devices report no trial end, so a Release build's
+        // StoreKitManager treats them as pre-trial (hasAccess = true) instead
+        // of flipping to the paywall once the real trial date has passed.
+        const trialEndsAt = unlimited ? null : subState.appTrialEndsAt;
         let trialDaysRemaining = null;
         if (trialEndsAt) {
             const msLeft = trialEndsAt - Date.now();
@@ -2047,7 +2077,7 @@ app.get('/status/:userId', statusLimiter, async (req, res) => {
             })),
             // App-level free trial (4 days from first MT5 connect).
             trialActive,
-            trialStartedAt: subState.appTrialStartedAt ? new Date(subState.appTrialStartedAt).toISOString() : null,
+            trialStartedAt: (!unlimited && subState.appTrialStartedAt) ? new Date(subState.appTrialStartedAt).toISOString() : null,
             trialEndsAt: trialEndsAt ? new Date(trialEndsAt).toISOString() : null,
             trialDaysRemaining,
         });
