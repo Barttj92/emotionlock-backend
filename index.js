@@ -519,15 +519,23 @@ async function redeployMetaApiAccount(accountId) {
 }
 
 async function getMetaApiAccountInfo(accountId) {
+    const { account } = await fetchMetaApiAccountInfo(accountId);
+    return account;
+}
+
+// Same lookup, but tells the caller WHY there is no account: a 404 means the
+// account is really gone from MetaAPI, anything else (5xx, timeout) may be
+// transient. The trade poller needs that difference.
+async function fetchMetaApiAccountInfo(accountId) {
     const response = await fetch(`${PROVISIONING_API}/users/current/accounts/${accountId}`, {
         headers: { 'auth-token': METAAPI_TOKEN }
     });
     if (!response.ok) {
         const errText = await response.text();
         console.log(`[metaapi] getAccountInfo HTTP ${response.status} for ${accountId}: ${errText.slice(0, 200)}`);
-        return null;
+        return { account: null, status: response.status };
     }
-    return response.json();
+    return { account: await response.json(), status: response.status };
 }
 
 // Safety net against duplicate accounts: if Supabase row and in-memory state are
@@ -933,10 +941,23 @@ async function checkUserTrades(userId) {
     checkDailyReset(user, getAmsterdamDateStr());
 
     try {
-        const accountInfo = await getMetaApiAccountInfo(user.metaApiAccountId);
+        const { account: accountInfo, status: infoStatus } = await fetchMetaApiAccountInfo(user.metaApiAccountId);
         if (!accountInfo) {
-            console.log(`[trades] ${userId.slice(0,8)}: MetaApi account not found (id: ${user.metaApiAccountId})`);
-            user.mt5SyncStatus = 'unknown';
+            if (infoStatus === 404) {
+                // The account no longer exists in MetaAPI (deleted manually or
+                // by an admin cleanup). Polling it again every cycle only spams
+                // the logs and burns API calls. Stop polling and show the user
+                // as not connected, so the app offers "Connect MT5" again.
+                // In memory only: the Supabase row is left untouched, and the
+                // connect flow already handles a stale meta_api_account_id
+                // (getMetaApiAccountInfo -> null -> createOrRecoverMetaApiAccount).
+                console.log(`[trades] ${userId.slice(0,8)}: MetaApi account ${user.metaApiAccountId} no longer exists (404). Marking MT5 as disconnected, polling stopped.`);
+                user.mt5Connected = false;
+                user.mt5SyncStatus = 'not_connected';
+            } else {
+                console.log(`[trades] ${userId.slice(0,8)}: MetaApi account lookup failed (HTTP ${infoStatus}), will retry (id: ${user.metaApiAccountId})`);
+                user.mt5SyncStatus = 'unknown';
+            }
             user.mt5SyncStatusAt = new Date().toISOString();
             return;
         }
