@@ -329,8 +329,56 @@ async function sendPushNotification(deviceToken, title, body, extraPayload = {})
 const METAAPI_TOKEN = process.env.METAAPI_TOKEN;
 const PROVISIONING_API = 'https://mt-provisioning-api-v1.agiliumtrade.agiliumtrade.ai';
 
+// MetaAPI answers 202 Accepted (not 201) while it is still auto-detecting
+// the broker's server settings, e.g. the first time anyone connects to a
+// given server. The 202 body is NOT an account: it is a message envelope with
+// a numeric "id" (e.g. 3747). We used to treat that as the account id and
+// then fail on deploy with "Trading account with id 3747 not found". Per the
+// MetaAPI docs the same POST must be repeated after Retry-After seconds; a 202
+// means nothing was created, so repeating cannot produce a duplicate.
+const METAAPI_CREATE_BUDGET_MS = 50 * 1000; // iOS gives /connect-mt5 90s in total
+const METAAPI_CREATE_MAX_WAIT_MS = 20 * 1000;
+
 async function createMetaApiAccount(server, login, password, name) {
-    const response = await fetch(`${PROVISIONING_API}/users/current/accounts`, {
+    const startedAt = Date.now();
+    for (;;) {
+        const response = await postCreateMetaApiAccount(server, login, password, name);
+        if (response.status !== 202) {
+            return parseCreatedMetaApiAccount(response, name);
+        }
+        const retryAfterSec = Number(response.headers.get('retry-after')) || 10;
+        const waitMs = Math.min(retryAfterSec * 1000, METAAPI_CREATE_MAX_WAIT_MS);
+        const body = await response.text().catch(() => '');
+        console.log(`[metaapi] Create for "${name}" accepted (202), broker settings still detecting. Retrying in ${waitMs}ms. ${body}`);
+        if (Date.now() - startedAt + waitMs > METAAPI_CREATE_BUDGET_MS) {
+            throw new Error(`MetaApi create account pending: {"error":"BrokerSettingsDetection","message":"Broker server settings are still being detected"}`);
+        }
+        await new Promise(r => setTimeout(r, waitMs));
+    }
+}
+
+async function parseCreatedMetaApiAccount(response, name) {
+    if (!response.ok) {
+        const err = await response.text();
+        throw new Error(`MetaApi create account failed: ${err}`);
+    }
+    const account = await response.json();
+    // A real account id is a string (UUID-like). Anything else means MetaAPI
+    // sent a message envelope we do not understand; never deploy on it.
+    if (typeof account?.id !== 'string' || account.id.length < 10) {
+        throw new Error(`MetaApi create account failed: unexpected response ${JSON.stringify(account)}`);
+    }
+    // We explicitly request reliability:'regular' (see postCreateMetaApiAccount), but the
+    // MetaAPI dashboard has been observed showing "high reliability" for
+    // accounts created this way. Log what MetaAPI actually confirms back so
+    // we can see per account, straight from Railway logs, whether our request
+    // is honored or silently overridden server-side — no dashboard click needed.
+    console.log(`[metaapi] Created account ${account.id} for "${name}": reliability=${account.reliability ?? 'not present in response'}`);
+    return account;
+}
+
+function postCreateMetaApiAccount(server, login, password, name) {
+    return fetch(`${PROVISIONING_API}/users/current/accounts`, {
         method: 'POST',
         headers: {
             'auth-token': METAAPI_TOKEN,
@@ -351,18 +399,6 @@ async function createMetaApiAccount(server, login, password, name) {
             tags: ['emotionlock']
         })
     });
-    if (!response.ok) {
-        const err = await response.text();
-        throw new Error(`MetaApi create account failed: ${err}`);
-    }
-    const account = await response.json();
-    // We explicitly request reliability:'regular' above (see comment), but the
-    // MetaAPI dashboard has been observed showing "high reliability" for
-    // accounts created this way. Log what MetaAPI actually confirms back so
-    // we can see per account, straight from Railway logs, whether our request
-    // is honored or silently overridden server-side — no dashboard click needed.
-    console.log(`[metaapi] Created account ${account.id} for "${name}": reliability=${account.reliability ?? 'not present in response'}`);
-    return account;
 }
 
 // Turns a raw MetaAPI error into a message the iOS app can show the user
@@ -389,6 +425,9 @@ function friendlyMt5ConnectError(err) {
     const errorType = parsed?.error;
     if (code === 'E_SRV_NOT_FOUND') {
         return 'Server name not recognized by the broker. Please check the exact server name in your MT5 app (Settings → Server) — including spaces and capitalization — and try again.';
+    }
+    if (errorType === 'BrokerSettingsDetection') {
+        return 'Your broker server is being set up for the first time. Please wait about a minute and try again.';
     }
     if (errorType === 'TooManyRequestsError') {
         return 'The broker connection service is temporarily busy. Please wait a few minutes and try again.';
