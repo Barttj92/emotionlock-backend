@@ -604,6 +604,12 @@ async function createOrRecoverMetaApiAccount(server, login, password, userId) {
     return { id: account.id, region: account.region || null, recovered: false };
 }
 
+// Returns the deals array, or null when the fetch failed. null must never be
+// treated as "no deals": the caller then skips this cycle WITHOUT moving
+// lastDealCheck forward, so the same window is fetched again next poll.
+// Returning [] on failure used to let the first-poll seed complete with zero
+// deals while MetaAPI was still connecting (HTTP 504 "not connected to broker
+// yet"), which silently and permanently dropped every trade closed before it.
 async function getDeals(accountId, region, fromTime, toTime) {
     const url = `https://mt-client-api-v1.${region}.agiliumtrade.ai/users/current/accounts/${accountId}/history-deals/time/${fromTime}/${toTime}`;
     try {
@@ -613,17 +619,17 @@ async function getDeals(accountId, region, fromTime, toTime) {
         if (!response.ok) {
             const errText = await response.text();
             console.log(`[getDeals] HTTP ${response.status} for account ${accountId} region ${region}: ${errText.slice(0, 200)}`);
-            return [];
+            return null;
         }
         const data = await response.json();
         if (!Array.isArray(data)) {
             console.log(`[getDeals] Unexpected response format for account ${accountId}:`, JSON.stringify(data).slice(0, 200));
-            return [];
+            return null;
         }
         return data;
     } catch (e) {
         console.log(`[getDeals] Fetch error for account ${accountId}: ${e.message}`);
-        return [];
+        return null;
     }
 }
 
@@ -1061,6 +1067,10 @@ async function checkUserTrades(userId) {
             //    Fix: count valid closes in the seed and bump tradesCount
             //    to max(tradesCount, seedCloseCount). Never decrement.
             const seedDeals = await getDeals(user.metaApiAccountId, user.mt5Region, todayMidnight.toISOString(), now.toISOString());
+            if (seedDeals === null) {
+                console.log(`[trades] ${userId.slice(0,8)}: seed fetch failed (account not ready yet?), retrying next poll`);
+                return;
+            }
             // Rebuild today's view from scratch since the seed represents the
             // full picture of today's deals as MetaAPI sees them.
             user.todayDeals = [];
@@ -1128,6 +1138,10 @@ async function checkUserTrades(userId) {
         const toTime = now.toISOString();
 
         const deals = await getDeals(user.metaApiAccountId, user.mt5Region, fromTime, toTime);
+        if (deals === null) {
+            // Keep lastDealCheck where it is so this window is fetched again.
+            return;
+        }
 
         debugLog(`[trades] ${userId.slice(0,8)}: fetched ${deals.length} deals from ${fromTime} to ${toTime}`);
         if (deals.length > 0) {
