@@ -29,8 +29,18 @@ app.set('trust proxy', 1);
 // Security middleware
 // =====================
 app.use(cors({ origin: 'https://emotionlock.app' }));
-// F9: Explicit body size limit — prevents oversized payloads from reaching JSON parsing
-app.use(express.json({ limit: '10kb' }));
+// F9: Explicit body size limit, prevents oversized payloads from reaching JSON parsing.
+// Exception: Apple App Store Server Notifications V2. Their signedPayload is a JWS
+// with the full x5c certificate chain plus nested signed transaction/renewal info,
+// which is well above 10kb. With the global 10kb cap every Apple webhook got a 413
+// and was never processed. That route gets its own, still bounded, limit. It is
+// authenticated by JWS signature verification against the Apple Root CA.
+const defaultJsonParser = express.json({ limit: '10kb' });
+const appleNotificationJsonParser = express.json({ limit: '256kb' });
+app.use((req, res, next) => {
+    if (req.path === '/apple/notifications') return appleNotificationJsonParser(req, res, next);
+    return defaultJsonParser(req, res, next);
+});
 
 // Debug logger — only logs in non-production environments
 const debugLog = (...args) => { if (process.env.NODE_ENV !== 'production') console.log(...args); };
