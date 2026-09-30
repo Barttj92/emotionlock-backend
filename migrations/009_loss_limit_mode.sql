@@ -6,8 +6,8 @@
 -- Rollback: nothing needed, older code ignores these columns. Dropping them
 -- is possible later but irreversible (data loss), so only do that on purpose.
 --
--- NOT YET APPLIED to prod Supabase (ixlmaqkhgjgmijlbstia). Apply only after
--- Bart's approval.
+-- Applied to prod Supabase (ixlmaqkhgjgmijlbstia) on 2026-09-30 via the
+-- Supabase MCP after Bart's approval. All 60 existing rows got limit_mode 'trades'.
 
 ALTER TABLE public.purchases
     ADD COLUMN IF NOT EXISTS limit_mode          text          NOT NULL DEFAULT 'trades',
