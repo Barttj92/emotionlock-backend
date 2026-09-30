@@ -7,6 +7,20 @@ let apn = null;
 try { apn = require('@parse/node-apn'); } catch (err) { console.error('apn module unavailable (push disabled):', err.message); }
 const { createClient } = require('@supabase/supabase-js');
 const { verifyAndDecodeNotification: verifyAppleNotification } = require('./apple-notifications');
+const lossLimit = require('./lossLimit');
+
+// Loss-limit mode feature flag. OFF by default: with the flag off every user
+// keeps the exact trade-count behaviour, and /status, /settings and /unlock
+// answer exactly as before. LOSS_MODE_TEST_USER_IDS (comma separated Keychain
+// UUIDs) enables it for test devices only, so TestFlight can be tested
+// against production without touching real users.
+const LOSS_MODE_ENABLED = process.env.LOSS_MODE_ENABLED === 'true';
+const LOSS_MODE_TEST_USER_IDS = new Set(
+    (process.env.LOSS_MODE_TEST_USER_IDS || '').split(',').map(s => s.trim().toLowerCase()).filter(Boolean)
+);
+// App builds below this version never see or set loss mode. Default is
+// deliberately unreachable until the approved App Store version is known.
+const LOSS_MODE_MIN_APP_VERSION = process.env.LOSS_MODE_MIN_APP_VERSION || '999.0.0';
 
 // =====================
 // Startup checks
@@ -148,6 +162,113 @@ async function saveDailyTrades(userId, count, dateStr) {
         .from('purchases')
         .update({ daily_trades_count: count, daily_trades_date: dateStr })
         .eq('user_id', userId);
+}
+
+// ── Loss-limit mode helpers ────────────────────────────────────────────────
+// Loss-mode columns are written in their OWN update calls, never merged into
+// an existing update. If migration 009 has not run yet the write simply fails
+// on its own and can never break max_trades, tokens or MT5 persistence.
+
+function isLossModeOn(userId) {
+    return LOSS_MODE_ENABLED || (!!userId && LOSS_MODE_TEST_USER_IDS.has(String(userId).toLowerCase()));
+}
+
+// True when this request comes from an app build that may use loss mode.
+function isLossModeAvailable(req, userId) {
+    if (!isLossModeOn(userId)) return false;
+    return lossLimit.compareVersions(req.headers['x-app-version'], LOSS_MODE_MIN_APP_VERSION) >= 0;
+}
+
+function isLossMode(user) {
+    return lossLimit.effectiveLimitMode(user, isLossModeOn(user.userId)) === 'loss';
+}
+
+async function saveDailyPnl(userId, user) {
+    const { error } = await supabase
+        .from('purchases')
+        .update({
+            daily_net_pnl: user.dailyNetPnl ?? 0,
+            daily_pnl_date: user.lastReset,
+            loss_unlock_pending: !!user.lossUnlockPending,
+        })
+        .eq('user_id', userId);
+    if (error) debugLog(`[pnl] save failed for ${userId.slice(0, 8)}: ${error.message}`);
+}
+
+async function saveLimitSettings(userId, user) {
+    const { error } = await supabase
+        .from('purchases')
+        .update({
+            limit_mode: user.limitMode || lossLimit.DEFAULT_LIMIT_MODE,
+            max_daily_loss: user.maxDailyLoss ?? null,
+            pending_limit_mode: user.pendingLimitMode ?? null,
+            pending_limit_value: user.pendingLimitValue ?? null,
+        })
+        .eq('user_id', userId);
+    if (error) debugLog(`[limit] save failed for ${userId.slice(0, 8)}: ${error.message}`);
+}
+
+async function saveAccountCurrency(userId, currency) {
+    const { error } = await supabase
+        .from('purchases')
+        .update({ account_currency: currency })
+        .eq('user_id', userId);
+    if (error) debugLog(`[currency] save failed for ${userId.slice(0, 8)}: ${error.message}`);
+}
+
+// Restore loss-mode state after a server restart. Separate query so missing
+// columns (migration not yet applied) never block the rest of /status.
+async function restoreLossLimitState(userId, user, todayISO) {
+    const { data, error } = await supabase
+        .from('purchases')
+        .select('limit_mode, max_daily_loss, pending_limit_mode, pending_limit_value, daily_net_pnl, daily_pnl_date, loss_unlock_pending, account_currency')
+        .eq('user_id', userId)
+        .maybeSingle();
+    if (error || !data) return;
+    if (lossLimit.LIMIT_MODES.includes(data.limit_mode)) user.limitMode = data.limit_mode;
+    if (data.max_daily_loss != null) user.maxDailyLoss = Number(data.max_daily_loss);
+    if (lossLimit.LIMIT_MODES.includes(data.pending_limit_mode)) {
+        user.pendingLimitMode = data.pending_limit_mode;
+        user.pendingLimitValue = data.pending_limit_value != null ? Number(data.pending_limit_value) : null;
+    }
+    if (data.account_currency) user.accountCurrency = data.account_currency;
+    if (data.daily_pnl_date === todayISO) {
+        if (data.daily_net_pnl != null) user.dailyNetPnl = Number(data.daily_net_pnl);
+        user.lossUnlockPending = data.loss_unlock_pending === true;
+    }
+}
+
+// Fetch the account's deposit currency once (loss limits are expressed in
+// it). Fire-and-forget, throttled to one attempt per 10 minutes per user.
+// Read-only call on the existing account: no new MetaAPI account, no cost.
+async function maybeFetchAccountCurrency(userId, user) {
+    if (user.accountCurrency || !user.metaApiAccountId || !user.mt5Region) return;
+    const nowMs = Date.now();
+    if (user.lastCurrencyFetchAttempt && nowMs - user.lastCurrencyFetchAttempt < 10 * 60 * 1000) return;
+    user.lastCurrencyFetchAttempt = nowMs;
+    const url = `https://mt-client-api-v1.${user.mt5Region}.agiliumtrade.ai/users/current/accounts/${user.metaApiAccountId}/account-information`;
+    try {
+        const response = await fetch(url, { headers: { 'auth-token': METAAPI_TOKEN } });
+        if (!response.ok) {
+            debugLog(`[currency] HTTP ${response.status} for ${userId.slice(0, 8)}`);
+            return;
+        }
+        const info = await response.json();
+        const currency = typeof info?.currency === 'string' ? info.currency.trim().toUpperCase().slice(0, 8) : null;
+        if (!currency) return;
+        user.accountCurrency = currency;
+        saveAccountCurrency(userId, currency).catch(() => {});
+        console.log(`[currency] ${userId.slice(0, 8)}: account currency ${currency}`);
+    } catch (e) {
+        debugLog(`[currency] fetch error for ${userId.slice(0, 8)}: ${e.message}`);
+    }
+}
+
+// Clears today's loss-mode counters (account switch, onboarding reset).
+function resetDailyPnl(user) {
+    user.dailyNetPnl = 0;
+    user.pnlDealIds = new Set();
+    user.lossUnlockPending = false;
 }
 
 // =====================
@@ -839,6 +960,24 @@ function initUser(userId) {
             // resync. 3 minutes is enough for a normal undeploy+deploy cycle
             // (~30-60s) plus broker sync (~30-60s) plus a safety margin.
             lastRedeployAttempt: null,
+            // Loss-limit mode (see lossLimit.js). limitMode 'trades' keeps the
+            // historical behaviour. maxTrades is never cleared when a user picks
+            // loss mode, so rolling the feature back restores their old limit.
+            userId,
+            limitMode: lossLimit.DEFAULT_LIMIT_MODE,
+            maxDailyLoss: null,
+            pendingLimitMode: null,
+            pendingLimitValue: null,
+            // Realized net P&L of today (profit + commission + swap + fee) in
+            // account currency. Computed for every user (shadow mode), only
+            // used for locking when loss mode is effective.
+            dailyNetPnl: 0,
+            pnlDealIds: new Set(),
+            // Set by an emergency unlock in loss mode: one extra trade, the
+            // lock can only come back once the next position has closed.
+            lossUnlockPending: false,
+            accountCurrency: null,
+            lastCurrencyFetchAttempt: null,
         };
     }
 }
@@ -859,6 +998,13 @@ function checkDailyReset(user, localDateStr) {
         user.processedPositionIds = new Set();
         user.openPositions = {};
         user.todayDeals = [];
+        resetDailyPnl(user);
+        // A limit-mode switch always waits for the daily reset, so it can
+        // never be used to escape a lock that is active today.
+        if (user.pendingLimitMode && lossLimit.applyPendingLimitMode(user)) {
+            console.log(`[limit] ${String(user.userId).slice(0, 8)}: switched to ${user.limitMode} mode at daily reset`);
+            if (user.userId) saveLimitSettings(user.userId, user).catch(() => {});
+        }
     }
 }
 
@@ -995,6 +1141,7 @@ async function checkUserTrades(userId) {
         const isReady = accountInfo.state === 'DEPLOYED' &&
             (accountInfo.connectionStatus === 'CONNECTED' || accountInfo.connectionStatus === 'SYNCHRONIZING');
         if (isReady) user.disconnectedSince = null;
+        if (isReady && !user.accountCurrency) maybeFetchAccountCurrency(userId, user).catch(() => {});
 
         debugLog(`[trades] ${userId.slice(0,8)}: state=${accountInfo.state} status=${accountInfo.connectionStatus} region=${user.mt5Region} ready=${isReady}`);
 
@@ -1096,6 +1243,9 @@ async function checkUserTrades(userId) {
                 recordPartialClose(user, positionId, deal);
             }
 
+            // Today's realized net P&L, recomputed from the full seed.
+            lossLimit.recomputePnl(user, seedDeals);
+
             // Phase 2: count only positions that are fully closed (not in the
             // live positions list). Positions still partially open stay pending
             // in user.openPositions and get counted on a later poll when closed.
@@ -1118,7 +1268,7 @@ async function checkUserTrades(userId) {
                     console.log(`[trades] ${userId.slice(0,8)}: seed reconciled tradesCount ${restoredCount} -> ${seedCloseCount} (MetaAPI shows ${seedCloseCount} fully-closed positions today)`);
                     saveDailyTrades(userId, user.tradesCount, user.lastReset).catch(() => {});
                 }
-                if (user.tradesCount >= user.maxTrades && !user.isLocked) {
+                if (!isLossMode(user) && user.tradesCount >= user.maxTrades && !user.isLocked) {
                     user.isLocked = true;
                     debugLog(`User ${userId}: trade limit reached during seed reconcile`);
                     // Skip push from this path: the user just opened the app
@@ -1131,6 +1281,15 @@ async function checkUserTrades(userId) {
                 // position is still partially open this session). Never decrement.
                 user.tradesCount = restoredCount;
             }
+
+            if (isLossMode(user) && !user.isLocked && !user.lossUnlockPending
+                && lossLimit.isLossLimitReached(user.dailyNetPnl, user.maxDailyLoss)) {
+                // No push, same reasoning as the trade-mode seed path above.
+                user.isLocked = true;
+                debugLog(`User ${userId}: loss limit reached during seed reconcile`);
+            }
+            saveDailyPnl(userId, user).catch(() => {});
+            console.log(`[pnl-shadow] ${userId.slice(0,8)}: seed dailyNetPnl=${user.dailyNetPnl} mode=${isLossMode(user) ? 'loss' : 'trades'} trades=${user.tradesCount}`);
 
             debugLog(`[trades] ${userId.slice(0,8)}: first check — seeded ${seedDeals.length} deals, ${Object.keys(user.openPositions).length} still-open position(s), ${seedCloseCount} fully-closed, tradesCount=${user.tradesCount}`);
             return;
@@ -1159,6 +1318,11 @@ async function checkUserTrades(userId) {
         }
 
         let newTradesDetected = false;
+        let positionClosed = false;
+
+        // Loss mode (and shadow logging): fold every new trade deal of this
+        // window into today's net P&L, entries included (commission).
+        const pnlChanged = lossLimit.applyDealsToPnl(user, deals);
 
         // Phase 1: accumulate close deals per position. A trade is NOT counted
         // here. Partial closes of the same position are summed into a pending
@@ -1216,6 +1380,7 @@ async function checkUserTrades(userId) {
                     debugLog(`[trades] ${userId.slice(0,8)}: position ${positionId} partially closed, still open, waiting for full close`);
                     continue;
                 }
+                positionClosed = true;
                 const counted = finalizeClosedPosition(user, positionId);
                 if (counted) {
                     newTradesDetected = true;
@@ -1231,7 +1396,7 @@ async function checkUserTrades(userId) {
             }
         }
 
-        if (newTradesDetected && user.tradesCount >= user.maxTrades && !user.isLocked) {
+        if (!isLossMode(user) && newTradesDetected && user.tradesCount >= user.maxTrades && !user.isLocked) {
             user.isLocked = true;
             logActivity(userId, 'limit_reached', { max: user.maxTrades });
             debugLog(`User ${userId}: trade limit reached, sending push`);
@@ -1240,6 +1405,25 @@ async function checkUserTrades(userId) {
                 '🔒 EmotionLock activated',
                 `You've reached your limit of ${user.maxTrades} trade${user.maxTrades > 1 ? 's' : ''} today. Trading apps are now blocked.`
             );
+        }
+
+        if (isLossMode(user)) {
+            const decision = lossLimit.decideLossLock(user, { positionClosed, pnlChanged });
+            if (decision === 'lock') {
+                user.isLocked = true;
+                const limitText = lossLimit.formatMoney(user.maxDailyLoss, user.accountCurrency);
+                logActivity(userId, 'loss_limit_reached', { max: user.maxDailyLoss, pnl: user.dailyNetPnl, currency: user.accountCurrency });
+                console.log(`User ${userId}: loss limit reached (${user.dailyNetPnl} of -${user.maxDailyLoss}), sending push`);
+                await sendPushNotification(
+                    user.deviceToken,
+                    'EmotionLock activated',
+                    `You've reached your daily loss limit of ${limitText}. Trading apps are now blocked.`
+                );
+            }
+        }
+        if (pnlChanged || positionClosed) {
+            saveDailyPnl(userId, user).catch(() => {});
+            console.log(`[pnl-shadow] ${userId.slice(0,8)}: dailyNetPnl=${user.dailyNetPnl} mode=${isLossMode(user) ? 'loss' : 'trades'} trades=${user.tradesCount} locked=${user.isLocked}`);
         }
 
         user.lastDealCheck = new Date().toISOString();
@@ -1873,6 +2057,12 @@ app.post('/connect-mt5/:userId', mt5Limiter, async (req, res) => {
             userStates[userId].openPositions = {};
             userStates[userId].tradesCount = 0;
             saveDailyTrades(userId, 0, userStates[userId].lastReset).catch(() => {});
+            // A different account has its own P&L and possibly another currency.
+            resetDailyPnl(userStates[userId]);
+            userStates[userId].accountCurrency = null;
+            userStates[userId].lastCurrencyFetchAttempt = null;
+            saveDailyPnl(userId, userStates[userId]).catch(() => {});
+            saveAccountCurrency(userId, null).catch(() => {});
         }
         if (accountRegion) userStates[userId].mt5Region = accountRegion;
         console.log(`MT5 connected for user ${userId.slice(0,8)}: accountId=${accountId} region=${accountRegion || 'unknown (will detect on first poll)'}`);
@@ -2081,6 +2271,8 @@ app.get('/status/:userId', statusLimiter, async (req, res) => {
             // Restore last_token_reset so the on-activity check has the right
             // anchor and doesn't fire a spurious extra reset after a restart.
             if (purchase?.last_token_reset) user.lastTokenReset = purchase.last_token_reset;
+            // Loss-limit mode state (own query, tolerant of missing columns).
+            await restoreLossLimitState(userId, user, localDate || getAmsterdamDateStr());
 
             // Restore today's trade count (separate query — daily_trades columns added later).
             // Amsterdam fallback so the comparison against daily_trades_date is
@@ -2095,10 +2287,14 @@ app.get('/status/:userId', statusLimiter, async (req, res) => {
             if (tradeData?.daily_trades_date === todayISO && tradeData?.daily_trades_count > 0) {
                 user.tradesCount = tradeData.daily_trades_count;
                 user.lastReset = todayISO;
-                if (user.tradesCount >= user.maxTrades) {
+                if (!isLossMode(user) && user.tradesCount >= user.maxTrades) {
                     user.isLocked = true;
                 }
                 console.log(`[status] Restored ${tradeData.daily_trades_count} trades for ${userId} (date: ${todayISO})`);
+            }
+            if (isLossMode(user) && !user.lossUnlockPending
+                && lossLimit.isLossLimitReached(user.dailyNetPnl, user.maxDailyLoss)) {
+                user.isLocked = true;
             }
         }
 
@@ -2166,6 +2362,9 @@ app.get('/status/:userId', statusLimiter, async (req, res) => {
             mt5SyncStatusAt: user.mt5SyncStatusAt ?? null,
             maxTrades: user.maxTrades,
             countWinningTrades: user.countWinningTrades ?? false,
+            // Loss-limit fields. Only sent to app builds that support loss
+            // mode, so older builds keep receiving the exact same response.
+            ...(isLossModeAvailable(req, userId) ? lossLimitStatusFields(user) : {}),
             // Explicitly serialize: positionId is internal (used only to
             // aggregate partial closes), never exposed to the client.
             todayDeals: (user.todayDeals ?? []).map(d => ({
@@ -2190,7 +2389,152 @@ const settingsSchema = z.object({
     maxTrades: z.number().int().min(1).max(10).optional(),
     // F4: When true, only winning trades (profit > 0) count toward the daily limit.
     countWinningTrades: z.boolean().optional(),
+    // Loss-limit mode. limitMode schedules a switch for the next daily reset
+    // (applied immediately only during the free initial setup).
+    limitMode: z.enum(lossLimit.LIMIT_MODES).optional(),
+    maxDailyLoss: z.number()
+        .refine(lossLimit.isValidMaxDailyLoss, { message: `maxDailyLoss must be between ${lossLimit.MAX_DAILY_LOSS_MIN} and ${lossLimit.MAX_DAILY_LOSS_MAX} with at most 2 decimals` })
+        .optional(),
 });
+
+// Serialized loss-limit state for /status and /settings responses.
+function lossLimitStatusFields(user) {
+    return {
+        limitMode: isLossMode(user) ? 'loss' : 'trades',
+        maxDailyLoss: user.maxDailyLoss ?? null,
+        dailyNetPnl: user.dailyNetPnl ?? 0,
+        accountCurrency: user.accountCurrency ?? null,
+        pendingLimitMode: user.pendingLimitMode ?? null,
+        pendingLimitValue: user.pendingLimitValue ?? null,
+        lossUnlockPending: !!user.lossUnlockPending,
+        lossModeAvailable: true,
+    };
+}
+
+// Free once: the user has never completed a settings change and has not
+// traded or been locked today, so a first choice cannot escape anything.
+function isFreeInitialLimitSetup(user) {
+    return !user.firstSetupComplete
+        && !user.isLocked
+        && user.tradesCount === 0
+        && lossLimit.toCents(user.dailyNetPnl ?? 0) === 0;
+}
+
+// Spend one emergency token for a limit change. Returns an error body or null.
+function spendLimitChangeToken(userId, user) {
+    checkWeeklyTokenReset(user, userId);
+    if (user.emergencyTokens <= 0) {
+        return {
+            error: 'no_tokens',
+            message: 'No emergency tokens left. You cannot change your limit.',
+            isLocked: user.isLocked,
+            emergencyTokens: user.emergencyTokens,
+        };
+    }
+    user.emergencyTokens -= 1;
+    saveTokensByUserId(userId, user.emergencyTokens).catch(() => {});
+    return null;
+}
+
+// Mode switch request. Outside the free initial setup a switch is scheduled
+// for the next daily reset (free of charge, can never lift today's lock).
+// Returns an error body or null. Mutates user.
+function applyLimitModeRequest(user, { limitMode, maxTrades, maxDailyLoss }) {
+    const current = user.limitMode || lossLimit.DEFAULT_LIMIT_MODE;
+    if (limitMode === current) {
+        // Same mode as today: cancels any scheduled switch.
+        user.pendingLimitMode = null;
+        user.pendingLimitValue = null;
+        return null;
+    }
+    const value = limitMode === 'loss' ? maxDailyLoss : (maxTrades ?? user.maxTrades);
+    if (limitMode === 'loss' && !lossLimit.isValidMaxDailyLoss(value)) {
+        return { error: 'max_daily_loss_required', message: 'Choose a daily loss limit to switch to loss mode.' };
+    }
+    if (isFreeInitialLimitSetup(user)) {
+        user.limitMode = limitMode;
+        if (limitMode === 'loss') user.maxDailyLoss = value;
+        else user.maxTrades = value;
+        user.pendingLimitMode = null;
+        user.pendingLimitValue = null;
+        user.firstSetupComplete = true;
+        return null;
+    }
+    user.pendingLimitMode = limitMode;
+    user.pendingLimitValue = value;
+    return null;
+}
+
+// Change of the loss amount itself. Same rules as a maxTrades change: one
+// token up or down (free during initial setup), then re-evaluate the lock.
+// Returns an error body or null. Mutates user.
+function applyMaxDailyLossChange(userId, user, maxDailyLoss) {
+    if ((user.limitMode || lossLimit.DEFAULT_LIMIT_MODE) !== 'loss') {
+        // Not in loss mode yet: only allowed to adjust a scheduled switch.
+        if (user.pendingLimitMode === 'loss') {
+            user.pendingLimitValue = maxDailyLoss;
+            return null;
+        }
+        return { error: 'wrong_mode', message: 'Switch to loss mode before setting a loss limit.' };
+    }
+    if (maxDailyLoss === user.maxDailyLoss) return null;
+    if (!isFreeInitialLimitSetup(user)) {
+        const tokenError = spendLimitChangeToken(userId, user);
+        if (tokenError) return tokenError;
+    }
+    const wasLocked = user.isLocked;
+    user.maxDailyLoss = maxDailyLoss;
+    user.firstSetupComplete = true;
+    if (lossLimit.isLossLimitReached(user.dailyNetPnl, user.maxDailyLoss)) {
+        user.isLocked = true;
+        user.emergencyUnlocked = false;
+    } else if (wasLocked) {
+        user.isLocked = false;
+        user.emergencyUnlocked = true;
+        user.lossUnlockPending = false;
+    }
+    return null;
+}
+
+// /settings branch for requests that carry limitMode and/or maxDailyLoss.
+// A plain maxTrades change in trade mode keeps using the original handler.
+function handleLossModeSettings(userId, user, body, res) {
+    const { limitMode, maxTrades, maxDailyLoss, countWinningTrades } = body;
+    const modeBefore = user.limitMode || lossLimit.DEFAULT_LIMIT_MODE;
+    if (limitMode !== undefined) {
+        const err = applyLimitModeRequest(user, { limitMode, maxTrades, maxDailyLoss });
+        if (err) return res.status(400).json(err);
+    }
+    // maxDailyLoss already consumed as the value of a switch made or scheduled
+    // in this same request; otherwise it is a change of the current amount.
+    const consumedBySwitch = limitMode === 'loss' && modeBefore !== 'loss';
+    if (maxDailyLoss !== undefined && !consumedBySwitch) {
+        const err = applyMaxDailyLossChange(userId, user, maxDailyLoss);
+        if (err) return res.status(400).json(err);
+    }
+    if (countWinningTrades !== undefined) user.countWinningTrades = countWinningTrades;
+
+    saveLimitSettings(userId, user).catch(() => {});
+    supabase.from('purchases').update({
+        max_trades: user.maxTrades,
+        count_winning_trades: user.countWinningTrades,
+        first_setup_complete: user.firstSetupComplete,
+    }).eq('user_id', userId).then(() => {}).catch(() => {});
+    logActivity(userId, 'limit_settings_changed', {
+        limitMode: user.limitMode, maxDailyLoss: user.maxDailyLoss, pendingLimitMode: user.pendingLimitMode,
+    });
+
+    return res.json({
+        success: true,
+        maxTrades: user.maxTrades,
+        isLocked: user.isLocked,
+        emergencyTokens: user.emergencyTokens,
+        emergencyUnlocked: user.emergencyUnlocked,
+        countWinningTrades: user.countWinningTrades,
+        tradesCount: user.tradesCount,
+        ...lossLimitStatusFields(user),
+    });
+}
 
 // PUBLIC ROUTE: user settings — called by iOS app. UserId is the Keychain UUID (non-guessable).
 app.post('/settings/:userId', (req, res) => {
@@ -2201,12 +2545,25 @@ app.post('/settings/:userId', (req, res) => {
         if (!parsed.success) {
             return res.status(400).json({ error: 'Invalid input.', details: parsed.error.issues.map(i => i.message) });
         }
-        const { maxTrades, countWinningTrades } = parsed.data;
+        const { maxTrades, countWinningTrades, limitMode, maxDailyLoss } = parsed.data;
 
         if (!userStates[userId]) {
             initUser(userId);
         }
         const user = userStates[userId];
+
+        // Loss-limit mode requests are only accepted from supporting app
+        // builds while the feature flag is on for this user.
+        const wantsLossFeature = limitMode !== undefined || maxDailyLoss !== undefined;
+        if (wantsLossFeature) {
+            if (!isLossModeAvailable(req, userId)) {
+                return res.status(403).json({ error: 'loss_mode_unavailable', message: 'This setting is not available yet.' });
+            }
+            return handleLossModeSettings(userId, user, parsed.data, res);
+        }
+        if (maxTrades !== undefined && isLossMode(user)) {
+            return res.status(400).json({ error: 'wrong_mode', message: 'Your limit is a daily loss amount, not a number of trades.' });
+        }
 
         if (maxTrades !== undefined && maxTrades !== user.maxTrades) {
             // Initial setup: free ONLY once per user, when the backend still
@@ -2313,13 +2670,23 @@ app.post('/unlock/:userId', unlockLimiter, async (req, res) => {
         if (user.emergencyTokens <= 0) {
             return res.status(400).json({ error: 'No tokens available' });
         }
-        user.tradesCount = Math.max(0, user.tradesCount - 1);
+        const lossMode = isLossMode(user);
+        if (lossMode) {
+            // One extra trade: the lock comes back only after the next close.
+            user.lossUnlockPending = true;
+            saveDailyPnl(userId, user).catch(() => {});
+        } else {
+            user.tradesCount = Math.max(0, user.tradesCount - 1);
+        }
         user.isLocked = false;
         user.emergencyTokens -= 1;
         // Persist new token count to Supabase so server restarts don't reset it
         await saveTokensByUserId(userId, user.emergencyTokens);
         debugLog(`User ${userId}: emergency unlock. tradesCount: ${user.tradesCount}, tokens left: ${user.emergencyTokens}`);
-        res.json({ success: true, isLocked: false, tradesCount: user.tradesCount, emergencyTokens: user.emergencyTokens });
+        res.json({
+            success: true, isLocked: false, tradesCount: user.tradesCount, emergencyTokens: user.emergencyTokens,
+            ...(lossMode ? { lossUnlockPending: true, dailyNetPnl: user.dailyNetPnl } : {}),
+        });
     } catch (err) {
         console.error(`Unlock error for ${req.params.userId}:`, err.message);
         res.status(500).json({ error: 'Failed to process unlock. Please try again.' });
@@ -2384,6 +2751,14 @@ app.get('/admin/user-state/:userId', async (req, res) => {
         maxTrades: user.maxTrades,
         isLocked: user.isLocked,
         lastDealCheck: user.lastDealCheck,
+        limitMode: user.limitMode,
+        effectiveLimitMode: isLossMode(user) ? 'loss' : 'trades',
+        maxDailyLoss: user.maxDailyLoss,
+        dailyNetPnl: user.dailyNetPnl,
+        accountCurrency: user.accountCurrency,
+        pendingLimitMode: user.pendingLimitMode,
+        pendingLimitValue: user.pendingLimitValue,
+        lossUnlockPending: user.lossUnlockPending,
         processedDealIds: [...(user.processedDealIds || [])],
         processedPositionIds: [...(user.processedPositionIds || [])],
         metaApiAccountInfo: accountInfo ? {
@@ -2504,6 +2879,10 @@ app.get('/admin/user-states', (req, res) => {
         isLocked: u.isLocked,
         emergencyTokens: u.emergencyTokens,
         lastReset: u.lastReset,
+        limitMode: u.limitMode,
+        maxDailyLoss: u.maxDailyLoss,
+        dailyNetPnl: u.dailyNetPnl,
+        accountCurrency: u.accountCurrency,
     }));
     res.json({ count: states.length, users: states });
 });
@@ -2743,6 +3122,19 @@ app.post('/reset-after-onboarding/:userId', async (req, res) => {
         user.maxTrades = maxTrades;
         user.emergencyTokens = DEFAULT_TOKENS;
         user.lastTokenReset = new Date().toISOString();
+        // Onboarding choice of limit mode. A loss choice from a build or user
+        // without loss mode is ignored (trade mode) so onboarding never fails.
+        const wantsLoss = req.body?.limitMode === 'loss';
+        if (wantsLoss && isLossModeAvailable(req, userId) && lossLimit.isValidMaxDailyLoss(req.body?.maxDailyLoss)) {
+            user.limitMode = 'loss';
+            user.maxDailyLoss = req.body.maxDailyLoss;
+        } else if (wantsLoss) {
+            console.log(`[onboarding] ${userId.slice(0, 8)}: loss mode requested but not available or invalid, using trade mode`);
+        }
+        // Clears any loss settings left over from a previous install.
+        saveLimitSettings(userId, user).catch(() => {});
+        saveDailyPnl(userId, user).catch(() => {});
+        saveAccountCurrency(userId, null).catch(() => {});
 
         // 3) Persist the operational columns in Supabase. License/subscription
         //    columns (has_license, etc.) are intentionally NOT touched.
@@ -2769,6 +3161,7 @@ app.post('/reset-after-onboarding/:userId', async (req, res) => {
             tradesCount: 0,
             isLocked: false,
             mt5Connected: false,
+            ...(isLossModeAvailable(req, userId) ? lossLimitStatusFields(user) : {}),
         });
     } catch (err) {
         console.error(`Reset after onboarding error for ${userId}:`, err.message);
@@ -2931,6 +3324,9 @@ const purchaseSchema = z.object({
     // applied on the very first INSERT for this user, so we never overwrite a
     // value the user later changed via /settings or the Settings screen.
     maxTrades:             z.number().int().min(1).max(50).optional(),
+    // Optional onboarding-time loss-limit choice, same first-INSERT-only rule.
+    limitMode:             z.enum(lossLimit.LIMIT_MODES).optional(),
+    maxDailyLoss:          z.number().refine(lossLimit.isValidMaxDailyLoss).optional(),
     // ASSN V2 mapping fields. originalTransactionId is the stable id across
     // renewals (Apple keeps it constant for the lifetime of the subscription),
     // appAccountToken is the UUID we set at purchase time so the webhook can
@@ -2964,7 +3360,7 @@ app.post('/purchase/:userId', async (req, res) => {
     }
     const {
         productId, transactionId, type, subscriptionStatus, expirationDate, maxTrades,
-        originalTransactionId, appAccountToken,
+        originalTransactionId, appAccountToken, limitMode, maxDailyLoss,
     } = parsed.data;
 
     try {
@@ -3080,6 +3476,13 @@ app.post('/purchase/:userId', async (req, res) => {
             console.error('[purchase] Supabase upsert error:', writeErr.message);
             return res.status(500).json({ error: 'Failed to record purchase. Please try again.' });
         }
+        // Separate write so a missing loss-mode column can never fail a purchase.
+        if (!existing && limitMode === 'loss' && maxDailyLoss !== undefined && isLossModeAvailable(req, userId)) {
+            supabase.from('purchases')
+                .update({ limit_mode: 'loss', max_daily_loss: maxDailyLoss })
+                .eq('user_id', userId)
+                .then(() => {}).catch(() => {});
+        }
         // Drop the cached subscription state so the next /status poll picks
         // up the new status immediately (otherwise the user would see the
         // old "expired" state for up to SUBSCRIPTION_CACHE_TTL_MS after
@@ -3111,7 +3514,12 @@ app.post('/purchase/:userId', async (req, res) => {
             const grantsAccess = subActive && hasLicense;
             if (trialExpired && grantsAccess && userStates[userId]) {
                 const u = userStates[userId];
-                if (u.isLocked || u.tradesCount > 0) {
+                if (u.isLocked || u.tradesCount > 0 || (isLossMode(u) && u.dailyNetPnl < 0)) {
+                    // Loss mode: same fresh start. pnlDealIds stays, so today's
+                    // earlier deals are not counted again.
+                    u.dailyNetPnl = 0;
+                    u.lossUnlockPending = false;
+                    saveDailyPnl(userId, u).catch(() => {});
                     console.log(`[purchase] Post-trial activation reset for ${userId.slice(0,8)}: clearing lock + trade count`);
                     u.tradesCount = 0;
                     u.isLocked = false;
