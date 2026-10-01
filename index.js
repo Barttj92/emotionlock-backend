@@ -2407,6 +2407,9 @@ function lossLimitStatusFields(user) {
         pendingLimitMode: user.pendingLimitMode ?? null,
         pendingLimitValue: user.pendingLimitValue ?? null,
         lossUnlockPending: !!user.lossUnlockPending,
+        // True while a limit change is still the free first setup, so the
+        // app can show "free" instead of a token cost.
+        freeLimitChange: isFreeInitialLimitSetup(user),
         lossModeAvailable: true,
     };
 }
