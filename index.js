@@ -609,6 +609,33 @@ async function undeployMetaApiAccount(accountId) {
     }
 }
 
+// Fire-and-forget redeploy used when /status restores a user from Supabase.
+// Skips users without access so a paywalled user never costs MetaAPI hours,
+// and clears meta_api_undeployed_at on success so the cleanup sweep can
+// undeploy the account again later. Fails open on a subscription lookup
+// error: a Supabase hiccup must never leave a paying user undeployed.
+async function redeployOnRestoreIfActive(userId, accountId) {
+    try {
+        let active = true;
+        try {
+            active = await isSubscriptionActive(userId);
+        } catch (e) {
+            console.error(`[status] subscription check failed for ${userId}:`, e.message);
+        }
+        if (!active) {
+            console.log(`[status] Skipping redeploy for ${userId.slice(0,8)}: no active access`);
+            return;
+        }
+        await deployMetaApiAccount(accountId);
+        await supabase
+            .from('purchases')
+            .update({ meta_api_undeployed_at: null })
+            .eq('user_id', userId);
+    } catch (e) {
+        console.log(`[status] Redeploy warning for ${userId}:`, e.message);
+    }
+}
+
 async function undeployAndDeleteMetaApiAccount(accountId) {
     await undeployMetaApiAccount(accountId);
     await new Promise(r => setTimeout(r, 3000));
@@ -2258,9 +2285,12 @@ app.get('/status/:userId', statusLimiter, async (req, res) => {
                     user.mt5SyncStatus = 'connecting';
                     user.mt5SyncStatusAt = new Date().toISOString();
                     console.log(`[status] Restored MT5 connection for ${userId}`);
-                    deployMetaApiAccount(purchase.meta_api_account_id).catch(e =>
-                        console.log(`[status] Redeploy warning for ${userId}:`, e.message)
-                    );
+                    // Only redeploy for users who still have access. This used
+                    // to deploy unconditionally, so after every server restart
+                    // an expired user opening the app got their account
+                    // redeployed, and the cleanup sweep never undeployed it
+                    // again because meta_api_undeployed_at was already stamped.
+                    redeployOnRestoreIfActive(userId, purchase.meta_api_account_id);
                 }
             }
             if (purchase?.max_trades) user.maxTrades = purchase.max_trades;
