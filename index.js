@@ -3287,12 +3287,40 @@ const ONBOARDING_STEPS = [
     // blocked_apps_set column in email_user_state, so the A6 reminder only
     // reaches users who never picked any apps.
     'blocked_apps_set',
+    // Paywall and purchase funnel. Not part of the onboarding order in the
+    // Command Center: they happen after the trial ends. The upsert keeps the
+    // first occurrence per user (did this user ever reach it), while every
+    // occurrence, with its detail, is also appended to activity_events so
+    // repeat attempts and StoreKit error reasons stay visible.
+    'paywall_shown',
+    'products_load_failed',
+    'purchase_started',
+    'purchase_succeeded',
+    'purchase_cancelled',
+    'purchase_pending',
+    'purchase_failed',
 ];
+
+const PURCHASE_FUNNEL_STEPS = new Set([
+    'paywall_shown',
+    'products_load_failed',
+    'purchase_started',
+    'purchase_succeeded',
+    'purchase_cancelled',
+    'purchase_pending',
+    'purchase_failed',
+]);
 
 const onboardingEventSchema = z.object({
     // Same proof-of-possession echo as /attribution and /reset-after-onboarding.
     confirm: z.string().min(1).max(100),
     step:    z.enum(ONBOARDING_STEPS),
+    // Optional context for paywall/purchase steps. Short strings only, no PII.
+    detail: z.object({
+        stage:   z.enum(['license', 'subscription']).optional(),
+        product: z.string().max(100).optional(),
+        error:   z.string().max(300).optional(),
+    }).strict().optional(),
 });
 
 // Record that an install reached a given first-run step. Feeds the Command
@@ -3316,9 +3344,14 @@ app.post('/onboarding-event/:userId', onboardingEventLimiter, async (req, res) =
             details: parsed.error.issues.map(i => i.message),
         });
     }
-    const { confirm, step } = parsed.data;
+    const { confirm, step, detail } = parsed.data;
     if (confirm !== userId) {
         return res.status(403).json({ error: 'Forbidden: confirm field must match userId.' });
+    }
+
+    if (PURCHASE_FUNNEL_STEPS.has(step)) {
+        // Fire-and-forget, never blocks the response.
+        logActivity(userId.toLowerCase(), step, detail ?? {});
     }
 
     try {
