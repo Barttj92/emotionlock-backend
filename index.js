@@ -22,6 +22,18 @@ const LOSS_MODE_TEST_USER_IDS = new Set(
 // deliberately unreachable until the approved App Store version is known.
 const LOSS_MODE_MIN_APP_VERSION = process.env.LOSS_MODE_MIN_APP_VERSION || '999.0.0';
 
+// Reinstall guard feature flag. OFF by default: /reset-after-onboarding then
+// behaves exactly as before (fresh tokens, unlocked, only the in-memory MetaAPI
+// account is removed). REINSTALL_GUARD_TEST_USER_IDS (comma separated Keychain
+// UUIDs) turns it on for test devices only.
+const REINSTALL_GUARD_ENABLED = process.env.REINSTALL_GUARD_ENABLED === 'true';
+const REINSTALL_GUARD_TEST_USER_IDS = new Set(
+    (process.env.REINSTALL_GUARD_TEST_USER_IDS || '').split(',').map(s => s.trim().toLowerCase()).filter(Boolean)
+);
+function isReinstallGuardOn(userId) {
+    return REINSTALL_GUARD_ENABLED || (!!userId && REINSTALL_GUARD_TEST_USER_IDS.has(String(userId).toLowerCase()));
+}
+
 // =====================
 // Startup checks
 // =====================
@@ -1003,6 +1015,7 @@ function getAmsterdamDateStr(date = new Date()) {
 function initUser(userId) {
     if (!userStates[userId]) {
         userStates[userId] = {
+            userId, // lets per-user helpers (recordDailySummary) know whose state this is
             tradesCount: 0,
             isLocked: false,
             emergencyUnlocked: false,
@@ -1081,6 +1094,10 @@ function checkDailyReset(user, localDateStr) {
     // midnight. Now both paths use Amsterdam.
     const today = localDateStr || getAmsterdamDateStr();
     if (user.lastReset !== today) {
+        // Store the day that just ended before its counters are wiped.
+        recordDailySummary(user);
+        user.tokensUsedToday = 0;
+        user.wasLockedToday = false;
         user.tradesCount = 0;
         user.isLocked = false;
         user.emergencyUnlocked = false;
@@ -1099,20 +1116,63 @@ function checkDailyReset(user, localDateStr) {
     }
 }
 
-// Returns the UTC Date object for midnight Amsterdam time on the given date string ("YYYY-MM-DD").
-// Determines the CET/CEST offset by sampling noon UTC on that day, which is always well
-// away from DST transition boundaries (transitions happen at 02:00 Amsterdam, i.e. 00:00/01:00 UTC).
+// Writes the outcome of the day in user.lastReset to daily_summaries, the
+// source of GET /history (Stats screen). Called right before the daily reset
+// wipes the counters. Fire-and-forget: a missing table or a network error must
+// never block or delay the reset itself. Users without an MT5 connection and
+// without trades have nothing worth recording.
+function recordDailySummary(user) {
+    if (!user || !user.userId || !UUID_V4_RE.test(String(user.userId)) || !user.lastReset) return;
+    if (!user.mt5Connected && !user.tradesCount) return;
+    const row = {
+        user_id: String(user.userId).toLowerCase(),
+        day: user.lastReset,
+        limit_mode: isLossMode(user) ? 'loss' : 'trades',
+        trades_count: user.tradesCount || 0,
+        max_trades: user.maxTrades,
+        net_pnl: lossLimit.toCents(user.dailyNetPnl ?? 0) / 100,
+        max_daily_loss: user.maxDailyLoss ?? null,
+        was_locked: !!(user.isLocked || user.wasLockedToday),
+        tokens_used: user.tokensUsedToday || 0,
+    };
+    supabase.from('daily_summaries')
+        .upsert(row, { onConflict: 'user_id,day' })
+        .then(({ error }) => {
+            if (error) console.error(`[history] summary write failed for ${row.user_id.slice(0, 8)}:`, error.message);
+        })
+        .catch(() => {});
+}
+
+// UTC offset of Europe/Amsterdam (in minutes) at a given instant.
+function amsterdamOffsetMinutesAt(ms) {
+    const parts = new Intl.DateTimeFormat('en-GB', {
+        timeZone: 'Europe/Amsterdam', hourCycle: 'h23',
+        year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit',
+    }).formatToParts(new Date(ms));
+    const v = (t) => Number(parts.find(p => p.type === t)?.value ?? 0);
+    const asUtc = Date.UTC(v('year'), v('month') - 1, v('day'), v('hour'), v('minute'));
+    return Math.round((asUtc - ms) / 60000);
+}
+
+// Returns the UTC Date for midnight Amsterdam time on the given date string
+// ("YYYY-MM-DD"). Reads the offset AT midnight itself (two passes, since the
+// first guess may sit on the other side of a switch), so it stays exact on the
+// clock-change days (last Sunday of March/October). The previous version
+// sampled noon, which is one hour off at midnight on those two days.
 function getAmsterdamMidnight(dateStr) {
-    const noon = new Date(dateStr + 'T12:00:00Z');
-    const hourStr = new Intl.DateTimeFormat('en-GB', {
-        timeZone: 'Europe/Amsterdam',
-        hour: '2-digit',
-        hour12: false,
-    }).format(noon);
-    const offsetHours = parseInt(hourStr, 10) - 12; // CEST=+2, CET=+1
-    const midnight = new Date(dateStr + 'T00:00:00Z');
-    midnight.setHours(midnight.getHours() - offsetHours);
-    return midnight;
+    const wallMidnightUtc = Date.parse(dateStr + 'T00:00:00Z');
+    let guess = wallMidnightUtc - amsterdamOffsetMinutesAt(wallMidnightUtc) * 60000;
+    guess = wallMidnightUtc - amsterdamOffsetMinutesAt(guess) * 60000;
+    return new Date(guess);
+}
+
+// ISO timestamp of the next daily reset: midnight Europe/Amsterdam, the same
+// boundary checkDailyReset and BlockingManager use. Sent to the app so its
+// unlock countdown follows the server clock and is correct in any time zone.
+function getNextAmsterdamResetIso(now = new Date()) {
+    const next = new Date(getAmsterdamDateStr(now) + 'T12:00:00Z');
+    next.setUTCDate(next.getUTCDate() + 1);
+    return getAmsterdamMidnight(next.toISOString().slice(0, 10)).toISOString();
 }
 
 // Get day-of-week (0=Sun) and hour in Europe/Amsterdam, correct across CET/CEST transitions.
@@ -1361,6 +1421,7 @@ async function checkUserTrades(userId) {
                 }
                 if (!isLossMode(user) && user.tradesCount >= user.maxTrades && !user.isLocked) {
                     user.isLocked = true;
+                    user.wasLockedToday = true;
                     debugLog(`User ${userId}: trade limit reached during seed reconcile`);
                     // Skip push from this path: the user just opened the app
                     // (that's what triggered /status -> initUser -> first poll),
@@ -1377,6 +1438,7 @@ async function checkUserTrades(userId) {
                 && lossLimit.isLossLimitReached(user.dailyNetPnl, user.maxDailyLoss)) {
                 // No push, same reasoning as the trade-mode seed path above.
                 user.isLocked = true;
+                user.wasLockedToday = true;
                 debugLog(`User ${userId}: loss limit reached during seed reconcile`);
             }
             saveDailyPnl(userId, user).catch(() => {});
@@ -1489,6 +1551,7 @@ async function checkUserTrades(userId) {
 
         if (!isLossMode(user) && newTradesDetected && user.tradesCount >= user.maxTrades && !user.isLocked) {
             user.isLocked = true;
+            user.wasLockedToday = true;
             logActivity(userId, 'limit_reached', { max: user.maxTrades });
             debugLog(`User ${userId}: trade limit reached, sending push`);
             await sendPushNotification(
@@ -1502,6 +1565,7 @@ async function checkUserTrades(userId) {
             const decision = lossLimit.decideLossLock(user, { positionClosed, pnlChanged });
             if (decision === 'lock') {
                 user.isLocked = true;
+                user.wasLockedToday = true;
                 const limitText = lossLimit.formatMoney(user.maxDailyLoss, user.accountCurrency);
                 logActivity(userId, 'loss_limit_reached', { max: user.maxDailyLoss, pnl: user.dailyNetPnl, currency: user.accountCurrency });
                 console.log(`User ${userId}: loss limit reached (${user.dailyNetPnl} of -${user.maxDailyLoss}), sending push`);
@@ -2387,12 +2451,14 @@ app.get('/status/:userId', statusLimiter, async (req, res) => {
                 user.lastReset = todayISO;
                 if (!isLossMode(user) && user.tradesCount >= user.maxTrades) {
                     user.isLocked = true;
+                    user.wasLockedToday = true;
                 }
                 console.log(`[status] Restored ${tradeData.daily_trades_count} trades for ${userId} (date: ${todayISO})`);
             }
             if (isLossMode(user) && !user.lossUnlockPending
                 && lossLimit.isLossLimitReached(user.dailyNetPnl, user.maxDailyLoss)) {
                 user.isLocked = true;
+                user.wasLockedToday = true;
             }
         }
 
@@ -2460,6 +2526,9 @@ app.get('/status/:userId', statusLimiter, async (req, res) => {
             mt5SyncStatusAt: user.mt5SyncStatusAt ?? null,
             maxTrades: user.maxTrades,
             countWinningTrades: user.countWinningTrades ?? false,
+            // Next daily reset (midnight Europe/Amsterdam) as an ISO timestamp,
+            // so the app can show the unlock moment in the user's own time zone.
+            nextResetAt: getNextAmsterdamResetIso(),
             // Loss-limit fields. Only sent to app builds that support loss
             // mode, so older builds keep receiving the exact same response.
             ...(isLossModeAvailable(req, userId) ? lossLimitStatusFields(user) : {}),
@@ -2533,6 +2602,7 @@ function spendLimitChangeToken(userId, user) {
         };
     }
     user.emergencyTokens -= 1;
+    user.tokensUsedToday = (user.tokensUsedToday || 0) + 1;
     saveTokensByUserId(userId, user.emergencyTokens).catch(() => {});
     return null;
 }
@@ -2588,6 +2658,7 @@ function applyMaxDailyLossChange(userId, user, maxDailyLoss) {
     user.firstSetupComplete = true;
     if (lossLimit.isLossLimitReached(user.dailyNetPnl, user.maxDailyLoss)) {
         user.isLocked = true;
+        user.wasLockedToday = true;
         user.emergencyUnlocked = false;
     } else if (wasLocked) {
         user.isLocked = false;
@@ -2697,6 +2768,7 @@ app.post('/settings/:userId', settingsLimiter, (req, res) => {
                     });
                 }
                 user.emergencyTokens -= 1;
+                user.tokensUsedToday = (user.tokensUsedToday || 0) + 1;
                 saveTokensByUserId(userId, user.emergencyTokens).catch(() => {});
             }
 
@@ -2711,6 +2783,7 @@ app.post('/settings/:userId', settingsLimiter, (req, res) => {
             // Re-evaluate lock state after the change
             if (user.tradesCount >= user.maxTrades) {
                 user.isLocked = true;
+                user.wasLockedToday = true;
                 user.emergencyUnlocked = false;
             } else if (wasLocked) {
                 // Limit raised high enough to lift the lock
@@ -2784,6 +2857,7 @@ app.post('/unlock/:userId', unlockLimiter, async (req, res) => {
         }
         user.isLocked = false;
         user.emergencyTokens -= 1;
+        user.tokensUsedToday = (user.tokensUsedToday || 0) + 1;
         // Persist new token count to Supabase so server restarts don't reset it
         await saveTokensByUserId(userId, user.emergencyTokens);
         debugLog(`User ${userId}: emergency unlock. tradesCount: ${user.tradesCount}, tokens left: ${user.emergencyTokens}`);
@@ -3196,6 +3270,62 @@ app.post('/push-opened', pushOpenedLimiter, async (req, res) => {
 // This endpoint resets only OPERATIONAL state. License and subscription rows
 // in Supabase are intentionally left untouched so existing entitlements
 // (mt5license + monthly) keep working without a restore flow.
+const historyLimiter = rateLimit({
+    windowMs: 60 * 60 * 1000,
+    max: 120,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { error: 'Too many requests. Please try again later.' },
+});
+
+const historyQuerySchema = z.object({
+    days: z.coerce.number().int().min(1).max(90).optional(),
+});
+
+// PUBLIC ROUTE: daily history for the Stats screen. Same credential model as
+// /status (the non-guessable Keychain UUID), read-only, only this user's rows.
+app.get('/history/:userId', historyLimiter, async (req, res) => {
+    res.set('Cache-Control', 'no-store');
+    try {
+        const { userId } = req.params;
+        if (!UUID_V4_RE.test(userId)) {
+            return res.status(400).json({ error: 'Invalid userId format.' });
+        }
+        const parsed = historyQuerySchema.safeParse(req.query);
+        if (!parsed.success) {
+            return res.status(400).json({ error: 'Invalid input.' });
+        }
+        const days = parsed.data.days ?? 30;
+        const since = new Date(getAmsterdamDateStr() + 'T12:00:00Z');
+        since.setUTCDate(since.getUTCDate() - days);
+        const { data, error } = await supabase
+            .from('daily_summaries')
+            .select('day, limit_mode, trades_count, max_trades, net_pnl, max_daily_loss, was_locked, tokens_used')
+            .eq('user_id', userId.toLowerCase())
+            .gte('day', since.toISOString().slice(0, 10))
+            .order('day', { ascending: false });
+        if (error) {
+            console.error(`[history] read failed for ${userId.slice(0, 8)}:`, error.message);
+            return res.status(500).json({ error: 'Failed to load history.' });
+        }
+        res.json({
+            days: (data ?? []).map(r => ({
+                day: r.day,
+                limitMode: r.limit_mode,
+                tradesCount: r.trades_count,
+                maxTrades: r.max_trades,
+                netPnl: r.net_pnl,
+                maxDailyLoss: r.max_daily_loss,
+                wasLocked: r.was_locked,
+                tokensUsed: r.tokens_used,
+            })),
+        });
+    } catch (err) {
+        console.error(`History error for ${req.params.userId}:`, err.message);
+        res.status(500).json({ error: 'Failed to load history.' });
+    }
+});
+
 app.post('/reset-after-onboarding/:userId', async (req, res) => {
     const { userId } = req.params;
     if (!userId) return res.status(400).json({ error: 'Missing userId' });
@@ -3215,27 +3345,74 @@ app.post('/reset-after-onboarding/:userId', async (req, res) => {
     }
 
     try {
+        // Reinstall guard. The Keychain userId survives an app reinstall (and
+        // Settings > Reset App), so this endpoint also runs for people who have
+        // used EmotionLock before. Emergency tokens, today's trade count and an
+        // active lock must survive it: otherwise deleting and reinstalling the
+        // app would hand out 2 fresh tokens and lift today's lock, which the
+        // Gebruiksstructuur forbids (tokens only reset Sunday 22:00, locks only
+        // at midnight Europe/Amsterdam). A first install has no prior state and
+        // gets the defaults.
+        // Behind REINSTALL_GUARD_* (see top of file); with the flag off the
+        // endpoint keeps its previous behaviour for every user.
+        const guardOn = isReinstallGuardOn(userId);
+        const existing = userStates[userId];
+        const today = getAmsterdamDateStr();
+        const prior = guardOn
+            ? (await supabase
+                .from('purchases')
+                .select('meta_api_account_id, emergency_tokens_remaining, last_token_reset, daily_trades_count, daily_trades_date, max_trades')
+                .eq('user_id', userId)
+                .maybeSingle()).data
+            : null;
+        const sameDay = !!existing && existing.lastReset === today;
+        const keptTokens = existing ? existing.emergencyTokens : prior?.emergency_tokens_remaining;
+        const keptTokenReset = existing?.lastTokenReset ?? prior?.last_token_reset ?? null;
+        const keptTradesToday = sameDay
+            ? existing.tradesCount
+            : (prior?.daily_trades_date === today ? (prior.daily_trades_count ?? 0) : 0);
+        const previousMax = existing?.maxTrades ?? prior?.max_trades ?? null;
+        const keptLock = sameDay
+            ? existing.isLocked
+            : (previousMax != null && keptTradesToday > 0 && keptTradesToday >= previousMax);
+        const keptTokensUsed = sameDay ? (existing.tokensUsedToday || 0) : 0;
+
         // 1) Tear down any existing MetaAPI account so we don't pay for an
         //    orphan. Use full delete (not just undeploy) since the user is
-        //    starting fresh and may pick a different broker.
-        const existing = userStates[userId];
-        if (existing?.metaApiAccountId) {
+        //    starting fresh and may pick a different broker. After a server
+        //    restart the in-memory state is gone, so fall back to the id that
+        //    is persisted in Supabase; otherwise that account kept billing.
+        const oldMetaApiId = existing?.metaApiAccountId ?? (guardOn ? prior?.meta_api_account_id : null) ?? null;
+        if (oldMetaApiId) {
             try {
-                await undeployAndDeleteMetaApiAccount(existing.metaApiAccountId);
+                await undeployAndDeleteMetaApiAccount(oldMetaApiId);
             } catch (e) {
                 console.log(`MT5 cleanup on reset for ${userId}:`, e.message);
             }
         }
 
-        // 2) Reset in-memory state to a clean slate. Re-init via initUser so we
-        //    get the same shape any other endpoint expects, then overwrite the
-        //    user-supplied fields.
+        // 2) Reset in-memory state. Re-init via initUser so we get the same
+        //    shape any other endpoint expects, then restore what must survive
+        //    and overwrite the user-supplied fields.
         delete userStates[userId];
         initUser(userId);
         const user = userStates[userId];
         user.maxTrades = maxTrades;
-        user.emergencyTokens = DEFAULT_TOKENS;
-        user.lastTokenReset = new Date().toISOString();
+        if (guardOn) {
+            user.emergencyTokens = Number.isInteger(keptTokens)
+                ? Math.max(0, Math.min(DEFAULT_TOKENS, keptTokens))
+                : DEFAULT_TOKENS;
+            user.lastTokenReset = keptTokenReset || new Date().toISOString();
+            user.tradesCount = keptTradesToday;
+            user.isLocked = !!keptLock;
+            user.wasLockedToday = !!keptLock;
+            user.tokensUsedToday = keptTokensUsed;
+            // A Sunday 22:00 token reset that came due in the meantime still applies.
+            checkWeeklyTokenReset(user, userId);
+        } else {
+            user.emergencyTokens = DEFAULT_TOKENS;
+            user.lastTokenReset = new Date().toISOString();
+        }
         // Onboarding choice of limit mode. A loss choice from a build or user
         // without loss mode is ignored (trade mode) so onboarding never fails.
         const wantsLoss = req.body?.limitMode === 'loss';
@@ -3257,7 +3434,7 @@ app.post('/reset-after-onboarding/:userId', async (req, res) => {
             mt5_server: null,
             mt5_login: null,
             max_trades: maxTrades,
-            emergency_tokens_remaining: DEFAULT_TOKENS,
+            emergency_tokens_remaining: user.emergencyTokens,
         }).eq('user_id', userId);
 
         if (error) {
@@ -3271,9 +3448,9 @@ app.post('/reset-after-onboarding/:userId', async (req, res) => {
             success: true,
             userId,
             maxTrades,
-            emergencyTokens: DEFAULT_TOKENS,
-            tradesCount: 0,
-            isLocked: false,
+            emergencyTokens: user.emergencyTokens,
+            tradesCount: user.tradesCount,
+            isLocked: user.isLocked,
             mt5Connected: false,
             ...(isLossModeAvailable(req, userId) ? lossLimitStatusFields(user) : {}),
         });
@@ -3352,6 +3529,9 @@ const ONBOARDING_STEPS = [
     // Post-account steps, in the order the user walks them.
     'permissions_shown',
     'blocked_apps_shown',
+    // Redesigned flow: summary screen after the blocked-apps step, before
+    // the main app (where MT5 is connected).
+    'setup_done',
     'mt5_connect_shown',
     'mt5_connected',
     // Outcomes rather than screens. Deliberately NOT part of the ordered
