@@ -1556,7 +1556,7 @@ async function checkUserTrades(userId) {
             debugLog(`User ${userId}: trade limit reached, sending push`);
             await sendPushNotification(
                 user.deviceToken,
-                '🔒 EmotionLock activated',
+                'EmotionLock activated',
                 `You've reached your limit of ${user.maxTrades} trade${user.maxTrades > 1 ? 's' : ''} today. Trading apps are now blocked.`
             );
         }
