@@ -59,6 +59,10 @@ app.use((req, res, next) => {
 // Debug logger — only logs in non-production environments
 const debugLog = (...args) => { if (process.env.NODE_ENV !== 'production') console.log(...args); };
 
+// UUID v4 regex used to validate userId (the Keychain UUID) before it touches
+// userStates or Supabase (F5)
+const UUID_V4_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
 // Timing-safe admin key comparison
 function isValidAdminKey(key) {
     if (!key || !process.env.ADMIN_KEY) return false;
@@ -107,6 +111,26 @@ const onboardingEventLimiter = rateLimit({
     legacyHeaders: false,
     message: { error: 'Too many requests. Please try again later.' },
 });
+
+// App write endpoints (register-device, settings, profile). The app calls
+// these a handful of times per session, so 120/hour per IP never hits a real
+// user but stops scripted spraying of random IDs into userStates and Supabase.
+function appWriteLimiter(max) {
+    return rateLimit({
+        windowMs: 60 * 60 * 1000,
+        max,
+        standardHeaders: true,
+        legacyHeaders: false,
+        message: { error: 'Too many requests. Please try again later.' },
+    });
+}
+const registerDeviceLimiter = appWriteLimiter(120);
+const settingsLimiter       = appWriteLimiter(120);
+const profileLimiter        = appWriteLimiter(30);
+// Account deletion is a one-off action. 5/hour per IP leaves room for retries.
+const deleteAccountLimiter  = appWriteLimiter(5);
+// License activation: blocks brute forcing EL-XXXX-XXXX codes.
+const activateLimiter       = appWriteLimiter(10);
 
 // =====================
 // Supabase setup
@@ -736,6 +760,41 @@ async function findMetaApiAccountByName(name) {
 //   3. If found but credentials are stale: delete it, then create fresh
 //   4. If not found: create fresh
 // Returns { id, region, recovered }.
+// Global cap on FRESH MetaAPI account creations. Each account is billed per
+// hour, and /connect-mt5 can be called by anyone holding a UUID, so without a
+// global ceiling a script rotating IPs could create accounts at our expense.
+// Normal volume is a few new connects per day, so the default of 20/hour is
+// far above real usage. Reuse and orphan recovery never count against it.
+// The window is in-memory, so a restart resets it, which is acceptable here.
+const METAAPI_CREATE_MAX_PER_HOUR = parseInt(process.env.METAAPI_CREATE_MAX_PER_HOUR || '20', 10);
+const metaApiCreateTimestamps = [];
+let metaApiCreateAlertSentAt = 0;
+
+function reserveMetaApiCreateSlot(userId) {
+    const now = Date.now();
+    const hourAgo = now - 60 * 60 * 1000;
+    while (metaApiCreateTimestamps.length && metaApiCreateTimestamps[0] < hourAgo) {
+        metaApiCreateTimestamps.shift();
+    }
+    if (metaApiCreateTimestamps.length >= METAAPI_CREATE_MAX_PER_HOUR) {
+        if (now - metaApiCreateAlertSentAt > 60 * 60 * 1000) {
+            metaApiCreateAlertSentAt = now;
+            notifyAdmin({
+                subject: '[EmotionLock] MetaAPI create limit reached',
+                lines: [
+                    `${METAAPI_CREATE_MAX_PER_HOUR} new MetaAPI accounts were created in the last hour, new creates are paused until the window clears.`,
+                    'This is either a real spike in signups or someone scripting /connect-mt5. Check GET /admin/metaapi-accounts.',
+                    `Last blocked user ID: ${userId}`,
+                    `Raise the cap with the METAAPI_CREATE_MAX_PER_HOUR env var on Railway if the traffic is legitimate.`,
+                ],
+            }).catch(() => {});
+        }
+        return false;
+    }
+    metaApiCreateTimestamps.push(now);
+    return true;
+}
+
 async function createOrRecoverMetaApiAccount(server, login, password, userId) {
     const name = `EmotionLock-${userId}`;
     const orphan = await findMetaApiAccountByName(name);
@@ -753,6 +812,11 @@ async function createOrRecoverMetaApiAccount(server, login, password, userId) {
         } catch (e) {
             console.log('Orphan cleanup warning:', e.message);
         }
+    }
+    if (!reserveMetaApiCreateSlot(userId)) {
+        const limitErr = new Error('metaapi_create_limit');
+        limitErr.code = 'METAAPI_CREATE_LIMIT';
+        throw limitErr;
     }
     const account = await createMetaApiAccount(server, String(login), password, name);
     // Short wait before the first deploy attempt — see
@@ -1846,7 +1910,7 @@ app.get('/', (req, res) => {
 });
 
 // PUBLIC ROUTE: license activation — validates licenseCode against Supabase, no session needed
-app.post('/activate', async (req, res) => {
+app.post('/activate', activateLimiter, async (req, res) => {
     try {
     const { licenseCode } = req.body;
     if (!licenseCode) return res.status(400).json({ error: 'licenseCode required' });
@@ -1907,6 +1971,9 @@ const connectMt5Schema = z.object({
 //               Rate-limited to 10 requests/hour per IP. Credentials are forwarded to MetaApi only.
 app.post('/connect-mt5/:userId', mt5Limiter, async (req, res) => {
     const { userId } = req.params;
+    if (!UUID_V4_RE.test(userId)) {
+        return res.status(400).json({ error: 'Invalid userId format.' });
+    }
 
     const parsed = connectMt5Schema.safeParse(req.body);
     if (!parsed.success) {
@@ -2171,6 +2238,9 @@ app.post('/connect-mt5/:userId', mt5Limiter, async (req, res) => {
         }
 
     } catch (err) {
+        if (err?.code === 'METAAPI_CREATE_LIMIT') {
+            return res.status(503).json({ error: 'Connecting is temporarily busy. Please try again in a few minutes.' });
+        }
         console.error(`MT5 connect error for ${userId}:`, err.message);
         res.status(500).json({ error: friendlyMt5ConnectError(err) });
     }
@@ -2203,8 +2273,6 @@ app.delete('/connect-mt5/:userId', async (req, res) => {
     }
 });
 
-// UUID v4 regex used to validate userId before writing to Supabase (F5)
-const UUID_V4_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 // PUBLIC ROUTE: status polling — called by the iOS app every 5s. UserId is the Keychain UUID
 //               (non-guessable). Returns only non-sensitive trade state.
@@ -2570,9 +2638,12 @@ function handleLossModeSettings(userId, user, body, res) {
 }
 
 // PUBLIC ROUTE: user settings — called by iOS app. UserId is the Keychain UUID (non-guessable).
-app.post('/settings/:userId', (req, res) => {
+app.post('/settings/:userId', settingsLimiter, (req, res) => {
     try {
         const { userId } = req.params;
+        if (!UUID_V4_RE.test(userId)) {
+            return res.status(400).json({ error: 'Invalid userId format.' });
+        }
 
         const parsed = settingsSchema.safeParse(req.body);
         if (!parsed.success) {
@@ -2727,10 +2798,19 @@ app.post('/unlock/:userId', unlockLimiter, async (req, res) => {
 });
 
 // PUBLIC ROUTE: device token registration — called on app launch. UserId is the Keychain UUID.
-app.post('/register-device/:userId', async (req, res) => {
+const registerDeviceSchema = z.object({
+    // APNs device tokens arrive hex encoded (64 chars today, Apple allows longer).
+    deviceToken: z.string().min(32).max(200).regex(/^[0-9a-fA-F]+$/),
+});
+
+app.post('/register-device/:userId', registerDeviceLimiter, async (req, res) => {
     const { userId } = req.params;
-    const { deviceToken } = req.body;
-    if (!deviceToken) return res.status(400).json({ error: 'deviceToken required' });
+    if (!UUID_V4_RE.test(userId)) {
+        return res.status(400).json({ error: 'Invalid userId format.' });
+    }
+    const parsed = registerDeviceSchema.safeParse(req.body ?? {});
+    if (!parsed.success) return res.status(400).json({ error: 'Valid deviceToken required' });
+    const { deviceToken } = parsed.data;
     initUser(userId);
     userStates[userId].deviceToken = deviceToken;
     console.log(`User ${userId}: device token registered`);
@@ -2871,7 +2951,8 @@ app.post('/admin/generate-code', async (req, res) => {
     let code = req.body && req.body.code;
     if (!code) {
         const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
-        const rand = (n) => Array.from({ length: n }, () => chars[Math.floor(Math.random() * chars.length)]).join('');
+        // crypto.randomInt instead of Math.random: license codes are credentials.
+        const rand = (n) => Array.from({ length: n }, () => chars[crypto.randomInt(chars.length)]).join('');
         code = `EL-${rand(4)}-${rand(4)}`;
     }
 
@@ -3897,9 +3978,25 @@ async function resolveUserIdFromAppleIds(appAccountToken, originalTransactionId)
 
 // Save user profile (collected after MT5 license purchase in the app)
 // Public endpoint, auth is the userId itself (UUID from Keychain, same pattern as all other user endpoints)
-app.post('/profile/:userId', async (req, res) => {
+// Shape and size limits only. The field-specific rules (required names, email
+// format, plus-addressing) stay below so their error messages are unchanged.
+const profileSchema = z.object({
+    firstName:      z.string().max(100).optional(),
+    lastName:       z.string().max(100).optional(),
+    email:          z.string().max(254).optional(),
+    referralSource: z.string().max(200).optional(),
+    country:        z.string().max(10).optional(),
+    locale:         z.string().max(50).optional(),
+}).passthrough();
+
+app.post('/profile/:userId', profileLimiter, async (req, res) => {
     const { userId } = req.params;
-    if (!userId) return res.status(400).json({ error: 'Missing userId' });
+    if (!UUID_V4_RE.test(userId)) {
+        return res.status(400).json({ error: 'Invalid userId format.' });
+    }
+    if (!profileSchema.safeParse(req.body ?? {}).success) {
+        return res.status(400).json({ error: 'Invalid input.' });
+    }
 
     const { firstName, lastName, email, referralSource } = req.body ?? {};
 
@@ -4140,7 +4237,7 @@ app.post('/profile/:userId', async (req, res) => {
 // Delete account — required by Apple App Store policy.
 // Must work even when in-memory state is empty (e.g. cold Railway restart
 // before any /status call). Source of truth is Supabase + MetaAPI.
-app.delete('/delete-account/:userId', async (req, res) => {
+app.delete('/delete-account/:userId', deleteAccountLimiter, async (req, res) => {
     const { userId } = req.params;
 
     if (!UUID_V4_RE.test(userId)) {
