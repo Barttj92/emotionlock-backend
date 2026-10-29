@@ -3662,6 +3662,23 @@ const ONBOARDING_STEPS = [
     'purchase_cancelled',
     'purchase_pending',
     'purchase_failed',
+    // Per-paywall funnel (activation month, 2026-10-29). The generic steps
+    // above collapse license and subscription into one row per user, so the
+    // funnel could never show who bought the license but not the sub. These
+    // keep one row per user per paywall. detail.source says where the
+    // paywall came from: trial_ended | activation_ended | settings | banner | returning.
+    'license_paywall_shown',
+    'license_purchase_started',
+    'license_purchase_cancelled',
+    'license_purchased',
+    'subscription_paywall_shown',
+    'subscription_purchase_started',
+    'subscription_purchase_cancelled',
+    'subscription_purchased',
+    // Activation month touchpoints that lead to paywall 2.
+    'activation_banner_shown',
+    'activation_banner_tapped',
+    'settings_subscribe_tapped',
 ];
 
 const PURCHASE_FUNNEL_STEPS = new Set([
@@ -3672,6 +3689,17 @@ const PURCHASE_FUNNEL_STEPS = new Set([
     'purchase_cancelled',
     'purchase_pending',
     'purchase_failed',
+    'license_paywall_shown',
+    'license_purchase_started',
+    'license_purchase_cancelled',
+    'license_purchased',
+    'subscription_paywall_shown',
+    'subscription_purchase_started',
+    'subscription_purchase_cancelled',
+    'subscription_purchased',
+    'activation_banner_shown',
+    'activation_banner_tapped',
+    'settings_subscribe_tapped',
 ]);
 
 const onboardingEventSchema = z.object({
@@ -3683,6 +3711,7 @@ const onboardingEventSchema = z.object({
         stage:   z.enum(['license', 'subscription']).optional(),
         product: z.string().max(100).optional(),
         error:   z.string().max(300).optional(),
+        source:  z.enum(['trial_ended', 'activation_ended', 'settings', 'banner', 'returning']).optional(),
     }).strict().optional(),
 });
 
