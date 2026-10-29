@@ -321,6 +321,18 @@ const SUBSCRIPTION_CACHE_TTL_MS = 60 * 1000;
 // re-subscribe within 48h keep their MT5 connection without reconnect setup.
 const SUBSCRIPTION_GRACE_MS = 48 * 60 * 60 * 1000;
 
+// Activation month: the one-time MT5 Activation license includes 30 days of
+// full access. Only after that window does the user need the monthly
+// subscription. The window starts at the later of the license purchase and
+// the end of the 4-day app trial, so buying during the trial never costs the
+// user trial days. Stored once in purchases.license_period_ends_at.
+const ACTIVATION_PERIOD_MS = 30 * 24 * 60 * 60 * 1000;
+
+function computeLicensePeriodEnd(purchasedAtMs, appTrialEndsAtMs) {
+    const start = Math.max(purchasedAtMs, appTrialEndsAtMs || 0);
+    return new Date(start + ACTIVATION_PERIOD_MS);
+}
+
 // Internal test devices with permanent access (the founder's own phone(s)).
 // Comma-separated Keychain userIds in the Railway env var
 // UNLIMITED_ACCESS_USER_IDS. Kept out of source on purpose: no userIds in git,
@@ -351,7 +363,7 @@ async function getSubscriptionState(userId) {
     }
     const { data, error } = await supabase
         .from('purchases')
-        .select('subscription_status, trial_ends_at, license_code, app_trial_started_at, app_trial_ends_at')
+        .select('subscription_status, trial_ends_at, license_code, app_trial_started_at, app_trial_ends_at, license_period_ends_at')
         .eq('user_id', userId)
         .maybeSingle();
     if (error) {
@@ -360,7 +372,7 @@ async function getSubscriptionState(userId) {
         // locked out by a database hiccup. The next refresh re-checks.
         return {
             status: null, trialEndsAt: null, hasLicense: false,
-            appTrialStartedAt: null, appTrialEndsAt: null,
+            appTrialStartedAt: null, appTrialEndsAt: null, licensePeriodEndsAt: null,
             fetchedAt: Date.now(), failedOpen: true,
         };
     }
@@ -371,6 +383,8 @@ async function getSubscriptionState(userId) {
         // App-level trial: separate from Apple's subscription trial. See migration 002.
         appTrialStartedAt: data?.app_trial_started_at ? new Date(data.app_trial_started_at).getTime() : null,
         appTrialEndsAt: data?.app_trial_ends_at ? new Date(data.app_trial_ends_at).getTime() : null,
+        // End of the activation month included with the license (migration 012).
+        licensePeriodEndsAt: data?.license_period_ends_at ? new Date(data.license_period_ends_at).getTime() : null,
         fetchedAt: Date.now(),
         failedOpen: false,
     };
@@ -384,10 +398,20 @@ function isAppTrialActive(state) {
     return state.appTrialEndsAt > Date.now();
 }
 
+// True iff the user holds the license and is inside the activation month it
+// includes. A refunded license clears license_code, so this turns false the
+// moment Apple reports the refund, even though license_period_ends_at stays.
+function isActivationPeriodActive(state) {
+    if (!state || !state.hasLicense || !state.licensePeriodEndsAt) return false;
+    return state.licensePeriodEndsAt > Date.now();
+}
+
 // True when the user is entitled to use trade-tracking features right now.
 // Rules:
 //   - In-app 4-day trial active: always allowed (covers brand new users who
 //     haven't paid yet but are inside their free trial).
+//   - License + activation month active: allowed (30 days included with the
+//     one-time MT5 Activation, before the subscription is needed).
 //   - 'active' or 'trialing': always allowed.
 //   - 'expired' BUT trial_ends_at is still in the future: Apple sometimes
 //     reports 'expired' during a billing retry window before the access
@@ -405,6 +429,8 @@ async function isSubscriptionActive(userId) {
     const state = await getSubscriptionState(userId);
     if (!state) return true;
     if (isAppTrialActive(state)) return true;
+    // License holder inside the activation month included with the license.
+    if (isActivationPeriodActive(state)) return true;
     if (state.status === 'active' || state.status === 'trialing') return true;
     if (state.status === 'expired') {
         if (state.trialEndsAt && state.trialEndsAt > Date.now()) return true;
@@ -1620,7 +1646,7 @@ async function cleanupExpiredMetaApiAccounts() {
     try {
         const { data: candidates, error } = await supabase
             .from('purchases')
-            .select('user_id, meta_api_account_id, trial_ends_at, subscription_status, meta_api_undeployed_at')
+            .select('user_id, meta_api_account_id, trial_ends_at, subscription_status, meta_api_undeployed_at, license_code, license_period_ends_at')
             .eq('subscription_status', 'expired')
             .not('meta_api_account_id', 'is', null);
 
@@ -1636,6 +1662,10 @@ async function cleanupExpiredMetaApiAccounts() {
             // Re-evaluate grace per row so the check matches isPastGracePeriod
             // exactly without trusting any cached value.
             if (hasUnlimitedAccess(row.user_id)) continue;
+            // Expired sub but still inside the license's activation month
+            // (e.g. subscribed early, then cancelled): keep MT5 deployed.
+            if (row.license_code && row.license_period_ends_at
+                && new Date(row.license_period_ends_at).getTime() > now) continue;
             const trialEndsAt = row.trial_ends_at ? new Date(row.trial_ends_at).getTime() : null;
             if (!trialEndsAt) continue;
             if ((now - trialEndsAt) <= SUBSCRIPTION_GRACE_MS) continue;
@@ -1807,6 +1837,64 @@ async function runTrialNotificationScheduler() {
         console.error('[trial-push] 1h block error:', e.message);
     }
 
+    // ---- Activation month ending pushes ----
+    // The license includes 30 days of access (license_period_ends_at). Two
+    // reminders before it ends, only for users without an active sub:
+    //   - 3 days before: early heads-up
+    //   - 1 day before:  last call
+    // Same idempotency pattern as the trial pushes: stamp on send, exclude
+    // stamped rows. Windows are wide so a missed tick never skips a user.
+    const activationReminders = [
+        {
+            column: 'activation_notified_3d_at',
+            lowerMs: 24 * ONE_HOUR_MS,
+            upperMs: 72 * ONE_HOUR_MS,
+            title: 'Your included month ends in 3 days',
+            body: 'Subscribe to keep EmotionLock protecting your trading after your included month.',
+        },
+        {
+            column: 'activation_notified_1d_at',
+            lowerMs: 0,
+            upperMs: 24 * ONE_HOUR_MS,
+            title: 'Your included month ends tomorrow',
+            body: 'Subscribe now so your trade limit and app blocking keep working without a gap.',
+        },
+    ];
+    for (const reminder of activationReminders) {
+        try {
+            const { data: due, error: errDue } = await supabase
+                .from('purchases')
+                .select('user_id, device_token, license_period_ends_at, subscription_status, license_code')
+                .gt('license_period_ends_at', new Date(now + reminder.lowerMs).toISOString())
+                .lte('license_period_ends_at', new Date(now + reminder.upperMs).toISOString())
+                .not('license_code', 'is', null)
+                .is(reminder.column, null);
+            if (errDue) {
+                console.error(`[activation-push] ${reminder.column} query failed:`, errDue.message);
+                continue;
+            }
+            for (const row of (due ?? [])) {
+                const subActive = row.subscription_status === 'active' || row.subscription_status === 'trialing';
+                // Stamp even when skipped so the row is not re-evaluated every tick.
+                const shouldSend = !subActive && !!row.device_token && !hasUnlimitedAccess(row.user_id);
+                try {
+                    if (shouldSend) {
+                        await sendPushNotification(row.device_token, reminder.title, reminder.body);
+                    }
+                    await supabase
+                        .from('purchases')
+                        .update({ [reminder.column]: new Date().toISOString() })
+                        .eq('user_id', row.user_id);
+                    if (shouldSend) console.log(`[activation-push] ${reminder.column} sent to ${row.user_id.slice(0,8)}`);
+                } catch (e) {
+                    console.error(`[activation-push] send failed for ${row.user_id}:`, e.message);
+                }
+            }
+        } catch (e) {
+            console.error(`[activation-push] ${reminder.column} block error:`, e.message);
+        }
+    }
+
     // ---- Cost cleanup: undeploy MetaAPI for users whose trial expired and
     // never paid. Without this, an abandoned trial keeps incurring MetaAPI
     // hourly cost indefinitely. We wait 24h past trial_ends_at before
@@ -1816,7 +1904,7 @@ async function runTrialNotificationScheduler() {
         const trialGraceCutoff = new Date(now - 24 * ONE_HOUR_MS).toISOString();
         const { data: abandoned, error: errAbandoned } = await supabase
             .from('purchases')
-            .select('user_id, meta_api_account_id, app_trial_ends_at, subscription_status, license_code, meta_api_undeployed_at')
+            .select('user_id, meta_api_account_id, app_trial_ends_at, subscription_status, license_code, license_period_ends_at, meta_api_undeployed_at')
             .lte('app_trial_ends_at', trialGraceCutoff)
             .not('meta_api_account_id', 'is', null)
             .is('meta_api_undeployed_at', null);
@@ -1828,6 +1916,10 @@ async function runTrialNotificationScheduler() {
                 // they are a real paying customer, hands off their MT5.
                 const subActive = row.subscription_status === 'active' || row.subscription_status === 'trialing';
                 if (subActive && row.license_code) continue;
+                // License holder inside the activation month, or less than 24h
+                // past it: same grace as after the trial before we undeploy.
+                if (row.license_code && row.license_period_ends_at
+                    && new Date(row.license_period_ends_at).getTime() > now - 24 * ONE_HOUR_MS) continue;
                 if (hasUnlimitedAccess(row.user_id)) continue;
                 try {
                     await undeployMetaApiAccount(row.meta_api_account_id);
@@ -2507,6 +2599,12 @@ app.get('/status/:userId', statusLimiter, async (req, res) => {
             const msLeft = trialEndsAt - Date.now();
             trialDaysRemaining = Math.max(0, Math.ceil(msLeft / (24 * 60 * 60 * 1000)));
         }
+        const activationEndsAt = (!unlimited && subState.hasLicense) ? subState.licensePeriodEndsAt : null;
+        let activationDaysRemaining = null;
+        if (activationEndsAt) {
+            const msLeft = activationEndsAt - Date.now();
+            activationDaysRemaining = Math.max(0, Math.ceil(msLeft / (24 * 60 * 60 * 1000)));
+        }
 
         res.json({
             tradesCount: user.tradesCount,
@@ -2545,6 +2643,10 @@ app.get('/status/:userId', statusLimiter, async (req, res) => {
             trialStartedAt: (!unlimited && subState.appTrialStartedAt) ? new Date(subState.appTrialStartedAt).toISOString() : null,
             trialEndsAt: trialEndsAt ? new Date(trialEndsAt).toISOString() : null,
             trialDaysRemaining,
+            // Activation month included with the license. Null when the user
+            // has no license (or on unlimited test devices).
+            activationEndsAt: activationEndsAt ? new Date(activationEndsAt).toISOString() : null,
+            activationDaysRemaining,
         });
     } catch (err) {
         console.error(`Status error for ${req.params.userId}:`, err.message);
@@ -3660,6 +3762,10 @@ const purchaseSchema = z.object({
     // map any future notification back to this user without lookups.
     originalTransactionId: z.string().min(1).max(100).optional(),
     appAccountToken:       z.string().min(1).max(100).optional(),
+    // License only: Apple's originalPurchaseDate (epoch ms). Anchors the
+    // activation month to the real purchase moment, so a restore on a new
+    // install or a new Keychain userId never grants a fresh 30 days.
+    licensePurchaseDate:   z.number().int().positive().optional(),
 });
 
 // Record an Apple IAP purchase or subscription state change in Supabase so the
@@ -3687,7 +3793,7 @@ app.post('/purchase/:userId', async (req, res) => {
     }
     const {
         productId, transactionId, type, subscriptionStatus, expirationDate, maxTrades,
-        originalTransactionId, appAccountToken, limitMode, maxDailyLoss,
+        originalTransactionId, appAccountToken, limitMode, maxDailyLoss, licensePurchaseDate,
     } = parsed.data;
 
     try {
@@ -3751,12 +3857,24 @@ app.post('/purchase/:userId', async (req, res) => {
         // so we never clobber unrelated fields the user has since changed.
         const { data: existing, error: readErr } = await supabase
             .from('purchases')
-            .select('user_id, license_code, subscription_status')
+            .select('user_id, license_code, subscription_status, app_trial_ends_at, license_period_ends_at')
             .eq('user_id', userId)
             .maybeSingle();
         if (readErr) {
             console.error('[purchase] Supabase read error:', readErr.message);
             return res.status(500).json({ error: 'Failed to record purchase. Please try again.' });
+        }
+
+        // Access BEFORE this purchase is recorded. The post-purchase lock reset
+        // below only fires on a real transition from no access to access, so
+        // repeated entitlement pings (or a sub bought during the activation
+        // month) can never be used as a free unlock. Fail closed on the reset
+        // (assume access) so a lookup error never wipes a paying user's count.
+        let accessBefore = true;
+        try {
+            accessBefore = await isSubscriptionActive(userId);
+        } catch (e) {
+            console.error(`[purchase] access-before check failed for ${userId}:`, e.message);
         }
 
         const patch = { user_id: userId };
@@ -3773,6 +3891,16 @@ app.post('/purchase/:userId', async (req, res) => {
             // an existing purchase date forward.
             if (!existing || !existing.license_code) {
                 patch.license_purchased_at = new Date().toISOString();
+            }
+            // Activation month: set ONCE per user. Anchored to Apple's
+            // purchase date when the app sends it (clamped to now so a
+            // client can never push the window into the future). Never reset
+            // by restores, refreshes or a refund followed by a re-purchase.
+            if (!existing || !existing.license_period_ends_at) {
+                const nowMs = Date.now();
+                const purchasedAtMs = licensePurchaseDate ? Math.min(licensePurchaseDate, nowMs) : nowMs;
+                const trialEndsMs = existing?.app_trial_ends_at ? new Date(existing.app_trial_ends_at).getTime() : null;
+                patch.license_period_ends_at = computeLicensePeriodEnd(purchasedAtMs, trialEndsMs).toISOString();
             }
         } else {
             // Subscription state. Always reflect what Apple just reported,
@@ -3838,8 +3966,8 @@ app.post('/purchase/:userId', async (req, res) => {
             const trialExpired = freshState.appTrialEndsAt && freshState.appTrialEndsAt <= Date.now();
             const subActive = freshState.status === 'active' || freshState.status === 'trialing';
             const hasLicense = freshState.hasLicense;
-            const grantsAccess = subActive && hasLicense;
-            if (trialExpired && grantsAccess && userStates[userId]) {
+            const grantsAccess = hasLicense && (subActive || isActivationPeriodActive(freshState));
+            if (!accessBefore && trialExpired && grantsAccess && userStates[userId]) {
                 const u = userStates[userId];
                 if (u.isLocked || u.tradesCount > 0 || (isLossMode(u) && u.dailyNetPnl < 0)) {
                     // Loss mode: same fresh start. pnlDealIds stays, so today's
