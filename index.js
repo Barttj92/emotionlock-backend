@@ -3351,7 +3351,13 @@ app.post('/push-opened', pushOpenedLimiter, async (req, res) => {
     if (!parsed.success) {
         return res.status(400).json({ error: 'Invalid request' });
     }
-    const { pushSendId, userId } = parsed.data;
+    const { pushSendId } = parsed.data;
+    // Lowercased so opens match one row per user regardless of casing (profiles
+    // store uppercase ids, purchases lowercase). The plain unique index on
+    // (push_send_id, user_id) is the ON CONFLICT arbiter; the older
+    // lower(user_id) expression index could never match it, which made every
+    // open fail with 42P10 until 2026-10-30.
+    const userId = parsed.data.userId.toLowerCase();
     const { error } = await supabase.from('push_opens').upsert(
         { push_send_id: pushSendId, user_id: userId },
         { onConflict: 'push_send_id,user_id', ignoreDuplicates: true }
