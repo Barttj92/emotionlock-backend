@@ -3650,6 +3650,11 @@ const ONBOARDING_STEPS = [
     // blocked_apps_set column in email_user_state, so the A6 reminder only
     // reaches users who never picked any apps.
     'blocked_apps_set',
+    // The user ticked "MetaTrader 5 is on my list" and finished the app
+    // picker step (iOS build 20+). Apple never exposes picked app names, so
+    // this is the user's own confirmation. Shown per user in the Command
+    // Center Users tab, not part of the ordered funnel.
+    'mt5_confirmed',
     // Paywall and purchase funnel. Not part of the onboarding order in the
     // Command Center: they happen after the trial ends. The upsert keeps the
     // first occurrence per user (did this user ever reach it), while every
