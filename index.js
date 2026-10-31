@@ -4492,6 +4492,7 @@ app.post('/profile/:userId', profileLimiter, async (req, res) => {
         // Sync into email_contacts so the e-mail automation engine has this user.
         // Canonical key = lowercased Keychain UUID (matches the email_user_state view).
         // Fire-and-forget: a failure here must never break profile creation.
+        let signupCountry = ''; // ISO-2, reused in the admin notification below
         try {
             const contactRow = {
                 email:      cleanEmail,
@@ -4512,6 +4513,7 @@ app.post('/profile/:userId', profileLimiter, async (req, res) => {
             const fallbackCountry = alRegion || (alLang === 'nl' ? 'NL' : '');
             const bodyCountry = ((req.body?.country ?? '').toString().trim().toUpperCase().slice(0, 2)) || fallbackCountry;
             if (bodyCountry) contactRow.country = bodyCountry; // 'NL'/'BE' -> Dutch mails
+            signupCountry = bodyCountry;
             const bodyLocale = ((req.body?.locale ?? '').toString().trim()) || acceptLang;
             if (bodyLocale) contactRow.locale = bodyLocale;
             const { error: contactErr } = await supabase
@@ -4564,6 +4566,9 @@ app.post('/profile/:userId', profileLimiter, async (req, res) => {
                 subject: `New EmotionLock account: ${cleanFirstName} ${cleanLastName}`,
                 lines: [
                     `${cleanFirstName} ${cleanLastName} just created an account.`,
+                    '',
+                    `Country: ${countryDisplayName(signupCountry)}`,
+                    `Heard via: ${(typeof referralSource === 'string' && referralSource.trim()) ? referralSource.trim().slice(0, 500) : 'not answered'}`,
                     '',
                     `Email:   ${cleanEmail}`,
                     `User ID: ${userId}`,
@@ -4689,6 +4694,18 @@ app.listen(PORT, () => {
 // to be alerted in real time. Fire-and-forget on the caller side: never
 // blocks the request and silently no-ops when RESEND_API_KEY is missing so
 // local development without the key keeps working.
+// "NL" -> "Netherlands (NL)". Falls back to the raw code if ICU doesn't know it.
+function countryDisplayName(code) {
+    const c = String(code || '').trim().toUpperCase();
+    if (!c) return 'unknown';
+    try {
+        const name = new Intl.DisplayNames(['en'], { type: 'region' }).of(c);
+        return name && name !== c ? `${name} (${c})` : c;
+    } catch {
+        return c;
+    }
+}
+
 async function notifyAdmin({ subject, lines }) {
     if (!process.env.RESEND_API_KEY) {
         debugLog('[notify] RESEND_API_KEY not set, skipping admin notification.');
