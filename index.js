@@ -1768,13 +1768,17 @@ async function runTrialNotificationScheduler() {
                         .select('first_name, last_name, email')
                         .ilike('user_id', row.user_id)
                         .maybeSingle()
-                        .then(({ data: prof }) => {
+                        .then(async ({ data: prof }) => {
                             const fullName = prof ? `${prof.first_name ?? ''} ${prof.last_name ?? ''}`.trim() : '';
                             const customerEmail = prof?.email ?? 'unknown';
+                            const ctx = await adminUserContext(row.user_id);
                             notifyAdmin({
                                 subject: `Trial ending soon (~24h): ${fullName || 'a user'}`,
                                 lines: [
                                     `${fullName || 'A user'}'s free trial ends in about 24 hours.`,
+                                    '',
+                                    `Country:      ${ctx.country}`,
+                                    `Heard via:    ${ctx.heardVia}`,
                                     '',
                                     `Email:        ${customerEmail}`,
                                     `User ID:      ${row.user_id}`,
@@ -2374,13 +2378,17 @@ app.post('/connect-mt5/:userId', mt5Limiter, async (req, res) => {
                 .select('first_name, last_name, email')
                 .ilike('user_id', userId)
                 .maybeSingle()
-                .then(({ data: prof }) => {
+                .then(async ({ data: prof }) => {
                     const fullName = prof ? `${prof.first_name ?? ''} ${prof.last_name ?? ''}`.trim() : '';
                     const customerEmail = prof?.email ?? 'unknown';
+                    const ctx = await adminUserContext(userId);
                     notifyAdmin({
                         subject: `Trial started (MT5 connected): ${fullName || 'a user'}`,
                         lines: [
                             `${fullName || 'A user'} just connected MT5 — their 4-day free trial has started.`,
+                            '',
+                            `Country: ${ctx.country}`,
+                            `Heard via: ${ctx.heardVia}`,
                             '',
                             `Email:   ${customerEmail}`,
                             `User ID: ${userId}`,
@@ -4053,13 +4061,17 @@ app.post('/purchase/:userId', async (req, res) => {
                 .select('first_name, last_name, email')
                 .ilike('user_id', userId)
                 .maybeSingle()
-                .then(({ data: prof }) => {
+                .then(async ({ data: prof }) => {
                     const fullName = prof ? `${prof.first_name ?? ''} ${prof.last_name ?? ''}`.trim() : 'a new customer';
                     const customerEmail = prof?.email ?? 'unknown';
+                    const ctx = await adminUserContext(userId);
                     notifyAdmin({
                         subject: `New EmotionLock purchase: ${fullName || 'new customer'}`,
                         lines: [
                             `${fullName || 'A new customer'} just purchased the MT5 Activation license.`,
+                            '',
+                            `Country:        ${ctx.country}`,
+                            `Heard via:      ${ctx.heardVia}`,
                             '',
                             `Email:          ${customerEmail}`,
                             `User ID:        ${userId}`,
@@ -4704,6 +4716,23 @@ function countryDisplayName(code) {
     } catch {
         return c;
     }
+}
+
+// Country + "heard via" for admin notifications, so every admin mail shows the
+// same context as the signup mail. Best effort: never throws, falls back to
+// 'unknown' / 'not answered'.
+async function adminUserContext(userId) {
+    const uid = String(userId || '').toLowerCase();
+    let country = '', heardVia = '';
+    try {
+        const { data: c } = await supabase.from('email_contacts').select('country').eq('user_id', uid).not('country', 'is', null).limit(1).maybeSingle();
+        country = c?.country ?? '';
+    } catch {}
+    try {
+        const { data: a } = await supabase.from('attributions').select('source').ilike('user_id', uid).limit(1).maybeSingle();
+        heardVia = (a?.source ?? '').trim();
+    } catch {}
+    return { country: countryDisplayName(country), heardVia: heardVia || 'not answered' };
 }
 
 async function notifyAdmin({ subject, lines }) {
