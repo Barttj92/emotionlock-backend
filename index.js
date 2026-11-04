@@ -4701,11 +4701,6 @@ app.listen(PORT, () => {
 
 // =====================
 // Weekly Stats Digest
-// Sends a transactional notification email to the admin via Resend.
-// Used for one-off events (new profile, new license purchase) where we want
-// to be alerted in real time. Fire-and-forget on the caller side: never
-// blocks the request and silently no-ops when RESEND_API_KEY is missing so
-// local development without the key keeps working.
 // "NL" -> "Netherlands (NL)". Falls back to the raw code if ICU doesn't know it.
 function countryDisplayName(code) {
     const c = String(code || '').trim().toUpperCase();
@@ -4735,29 +4730,49 @@ async function adminUserContext(userId) {
     return { country: countryDisplayName(country), heardVia: heardVia || 'not answered' };
 }
 
+// Sends a transactional notification email to the admin through the
+// Supabase `send-email` edge function (Gmail API via Google Workspace), the
+// same sending path as all user-facing email. Every send is also logged in
+// `email_sends` with template_key 'admin_notify', so failures are visible in
+// Supabase. Used for one-off events (new profile, MT5 connect, new license
+// purchase). Fire-and-forget on the caller side: never throws and never
+// blocks the request.
+function escapeHtml(str) {
+    return String(str)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;');
+}
+
 async function notifyAdmin({ subject, lines }) {
-    if (!process.env.RESEND_API_KEY) {
-        debugLog('[notify] RESEND_API_KEY not set, skipping admin notification.');
+    const supabaseUrl = process.env.SUPABASE_URL;
+    const serviceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+    if (!supabaseUrl || !serviceKey) {
+        console.warn('[notify] SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY missing, admin notification skipped:', subject);
         return;
     }
     try {
         const text = Array.isArray(lines) ? lines.join('\n') : String(lines);
-        const res = await fetch('https://api.resend.com/emails', {
+        const html = `<pre style="font-family:Menlo,Consolas,monospace;font-size:13px;line-height:1.5;white-space:pre-wrap">${escapeHtml(text)}</pre>`;
+        const res = await fetch(`${supabaseUrl}/functions/v1/send-email`, {
             method: 'POST',
             headers: {
-                'Authorization': `Bearer ${process.env.RESEND_API_KEY}`,
+                'Authorization': `Bearer ${serviceKey}`,
                 'Content-Type': 'application/json',
             },
             body: JSON.stringify({
-                from: 'noreply@emotionlock.app',
-                to: [process.env.ADMIN_EMAIL || 'janssenbart92@gmail.com'],
+                to: process.env.ADMIN_EMAIL || 'janssenbart92@gmail.com',
                 subject,
                 text,
+                html,
+                kind: 'transactional',
+                templateKey: 'admin_notify',
             }),
         });
         if (!res.ok) {
             const err = await res.text();
-            console.error('[notify] Failed to send admin notification:', err);
+            console.error('[notify] Failed to send admin notification:', res.status, err.slice(0, 500));
         }
     } catch (err) {
         console.error('[notify] Error sending admin notification:', err?.message ?? err);
@@ -4852,74 +4867,42 @@ function adminNotifyTimestamp() {
     });
 }
 
-// Sends a Monday morning email summary to the admin via Resend
-// Requires RESEND_API_KEY environment variable in Railway
+// Sends a Monday morning email summary to the admin via notifyAdmin
+// (Supabase send-email edge function, Gmail API via Google Workspace).
+// The community opportunities section was dropped: the scout agents were
+// removed on 2026-08-21, so that table stays empty.
 // =====================
 async function sendWeeklyStatsDigest() {
-    if (!process.env.RESEND_API_KEY) {
-        debugLog('[Digest] RESEND_API_KEY not set, skipping weekly digest.');
-        return;
-    }
-
     try {
-        const { data: users } = await supabase.from('user_overview').select('*');
-        const { data: opps } = await supabase
-            .from('opportunities')
-            .select('*')
-            .gte('created_at', new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString());
+        const { data: users, error } = await supabase.from('user_overview').select('has_license, has_active_subscription, has_mt5');
+        if (error) throw new Error(error.message);
 
-        const totalUsers      = users?.length ?? 0;
-        const activeLicense   = users?.filter(u => u.has_license).length ?? 0;
-        const activeSub       = users?.filter(u => u.has_active_subscription).length ?? 0;
-        const mt5Connected    = users?.filter(u => u.has_mt5).length ?? 0;
-        const newOpps         = opps?.length ?? 0;
-        const responded       = opps?.filter(o => o.status === 'responded').length ?? 0;
-        const pending         = newOpps - responded;
+        const totalUsers    = users?.length ?? 0;
+        const activeLicense = users?.filter(u => u.has_license).length ?? 0;
+        const activeSub     = users?.filter(u => u.has_active_subscription).length ?? 0;
+        const mt5Connected  = users?.filter(u => u.has_mt5).length ?? 0;
 
         const dateStr = new Date().toLocaleDateString('en-GB', {
             weekday: 'long', year: 'numeric', month: 'long', day: 'numeric',
             timeZone: 'Europe/Amsterdam'
         });
 
-        const emailText = [
-            'EmotionLock — Weekly Stats Digest',
-            dateStr,
-            '',
-            'USERS',
-            `Total accounts:       ${totalUsers}`,
-            `License activated:    ${activeLicense}`,
-            `Active subscription:  ${activeSub}`,
-            `MT5 connected:        ${mt5Connected}`,
-            '',
-            'COMMUNITY OPPORTUNITIES (LAST 7 DAYS)',
-            `New threads found:    ${newOpps}`,
-            `Responded:            ${responded}`,
-            `Pending response:     ${pending}`,
-            '',
-            'ACTION',
-            'Review Command Center: https://emotionlock.app/command',
-        ].join('\n');
-
-        const res = await fetch('https://api.resend.com/emails', {
-            method: 'POST',
-            headers: {
-                'Authorization': `Bearer ${process.env.RESEND_API_KEY}`,
-                'Content-Type': 'application/json',
-            },
-            body: JSON.stringify({
-                from: 'noreply@emotionlock.app',
-                to: [process.env.ADMIN_EMAIL || 'janssenbart92@gmail.com'],
-                subject: `EmotionLock Weekly — ${dateStr}`,
-                text: emailText,
-            }),
+        await notifyAdmin({
+            subject: `EmotionLock Weekly, ${dateStr}`,
+            lines: [
+                'EmotionLock Weekly Stats Digest',
+                dateStr,
+                '',
+                'USERS',
+                `Total accounts:       ${totalUsers}`,
+                `License activated:    ${activeLicense}`,
+                `Active subscription:  ${activeSub}`,
+                `MT5 connected:        ${mt5Connected}`,
+                '',
+                'Review Command Center: https://emotionlock.app/command',
+            ],
         });
-
-        if (res.ok) {
-            console.log('[Digest] Weekly stats digest sent.');
-        } else {
-            const err = await res.text();
-            console.error('[Digest] Failed to send digest:', err);
-        }
+        console.log('[Digest] Weekly stats digest sent.');
     } catch (err) {
         console.error('[Digest] Error generating weekly digest:', err?.message ?? err);
     }
