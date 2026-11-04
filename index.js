@@ -4763,7 +4763,7 @@ async function notifyAdmin({ subject, lines }) {
                 'Content-Type': 'application/json',
             },
             body: JSON.stringify({
-                to: process.env.ADMIN_EMAIL || 'janssenbart92@gmail.com',
+                to: process.env.ADMIN_EMAIL || 'bart@emotionlock.app',
                 subject,
                 text,
                 html,
@@ -4862,7 +4862,7 @@ async function sendWelcomeEmail({ to, firstName }) {
             body: JSON.stringify({
                 from: 'Bart at EmotionLock <noreply@emotionlock.app>',
                 to: [to],
-                reply_to: process.env.ADMIN_EMAIL || 'janssenbart92@gmail.com',
+                reply_to: process.env.ADMIN_EMAIL || 'bart@emotionlock.app',
                 subject,
                 text,
                 html,
