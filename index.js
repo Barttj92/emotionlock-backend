@@ -4758,6 +4758,7 @@ async function notifyAdmin({ subject, lines }) {
         const res = await fetch(`${supabaseUrl}/functions/v1/send-email`, {
             method: 'POST',
             headers: {
+                'apikey': serviceKey,
                 'Authorization': `Bearer ${serviceKey}`,
                 'Content-Type': 'application/json',
             },
@@ -4778,6 +4779,27 @@ async function notifyAdmin({ subject, lines }) {
         console.error('[notify] Error sending admin notification:', err?.message ?? err);
     }
 }
+
+// Startup self-test: confirms send-email accepts this backend's key without
+// sending anything. An empty body passes auth and then returns 400; a 401/403
+// means admin notifications would be rejected. Result goes to the Railway log.
+async function checkAdminNotifyAuth() {
+    const supabaseUrl = process.env.SUPABASE_URL;
+    const serviceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+    if (!supabaseUrl || !serviceKey) return;
+    try {
+        const res = await fetch(`${supabaseUrl}/functions/v1/send-email`, {
+            method: 'POST',
+            headers: { 'apikey': serviceKey, 'Authorization': `Bearer ${serviceKey}`, 'Content-Type': 'application/json' },
+            body: '{}',
+        });
+        if (res.status === 400) console.log('[notify] self-test OK: send-email accepts backend key');
+        else console.error(`[notify] self-test FAILED: send-email returned ${res.status}, admin mails will not arrive`);
+    } catch (err) {
+        console.error('[notify] self-test error:', err?.message ?? err);
+    }
+}
+setTimeout(() => { checkAdminNotifyAuth(); }, 10 * 1000);
 
 // Sends a one-time welcome email to a newly signed-up user via Resend.
 // Mirrors notifyAdmin's fail-safe design: never throws, silently no-ops when
