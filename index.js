@@ -611,7 +611,7 @@ function friendlyMt5ConnectError(err) {
     const code = parsed?.details?.code;
     const errorType = parsed?.error;
     if (code === 'E_SRV_NOT_FOUND') {
-        return 'Server name not recognized by the broker. Please check the exact server name in your MT5 app (Settings → Server) — including spaces and capitalization — and try again.';
+        return 'Server name not recognized by the broker. Please check the exact server name in your MT5 app (Settings → Server), including spaces and capitalization, and try again.';
     }
     if (errorType === 'BrokerSettingsDetection') {
         return 'Your broker server is being set up for the first time. Please wait about a minute and try again.';
@@ -1470,7 +1470,7 @@ async function checkUserTrades(userId) {
             saveDailyPnl(userId, user).catch(() => {});
             console.log(`[pnl-shadow] ${userId.slice(0,8)}: seed dailyNetPnl=${user.dailyNetPnl} mode=${isLossMode(user) ? 'loss' : 'trades'} trades=${user.tradesCount}`);
 
-            debugLog(`[trades] ${userId.slice(0,8)}: first check — seeded ${seedDeals.length} deals, ${Object.keys(user.openPositions).length} still-open position(s), ${seedCloseCount} fully-closed, tradesCount=${user.tradesCount}`);
+            debugLog(`[trades] ${userId.slice(0,8)}: first check, seeded ${seedDeals.length} deals, ${Object.keys(user.openPositions).length} still-open position(s), ${seedCloseCount} fully-closed, tradesCount=${user.tradesCount}`);
             return;
         }
 
@@ -2385,7 +2385,7 @@ app.post('/connect-mt5/:userId', mt5Limiter, async (req, res) => {
                     notifyAdmin({
                         subject: `Trial started (MT5 connected): ${fullName || 'a user'}`,
                         lines: [
-                            `${fullName || 'A user'} just connected MT5 — their 4-day free trial has started.`,
+                            `${fullName || 'A user'} just connected MT5. Their 4-day free trial has started.`,
                             '',
                             `Country: ${ctx.country}`,
                             `Heard via: ${ctx.heardVia}`,
@@ -3881,13 +3881,13 @@ app.post('/purchase/:userId', async (req, res) => {
                 .then(({ data: knownUser }) => {
                     if (!knownUser) return; // genuine scanner noise, stay quiet
                     notifyAdmin({
-                        subject: `[EmotionLock] Blocked purchase — no profile for known user ${userId.slice(0, 8)}`,
+                        subject: `[EmotionLock] Blocked purchase, no profile for known user ${userId.slice(0, 8)}`,
                         lines: [
                             `A real Apple IAP purchase attempt for product "${productId}" (type: ${type}, tx: ${transactionId}) was REJECTED because user ${userId} has no profiles row (no name/email on file).`,
                             '',
                             `This is a known app install, not scanner noise: MT5 login ${knownUser.mt5_login ?? 'n/a'} on ${knownUser.mt5_server ?? 'n/a'}, trial started ${knownUser.app_trial_started_at ?? 'never'}, account created ${knownUser.created_at}.`,
                             '',
-                            `Apple has already charged the customer and finished the transaction on the app side — this purchase will NOT show up in the Command Center or revenue numbers unless handled manually.`,
+                            `Apple has already charged the customer and finished the transaction on the app side. This purchase will NOT show up in the Command Center or revenue numbers unless handled manually.`,
                             '',
                             `User ID: ${userId}`,
                             `Time (Europe/Amsterdam): ${adminNotifyTimestamp()}`,
@@ -4589,9 +4589,8 @@ app.post('/profile/:userId', profileLimiter, async (req, res) => {
                     'View in Command Center: https://emotionlock.app/command',
                 ],
             }).catch(() => {});
-            // Welcome email to the new user. Fire-and-forget, English copy.
-            // Only on the first save so profile edits never re-trigger it.
-            sendWelcomeEmail({ to: cleanEmail, firstName: cleanFirstName }).catch(() => {});
+            // The welcome email to the new user is sent by the Supabase email
+            // automation A0_welcome (send-email edge function), not from here.
         }
     } catch (err) {
         console.error('[profile] Unexpected error:', err);
@@ -4800,84 +4799,6 @@ async function checkAdminNotifyAuth() {
     }
 }
 setTimeout(() => { checkAdminNotifyAuth(); }, 10 * 1000);
-
-// Sends a one-time welcome email to a newly signed-up user via Resend.
-// Mirrors notifyAdmin's fail-safe design: never throws, silently no-ops when
-// RESEND_API_KEY is missing so local dev without the key keeps working, and
-// is called fire-and-forget from /profile so it never delays the iOS app.
-// English copy on purpose — the app UI is English and users can be anywhere.
-async function sendWelcomeEmail({ to, firstName }) {
-    if (!process.env.RESEND_API_KEY) {
-        debugLog('[welcome] RESEND_API_KEY not set, skipping welcome email.');
-        return;
-    }
-    if (!to || typeof to !== 'string' || !to.includes('@')) {
-        debugLog('[welcome] No valid recipient, skipping welcome email.');
-        return;
-    }
-    const name = (firstName && String(firstName).trim()) || 'there';
-    const subject = 'Welcome to EmotionLock';
-    const text = [
-        `Hi ${name},`,
-        '',
-        'Welcome to EmotionLock — and thanks for creating your account.',
-        '',
-        "EmotionLock protects you from yourself: it caps how many trades you can take, so one emotional day can't wipe out weeks of discipline.",
-        '',
-        'Here is how to get started:',
-        '1. Connect your MT5 account in read-only mode (we can never trade for you).',
-        '2. Set your daily trade limit.',
-        '3. That is it — your free trial starts the moment you connect, no card needed.',
-        '',
-        'Your trades stay yours. Your investor password is never stored on our servers, and read-only is enforced at the MT5 protocol level.',
-        '',
-        'Questions? Just reply to this email.',
-        '',
-        'Trade with discipline,',
-        'Bart — EmotionLock',
-    ].join('\n');
-    const html = `
-    <div style="font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;max-width:520px;margin:0 auto;color:#1a1a1a;line-height:1.55;">
-      <p style="font-size:16px;">Hi ${name},</p>
-      <p style="font-size:16px;">Welcome to <strong>EmotionLock</strong> — and thanks for creating your account.</p>
-      <p style="font-size:16px;">EmotionLock protects you from yourself: it caps how many trades you can take, so one emotional day can't wipe out weeks of discipline.</p>
-      <p style="font-size:16px;margin-bottom:6px;"><strong>Here's how to get started:</strong></p>
-      <ol style="font-size:16px;padding-left:20px;margin-top:0;">
-        <li>Connect your MT5 account in read-only mode (we can never trade for you).</li>
-        <li>Set your daily trade limit.</li>
-        <li>That's it — your free trial starts the moment you connect, no card needed.</li>
-      </ol>
-      <p style="font-size:14px;color:#555;">Your trades stay yours. Your investor password is never stored on our servers, and read-only is enforced at the MT5 protocol level.</p>
-      <p style="font-size:16px;">Questions? Just reply to this email.</p>
-      <p style="font-size:16px;margin-bottom:2px;">Trade with discipline,</p>
-      <p style="font-size:16px;margin-top:0;">Bart — EmotionLock</p>
-    </div>`;
-    try {
-        const res = await fetch('https://api.resend.com/emails', {
-            method: 'POST',
-            headers: {
-                'Authorization': `Bearer ${process.env.RESEND_API_KEY}`,
-                'Content-Type': 'application/json',
-            },
-            body: JSON.stringify({
-                from: 'Bart at EmotionLock <noreply@emotionlock.app>',
-                to: [to],
-                reply_to: process.env.ADMIN_EMAIL || 'bart@emotionlock.app',
-                subject,
-                text,
-                html,
-            }),
-        });
-        if (!res.ok) {
-            const err = await res.text();
-            console.error('[welcome] Failed to send welcome email:', err);
-        } else {
-            console.log(`[welcome] Welcome email sent to ${to}`);
-        }
-    } catch (err) {
-        console.error('[welcome] Error sending welcome email:', err?.message ?? err);
-    }
-}
 
 // Formats the current moment in the Europe/Amsterdam timezone so the
 // notification emails read consistently regardless of where Railway runs.
