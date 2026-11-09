@@ -757,14 +757,26 @@ async function fetchMetaApiAccountInfo(accountId) {
 // find any pre-existing MetaAPI account tied to this user before creating a new one.
 // Every account we create is named `EmotionLock-${userId}` and tagged 'emotionlock'
 // so we can recover by listing accounts and matching on name.
-async function findMetaApiAccountByName(name) {
-    // Paginate. MetaAPI's list endpoint defaults to a page size of ~100. Once
-    // the total account count crosses that boundary, a non-paginated request
-    // would silently stop seeing older accounts and the safety net would
-    // start letting duplicates through. We walk pages until either we find
-    // the match or a page returns fewer rows than the limit (i.e. last page).
+//
+// MetaAPI has answered the list endpoint with a plain array, but newer API
+// versions wrap a page as { items, count }. The old lookup only accepted an
+// array and returned null without a log line for anything else, which made the
+// safety net a silent no-op: between 1 and 9 Nov 2026 it never matched once,
+// while duplicates were being created. Both shapes are accepted now, and an
+// unknown shape is logged.
+function extractMetaApiAccountsPage(body) {
+    if (Array.isArray(body)) return body;
+    if (body && Array.isArray(body.items)) return body.items;
+    return null;
+}
+
+// Lists every MetaAPI account on our token, walking pages so the safety net
+// keeps working past 100 accounts. Returns null (logged) when the lookup
+// itself failed, so callers can tell "no accounts" apart from "unknown".
+async function listAllMetaApiAccounts() {
     const PAGE_LIMIT = 100;
     const MAX_PAGES = 50; // Hard ceiling: 5000 accounts. Plenty for years of growth.
+    const all = [];
     try {
         for (let page = 0; page < MAX_PAGES; page++) {
             const offset = page * PAGE_LIMIT;
@@ -773,22 +785,43 @@ async function findMetaApiAccountByName(name) {
                 headers: { 'auth-token': METAAPI_TOKEN }
             });
             if (!response.ok) {
-                console.log(`[metaapi] findByName list HTTP ${response.status} (page ${page})`);
+                console.log(`[metaapi] list accounts HTTP ${response.status} (page ${page})`);
                 return null;
             }
-            const accounts = await response.json();
-            if (!Array.isArray(accounts)) return null;
-            const match = accounts.find(a => a && a.name === name);
-            if (match) return match;
+            const body = await response.json();
+            const accounts = extractMetaApiAccountsPage(body);
+            if (!accounts) {
+                console.log(`[metaapi] list accounts: unexpected response shape (page ${page}): ${JSON.stringify(body).slice(0, 200)}`);
+                return null;
+            }
+            all.push(...accounts.filter(Boolean));
             // Last page: fewer results than limit means we have seen everything.
-            if (accounts.length < PAGE_LIMIT) return null;
+            if (accounts.length < PAGE_LIMIT) return all;
         }
-        console.log(`[metaapi] findByName exhausted ${MAX_PAGES} pages without match for ${name}`);
-        return null;
+        console.log(`[metaapi] list accounts stopped after ${MAX_PAGES} pages, result may be incomplete`);
+        return all;
     } catch (err) {
-        console.log(`[metaapi] findByName error: ${err.message}`);
+        console.log(`[metaapi] list accounts error: ${err.message}`);
         return null;
     }
+}
+
+// Every account named `name` (case-insensitive, the iOS app sends upper-case
+// UUIDs while Supabase stores lower-case). [] when none, null when the lookup
+// failed.
+async function findMetaApiAccountsByName(name) {
+    const accounts = await listAllMetaApiAccounts();
+    if (!accounts) return null;
+    const wanted = String(name).toLowerCase();
+    return accounts.filter(a => String(a.name || '').toLowerCase() === wanted);
+}
+
+// MT5 server names are case-insensitive for the broker and MetaAPI stores its
+// own casing ("XMGlobal-MT5 12" for a user who typed "XMGLOBAL-MT5 12"). A
+// case-sensitive compare treated a re-typed server as a different account and
+// sent the user down the delete-and-create path.
+function sameMt5Server(a, b) {
+    return String(a ?? '').trim().toLowerCase() === String(b ?? '').trim().toLowerCase();
 }
 
 // Wraps createMetaApiAccount with the safety-net check. Always called instead of
@@ -835,22 +868,44 @@ function reserveMetaApiCreateSlot(userId) {
 
 async function createOrRecoverMetaApiAccount(server, login, password, userId) {
     const name = `EmotionLock-${userId}`;
-    const orphan = await findMetaApiAccountByName(name);
-    if (orphan && orphan.id) {
-        const sameCreds = (orphan.server || '').trim() === server.trim() &&
-                          String(orphan.login || '') === String(login);
-        if (sameCreds) {
-            console.log(`[metaapi] Recovered orphan account ${orphan.id} by name for user ${userId}`);
-            await deployMetaApiAccountWithRetry(orphan.id);
-            return { id: orphan.id, region: orphan.region || null, recovered: true };
-        }
-        console.log(`[metaapi] Stale orphan account ${orphan.id} for user ${userId}, deleting before create`);
+    const matches = await findMetaApiAccountsByName(name);
+    if (matches === null) {
+        // Fail open on purpose: refusing to connect would lock new users out
+        // whenever the list call hiccups. The hourly orphan sweep catches a
+        // duplicate that slips through here.
+        console.log(`[metaapi] Name lookup failed for ${name}, continuing with create`);
+    }
+    const found = matches || [];
+    if (found.length > 1) {
+        console.log(`[metaapi] ${found.length} accounts named ${name}: ${found.map(a => `${a.id}(${a.state})`).join(', ')}`);
+    }
+    const reusable = found.filter(a => sameMt5Server(a.server, server) && String(a.login || '') === String(login));
+    const stale = found.filter(a => !reusable.includes(a));
+
+    for (const old of stale) {
+        console.log(`[metaapi] Stale orphan account ${old.id} for user ${userId}, deleting before create`);
         try {
-            await undeployAndDeleteMetaApiAccount(orphan.id);
+            await undeployAndDeleteMetaApiAccount(old.id);
         } catch (e) {
             console.log('Orphan cleanup warning:', e.message);
         }
     }
+
+    if (reusable.length > 0) {
+        // Prefer the one that is already running, so the user keeps syncing.
+        const keep = reusable.find(a => a.state === 'DEPLOYED') || reusable[0];
+        for (const extra of reusable) {
+            if (extra.id === keep.id) continue;
+            // Same user, same credentials: a pure duplicate. Undeploy only
+            // (reversible) so billing stops; deleting is left to the admin.
+            console.log(`[metaapi] Undeploying duplicate account ${extra.id} for user ${userId} (keeping ${keep.id})`);
+            await undeployMetaApiAccount(extra.id);
+        }
+        console.log(`[metaapi] Recovered orphan account ${keep.id} by name for user ${userId}`);
+        await deployMetaApiAccountWithRetry(keep.id);
+        return { id: keep.id, region: keep.region || null, recovered: true };
+    }
+
     if (!reserveMetaApiCreateSlot(userId)) {
         const limitErr = new Error('metaapi_create_limit');
         limitErr.code = 'METAAPI_CREATE_LIMIT';
@@ -1019,8 +1074,13 @@ const processedIAPTransactions = new Set();
 
 // Per-user mutex for /connect-mt5. Prevents concurrent calls from creating
 // duplicate MetaAPI accounts (each account costs money per hour).
-// Map<userId, Promise> — second concurrent call awaits the first.
+// Map<userId, startedAtMs>. Held until the handler has really finished, not
+// until the client hangs up: the iOS app gives up after 90s while a MetaAPI
+// create can take longer, and releasing on 'close' let the user's retry run a
+// second create next to the first (5A3343C3 on 4 Nov 2026). The age cap only
+// exists so a hung MetaAPI call can never block a user for good.
 const connectMt5InFlight = new Map();
+const CONNECT_MT5_LOCK_MAX_MS = 5 * 60 * 1000;
 
 // Returns the calendar date string ("YYYY-MM-DD") in Europe/Amsterdam.
 // Used by the trade-polling loop so the daily reset boundary matches the
@@ -1273,8 +1333,16 @@ async function checkUserTrades(userId) {
     // reason, and these two sources must agree or trades get double-counted.
     checkDailyReset(user, getAmsterdamDateStr());
 
+    const polledAccountId = user.metaApiAccountId;
     try {
-        const { account: accountInfo, status: infoStatus } = await fetchMetaApiAccountInfo(user.metaApiAccountId);
+        const { account: accountInfo, status: infoStatus } = await fetchMetaApiAccountInfo(polledAccountId);
+        // The lookup takes a moment. If the user reset onboarding, disconnected
+        // or switched accounts meanwhile, this result is about an account we no
+        // longer own: acting on it (auto-deploy) is how a reset left a deployed
+        // orphan behind on 3 Nov 2026 (BF51A60B, e14c0ac9).
+        if (userStates[userId] !== user || user.metaApiAccountId !== polledAccountId || !user.mt5Connected) {
+            return;
+        }
         if (!accountInfo) {
             if (infoStatus === 404) {
                 // The account no longer exists in MetaAPI (deleted manually or
@@ -1710,6 +1778,116 @@ setTimeout(() => {
     cleanupExpiredMetaApiAccounts().catch(() => {});
     setInterval(() => cleanupExpiredMetaApiAccounts().catch(() => {}), 60 * 60 * 1000);
 }, 5 * 60 * 1000);
+
+// =====================
+// MetaAPI orphan sweep, runs hourly
+// =====================
+// An orphan is a deployed EmotionLock MetaAPI account that no user points to:
+// not in purchases.meta_api_account_id and not in memory. Nothing else ever
+// undeploys those (the expiry cleanup above only knows linked ids), so they
+// bill until someone spots them in the dashboard. This sweep undeploys them.
+// Safety rails, so a real user is never touched:
+//   - only accounts named EmotionLock-*, only DEPLOYED/DEPLOYING
+//   - skipped entirely when MetaAPI or Supabase could not be read, or when
+//     Supabase returns no linked ids at all
+//   - an account must be seen as orphan on two runs at least 50 min apart
+//     (covers a connect that has created but not yet persisted)
+//   - never while that user has a /connect-mt5 in flight
+//   - undeploy only, never delete (reversible), max 10 per run, admin mailed
+const ORPHAN_CONFIRM_MS = 50 * 60 * 1000;
+const ORPHAN_MAX_PER_RUN = 10;
+const orphanFirstSeenAt = new Map(); // accountId -> ms
+
+async function loadLinkedMetaApiAccountIds() {
+    const linked = new Set();
+    const PAGE = 1000;
+    for (let from = 0; ; from += PAGE) {
+        const { data, error } = await supabase
+            .from('purchases')
+            .select('meta_api_account_id')
+            .not('meta_api_account_id', 'is', null)
+            .range(from, from + PAGE - 1);
+        if (error) throw new Error(error.message);
+        for (const row of data ?? []) linked.add(row.meta_api_account_id);
+        if (!data || data.length < PAGE) break;
+    }
+    for (const state of Object.values(userStates)) {
+        if (state?.metaApiAccountId) linked.add(state.metaApiAccountId);
+    }
+    return linked;
+}
+
+async function sweepOrphanMetaApiAccounts() {
+    try {
+        const accounts = await listAllMetaApiAccounts();
+        if (!accounts) return;
+        let linked;
+        try {
+            linked = await loadLinkedMetaApiAccountIds();
+        } catch (e) {
+            console.error('[orphan-sweep] Supabase read failed, skipping run:', e.message);
+            return;
+        }
+        if (linked.size === 0) {
+            console.log('[orphan-sweep] No linked accounts found, skipping run as a precaution');
+            return;
+        }
+
+        const now = Date.now();
+        const inFlightUsers = new Set([...connectMt5InFlight.keys()].map(u => String(u).toLowerCase()));
+        const orphans = accounts.filter(a =>
+            a.id &&
+            /^EmotionLock-/i.test(String(a.name || '')) &&
+            (a.state === 'DEPLOYED' || a.state === 'DEPLOYING') &&
+            !linked.has(a.id)
+        );
+        const orphanIds = new Set(orphans.map(a => a.id));
+        for (const id of [...orphanFirstSeenAt.keys()]) {
+            if (!orphanIds.has(id)) orphanFirstSeenAt.delete(id);
+        }
+
+        const confirmed = [];
+        for (const a of orphans) {
+            const ownerId = String(a.name).slice('EmotionLock-'.length).toLowerCase();
+            if (inFlightUsers.has(ownerId)) continue;
+            if (!orphanFirstSeenAt.has(a.id)) {
+                orphanFirstSeenAt.set(a.id, now);
+                console.log(`[orphan-sweep] Candidate ${a.id} (${a.name}, ${a.state}), will undeploy if still unlinked next run`);
+                continue;
+            }
+            if (now - orphanFirstSeenAt.get(a.id) >= ORPHAN_CONFIRM_MS) confirmed.push(a);
+        }
+        if (confirmed.length === 0) return;
+
+        const toUndeploy = confirmed.slice(0, ORPHAN_MAX_PER_RUN);
+        for (const a of toUndeploy) {
+            await undeployMetaApiAccount(a.id);
+            orphanFirstSeenAt.delete(a.id);
+            console.log(`[orphan-sweep] Undeployed orphan ${a.id} (${a.name}, ${a.server}/${a.login})`);
+        }
+        notifyAdmin({
+            subject: `[EmotionLock] ${toUndeploy.length} orphan MetaAPI account(s) undeployed`,
+            lines: [
+                'These deployed MetaAPI accounts were not linked to any user and were undeployed (not deleted):',
+                '',
+                ...toUndeploy.map(a => `  - ${a.id}  ${a.name}  ${a.server}/${a.login}`),
+                '',
+                confirmed.length > toUndeploy.length
+                    ? `${confirmed.length - toUndeploy.length} more are waiting for the next run (cap ${ORPHAN_MAX_PER_RUN} per run).`
+                    : 'Delete them via DELETE /admin/metaapi-accounts/{id} once checked.',
+                '',
+                `Time (Europe/Amsterdam): ${adminNotifyTimestamp()}`,
+            ],
+        }).catch(() => {});
+    } catch (err) {
+        console.error('[orphan-sweep] Unexpected error:', err.message);
+    }
+}
+
+setTimeout(() => {
+    sweepOrphanMetaApiAccounts().catch(() => {});
+    setInterval(() => sweepOrphanMetaApiAccounts().catch(() => {}), 60 * 60 * 1000);
+}, 10 * 60 * 1000);
 
 // =====================
 // Trial expiry push scheduler
@@ -2152,17 +2330,25 @@ app.post('/connect-mt5/:userId', mt5Limiter, async (req, res) => {
     // would end up with two MetaAPI accounts named EmotionLock-${userId},
     // each billed hourly. Returning 409 keeps the client side simple: the
     // iOS app retries on next /status anyway.
-    if (connectMt5InFlight.has(userId)) {
+    const inFlightSince = connectMt5InFlight.get(userId);
+    if (inFlightSince && Date.now() - inFlightSince < CONNECT_MT5_LOCK_MAX_MS) {
+        // The app shows `error` as-is, so it must read as a sentence.
         return res.status(409).json({
-            error: 'connect_in_progress',
-            message: 'Another connection attempt is already in progress. Please wait a moment.',
+            error: 'Your previous connection attempt is still running. Please wait a minute and check again.',
+            code: 'connect_in_progress',
         });
     }
-    let _resolveInFlight;
-    connectMt5InFlight.set(userId, new Promise(r => { _resolveInFlight = r; }));
-    res.on('finish', () => { connectMt5InFlight.delete(userId); _resolveInFlight && _resolveInFlight(); });
-    res.on('close',  () => { connectMt5InFlight.delete(userId); _resolveInFlight && _resolveInFlight(); });
+    const lockStamp = Date.now();
+    connectMt5InFlight.set(userId, lockStamp);
+    try {
+        await connectMt5Locked(res, userId, server, login, password);
+    } finally {
+        if (connectMt5InFlight.get(userId) === lockStamp) connectMt5InFlight.delete(userId);
+    }
+});
 
+// Body of POST /connect-mt5, always run while holding connectMt5InFlight.
+async function connectMt5Locked(res, userId, server, login, password) {
     // Block new MT5 connections for users whose subscription has expired.
     // Without this gate a paywalled user could trigger a new MetaAPI account
     // creation (or redeploy of an existing one) and immediately start
@@ -2252,21 +2438,26 @@ app.post('/connect-mt5/:userId', mt5Limiter, async (req, res) => {
         // Without this, every reconnect creates a new MetaAPI account.
         const existingServer = savedAccount?.mt5_server ?? userStates[userId].mt5Server;
         const existingLogin  = savedAccount?.mt5_login  ?? userStates[userId].mt5Login;
-        const isSameAccount = existingMetaApiId &&
-            existingServer?.trim() === server.trim() &&
-            existingLogin === String(login);
+        const isSameAccount = !!existingMetaApiId &&
+            sameMt5Server(existingServer, server) &&
+            String(existingLogin ?? '') === String(login);
 
         let accountId;
         let accountRegion = null;
         if (isSameAccount) {
             // Same server + login: redeploy the existing account, no new account needed.
             // If the account was manually deleted in MetaAPI, fall through and create a fresh one.
-            const info = await getMetaApiAccountInfo(existingMetaApiId);
+            const { account: info, status: infoStatus } = await fetchMetaApiAccountInfo(existingMetaApiId);
             if (info) {
                 console.log(`Reusing existing MetaAPI account for user ${userId}`);
                 accountId = existingMetaApiId;
                 await deployMetaApiAccount(accountId);
                 if (info.region) accountRegion = info.region;
+            } else if (infoStatus !== 404) {
+                // 429/5xx: MetaAPI could not tell us whether the account still
+                // exists. Creating now would duplicate a live account, so fail
+                // this attempt and let the user retry.
+                throw new Error(`MetaApi account lookup failed (HTTP ${infoStatus}) for ${existingMetaApiId}, not creating a new account`);
             } else {
                 console.log(`Existing MetaAPI account not found, creating or recovering for user ${userId}`);
                 const result = await createOrRecoverMetaApiAccount(server, String(login), password, userId);
@@ -2408,7 +2599,7 @@ app.post('/connect-mt5/:userId', mt5Limiter, async (req, res) => {
         console.error(`MT5 connect error for ${userId}:`, err.message);
         res.status(500).json({ error: friendlyMt5ConnectError(err) });
     }
-});
+}
 
 // Disconnect MT5 account
 app.delete('/connect-mt5/:userId', async (req, res) => {
@@ -3085,11 +3276,8 @@ app.get('/admin/metaapi-accounts', async (req, res) => {
     if (!isValidAdminKey(adminKey)) return res.status(401).json({ error: 'Unauthorized' });
 
     try {
-        const response = await fetch(`${PROVISIONING_API}/users/current/accounts`, {
-            headers: { 'auth-token': METAAPI_TOKEN }
-        });
-        if (!response.ok) return res.status(500).json({ error: 'MetaAPI request failed' });
-        const accounts = await response.json();
+        const accounts = await listAllMetaApiAccounts();
+        if (!accounts) return res.status(500).json({ error: 'MetaAPI request failed' });
         res.json(accounts.map(a => ({
             id: a.id,
             name: a.name,
@@ -3498,11 +3686,34 @@ app.post('/reset-after-onboarding/:userId', async (req, res) => {
         //    starting fresh and may pick a different broker. After a server
         //    restart the in-memory state is gone, so fall back to the id that
         //    is persisted in Supabase; otherwise that account kept billing.
-        const oldMetaApiId = existing?.metaApiAccountId ?? (guardOn ? prior?.meta_api_account_id : null) ?? null;
+        let oldMetaApiId = existing?.metaApiAccountId ?? (guardOn ? prior?.meta_api_account_id : null) ?? null;
+        if (!oldMetaApiId) {
+            // Guard off and nothing in memory (e.g. after a server restart):
+            // still look up the persisted id, otherwise clearing the row below
+            // leaves that account running unlinked.
+            try {
+                const { data: linkRow } = await supabase
+                    .from('purchases')
+                    .select('meta_api_account_id')
+                    .eq('user_id', userId)
+                    .maybeSingle();
+                oldMetaApiId = linkRow?.meta_api_account_id ?? null;
+            } catch (e) {
+                console.log(`MT5 cleanup lookup on reset for ${userId}:`, e.message);
+            }
+        }
+        if (existing) {
+            // Stop the poller from touching the old account before we tear it
+            // down. It used to see UNDEPLOYED mid-reset and deploy it again.
+            existing.mt5Connected = false;
+            existing.metaApiAccountId = null;
+        }
         if (oldMetaApiId) {
             try {
                 await undeployAndDeleteMetaApiAccount(oldMetaApiId);
+                console.log(`[reset] Deleted MetaAPI account ${oldMetaApiId} for ${userId.slice(0, 8)}`);
             } catch (e) {
+                // The hourly orphan sweep undeploys it if it is still running.
                 console.log(`MT5 cleanup on reset for ${userId}:`, e.message);
             }
         }
