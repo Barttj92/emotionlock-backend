@@ -623,7 +623,7 @@ function friendlyMt5ConnectError(err) {
         return 'The connection to your broker timed out. Please try again in a moment.';
     }
     if (code === 'E_AUTH') {
-        return 'Your broker rejected the login. Please check your MT5 account number and password (use the master password) and try again.';
+        return 'Your broker rejected the login. Please check your MT5 account number and investor password and try again.';
     }
     if (errorType === 'ValidationError') {
         return 'Could not verify your MT5 account details. Please double-check the server, account number and password.';
@@ -1566,13 +1566,15 @@ async function checkUserTrades(userId) {
             return;
         }
 
-        if (user.lastDealCheck) {
-            const lastCheck = new Date(user.lastDealCheck);
-            // 60s overlap to catch deals that arrived during the previous poll window
-            const overlapped = new Date(lastCheck.getTime() - 60 * 1000);
-            // Never go earlier than today-midnight (daily reset boundary)
-            fromDate = overlapped > todayMidnight ? overlapped : todayMidnight;
-        }
+        // Always fetch the whole day. MetaAPI fills in deal history
+        // asynchronously after a (re)deploy, so a deal can show up with a
+        // timestamp older than our last check. With a sliding window
+        // (lastDealCheck minus 60s) such deals were skipped forever, which is
+        // exactly what happened to a fresh SharkFunded account: the seed ran
+        // on an empty, still-syncing history and every close before that
+        // point was lost. processedDealIds and pnlDealIds already dedupe, so
+        // re-reading earlier deals never double counts.
+        fromDate = todayMidnight;
 
         const fromTime = fromDate.toISOString();
         const toTime = now.toISOString();
@@ -1584,6 +1586,12 @@ async function checkUserTrades(userId) {
         }
 
         debugLog(`[trades] ${userId.slice(0,8)}: fetched ${deals.length} deals from ${fromTime} to ${toTime}`);
+        if (deals.length !== user.lastDealsSeen) {
+            // Production-visible, only on change, so support can see whether
+            // MetaAPI returns any history at all for a user.
+            console.log(`[trades] ${userId.slice(0,8)}: ${deals.length} deal(s) today (was ${user.lastDealsSeen ?? 'n/a'})`);
+            user.lastDealsSeen = deals.length;
+        }
         if (deals.length > 0) {
             debugLog(`[trades] ${userId.slice(0,8)}: deal types:`, deals.map(d => `${d.id} ${d.entryType} ${d.type} profit=${d.profit}`).join(' | '));
         }
