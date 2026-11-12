@@ -622,6 +622,9 @@ function friendlyMt5ConnectError(err) {
     if (errorType === 'TimeoutError') {
         return 'The connection to your broker timed out. Please try again in a moment.';
     }
+    if (code === 'E_AUTH') {
+        return 'Your broker rejected the login. Please check your MT5 account number and password (use the master password) and try again.';
+    }
     if (errorType === 'ValidationError') {
         return 'Could not verify your MT5 account details. Please double-check the server, account number and password.';
     }
@@ -657,6 +660,27 @@ async function deployMetaApiAccountWithRetry(accountId, attempts = 4, delayMs = 
             console.log(`[metaapi] Deploy not-found for ${accountId} (propagation lag), retrying in ${delayMs}ms (attempt ${i + 1}/${attempts})`);
             await new Promise(r => setTimeout(r, delayMs));
         }
+    }
+}
+
+// Pushes a new password to an existing MetaAPI account. Used when a user
+// reconnects the SAME server + login (so we reuse the account, no duplicate)
+// but the account never reached the broker: before this, the reconnect
+// ignored the password the user just typed, so a user who first entered a
+// wrong password could never fix it from the app. MetaAPI requires name,
+// server and password on PUT and a redeploy before the change takes effect.
+async function updateMetaApiAccountPassword(accountId, { name, server, password }) {
+    const response = await fetch(`${PROVISIONING_API}/users/current/accounts/${accountId}`, {
+        method: 'PUT',
+        headers: {
+            'auth-token': METAAPI_TOKEN,
+            'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({ name, server, password })
+    });
+    if (!response.ok) {
+        const err = await response.text();
+        throw new Error(`MetaApi update account failed: ${err}`);
     }
 }
 
@@ -2451,7 +2475,22 @@ async function connectMt5Locked(res, userId, server, login, password) {
             if (info) {
                 console.log(`Reusing existing MetaAPI account for user ${userId}`);
                 accountId = existingMetaApiId;
-                await deployMetaApiAccount(accountId);
+                if (info.connectionStatus === 'CONNECTED') {
+                    // Healthy account: keep the working credentials untouched.
+                    await deployMetaApiAccount(accountId);
+                } else {
+                    // Never reached the broker (or lost it): the stored password
+                    // may be the wrong one. Push the password the user just
+                    // entered, then cycle deploy so MetaAPI uses it.
+                    console.log(`[connect-mt5] ${userId.slice(0,8)}: existing account is ${info.state}/${info.connectionStatus}, updating password and redeploying`);
+                    await updateMetaApiAccountPassword(accountId, {
+                        name: info.name || `EmotionLock-${userId}`,
+                        server: info.server || server,
+                        password,
+                    });
+                    const ok = await redeployMetaApiAccount(accountId);
+                    if (!ok) throw new Error(`MetaApi redeploy after password update failed for ${accountId}`);
+                }
                 if (info.region) accountRegion = info.region;
             } else if (infoStatus !== 404) {
                 // 429/5xx: MetaAPI could not tell us whether the account still
