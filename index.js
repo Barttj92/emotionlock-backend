@@ -200,6 +200,32 @@ async function saveDailyTrades(userId, count, dateStr) {
         .eq('user_id', userId);
 }
 
+// Emergency unlocks in trade mode give one extra trade by lowering tradesCount.
+// That used to live in memory only: after a restart the old count came back
+// from Supabase (or the seed recounted every close) and the user was locked
+// again, token gone. The credits are stored with their day and subtracted from
+// the recount. Own update call, so a missing column (migration 015 not run)
+// can never break the other writes.
+async function saveUnlockCredits(userId, credits, dateStr) {
+    const { error } = await supabase
+        .from('purchases')
+        .update({ daily_unlock_credits: credits, daily_unlock_date: dateStr })
+        .eq('user_id', userId);
+    if (error) console.log(`[unlock-credits] save failed for ${String(userId).slice(0,8)}: ${error.message}`);
+}
+
+async function restoreUnlockCredits(userId, user, todayISO) {
+    const { data, error } = await supabase
+        .from('purchases')
+        .select('daily_unlock_credits, daily_unlock_date')
+        .eq('user_id', userId)
+        .maybeSingle();
+    if (error || !data) return;
+    if (data.daily_unlock_date === todayISO && Number(data.daily_unlock_credits) > 0) {
+        user.unlockCredits = Number(data.daily_unlock_credits);
+    }
+}
+
 // ── Loss-limit mode helpers ────────────────────────────────────────────────
 // Loss-mode columns are written in their OWN update calls, never merged into
 // an existing update. If migration 009 has not run yet the write simply fails
@@ -501,6 +527,9 @@ async function sendPushNotification(deviceToken, title, body, extraPayload = {})
     notification.alert = { title, body };
     notification.topic = process.env.APNS_BUNDLE_ID || 'com.emotionlock.EmotionLock';
     notification.payload = extraPayload;
+    // Lock pushes also wake the app in the background (content-available) so
+    // it can apply the Screen Time shield without the user opening it.
+    if (extraPayload && extraPayload.type === 'lock') notification.contentAvailable = true;
     try {
         const result = await apnProvider.send(notification, deviceToken);
         if (result.failed.length > 0) {
@@ -514,6 +543,42 @@ async function sendPushNotification(deviceToken, title, body, extraPayload = {})
         console.error('Push error:', err.message);
         return { ok: false, error: err.message };
     }
+}
+
+// Lock push plus bookkeeping for the reminder below. The app confirms by
+// calling /status (foreground poll or background wake). The shield is applied
+// by the app itself, so until that call we cannot assume anything is blocked.
+const LOCK_PUSH_SUFFIX = 'Open EmotionLock to make sure your trading apps are blocked.';
+const LOCK_REMINDER_DELAYS_MS = [3 * 60 * 1000, 15 * 60 * 1000];
+
+async function sendLockPush(user, body) {
+    user.lockPushAt = Date.now();
+    user.lockAckAt = null;
+    user.lockReminderCount = 0;
+    return sendPushNotification(user.deviceToken, 'EmotionLock activated', body, { type: 'lock' });
+}
+
+// At most two reminders (after 3 and 15 minutes) while the user is locked and
+// the app has not checked in since the lock push. Covers an app that was
+// swiped away, where iOS does not deliver the background wake.
+async function maybeSendLockReminder(userId, user) {
+    if (!user || !user.isLocked || !user.lockPushAt || user.lockAckAt) return;
+    const count = user.lockReminderCount || 0;
+    if (count >= LOCK_REMINDER_DELAYS_MS.length) return;
+    if (Date.now() - user.lockPushAt < LOCK_REMINDER_DELAYS_MS[count]) return;
+    user.lockReminderCount = count + 1;
+    console.log(`[lock-reminder] ${String(userId).slice(0,8)}: app has not checked in since the lock, reminder ${count + 1}/${LOCK_REMINDER_DELAYS_MS.length}`);
+    await sendPushNotification(
+        user.deviceToken,
+        'Your trading apps are not locked yet',
+        'You reached your limit today. Open EmotionLock to lock your trading apps.',
+        { type: 'lock' }
+    );
+}
+
+// True when the app polled /status in the last minute, i.e. it is open.
+function appIsPolling(user) {
+    return !!user._lastSessionMs && (Date.now() - user._lastSessionMs) < 60 * 1000;
 }
 
 // =====================
@@ -1298,6 +1363,18 @@ function getAmsterdamDateStr(date = new Date()) {
 }
 
 function initUser(userId) {
+    // The iOS app sends its UUID in upper case, Supabase stores lower case.
+    // If a state already exists under the other spelling (startup restore),
+    // move it to the spelling this caller uses instead of creating a second
+    // state, which would mean double polling and double pushes.
+    if (!userStates[userId] && typeof userId === 'string') {
+        const alt = [userId.toUpperCase(), userId.toLowerCase()].find(k => k !== userId && userStates[k]);
+        if (alt) {
+            userStates[userId] = userStates[alt];
+            userStates[userId].userId = userId;
+            delete userStates[alt];
+        }
+    }
     if (!userStates[userId]) {
         userStates[userId] = {
             userId, // lets per-user helpers (recordDailySummary) know whose state this is
@@ -1386,6 +1463,8 @@ function checkDailyReset(user, localDateStr) {
         user.tradesCount = 0;
         user.isLocked = false;
         user.emergencyUnlocked = false;
+        user.unlockCredits = 0;
+        user.lockPushAt = null;
         user.lastReset = today;
         user.processedDealIds = new Set();
         user.processedPositionIds = new Set();
@@ -1522,6 +1601,7 @@ function checkWeeklyTokenReset(user, userId) {
 async function checkUserTrades(userId) {
     const user = userStates[userId];
     if (!user) return;
+    if (user._restoring) return; // state is still loading from Supabase
     if (!user.mt5Connected) return;
     if (!user.metaApiAccountId) return;
 
@@ -1717,6 +1797,8 @@ async function checkUserTrades(userId) {
                 if (stillOpen) continue;
                 finalizeClosedPosition(user, positionId);
             }
+            // Emergency unlocks used today each bought one extra trade.
+            if (user.unlockCredits > 0) user.tradesCount = Math.max(0, user.tradesCount - user.unlockCredits);
             const seedCloseCount = user.tradesCount; // fully-closed, count-eligible positions today
             user.lastDealCheck = now.toISOString();
 
@@ -1729,10 +1811,13 @@ async function checkUserTrades(userId) {
                     user.isLocked = true;
                     user.wasLockedToday = true;
                     debugLog(`User ${userId}: trade limit reached during seed reconcile`);
-                    // Skip push from this path: the user just opened the app
-                    // (that's what triggered /status -> initUser -> first poll),
-                    // so the next /status response will surface isLocked within
-                    // seconds. No need to double-notify.
+                    // No push when the app is open: the next /status response
+                    // surfaces isLocked within seconds. Since the startup
+                    // restore a seed can also run with the app closed, and
+                    // then the push is the only signal.
+                    if (!appIsPolling(user)) {
+                        sendLockPush(user, `You've reached your limit of ${user.maxTrades} trade${user.maxTrades > 1 ? 's' : ''} today. ${LOCK_PUSH_SUFFIX}`).catch(() => {});
+                    }
                 }
             } else {
                 // Recomputed count is lower than the restored value (e.g. a
@@ -1742,9 +1827,13 @@ async function checkUserTrades(userId) {
 
             if (isLossMode(user) && !user.isLocked && !user.lossUnlockPending
                 && lossLimit.isLossLimitReached(user.dailyNetPnl, user.maxDailyLoss)) {
-                // No push, same reasoning as the trade-mode seed path above.
+                // Push only when the app is closed, same reasoning as the
+                // trade-mode seed path above.
                 user.isLocked = true;
                 user.wasLockedToday = true;
+                if (!appIsPolling(user)) {
+                    sendLockPush(user, `You've reached your daily loss limit of ${lossLimit.formatMoney(user.maxDailyLoss, user.accountCurrency)}. ${LOCK_PUSH_SUFFIX}`).catch(() => {});
+                }
                 debugLog(`User ${userId}: loss limit reached during seed reconcile`);
             }
             saveDailyPnl(userId, user).catch(() => {});
@@ -1880,10 +1969,9 @@ async function checkUserTrades(userId) {
             user.wasLockedToday = true;
             logActivity(userId, 'limit_reached', { max: user.maxTrades });
             debugLog(`User ${userId}: trade limit reached, sending push`);
-            await sendPushNotification(
-                user.deviceToken,
-                'EmotionLock activated',
-                `You've reached your limit of ${user.maxTrades} trade${user.maxTrades > 1 ? 's' : ''} today. Trading apps are now blocked.`
+            await sendLockPush(
+                user,
+                `You've reached your limit of ${user.maxTrades} trade${user.maxTrades > 1 ? 's' : ''} today. ${LOCK_PUSH_SUFFIX}`
             );
         }
 
@@ -1895,10 +1983,9 @@ async function checkUserTrades(userId) {
                 const limitText = lossLimit.formatMoney(user.maxDailyLoss, user.accountCurrency);
                 logActivity(userId, 'loss_limit_reached', { max: user.maxDailyLoss, pnl: user.dailyNetPnl, currency: user.accountCurrency });
                 console.log(`User ${userId}: loss limit reached (${user.dailyNetPnl} of -${user.maxDailyLoss}), sending push`);
-                await sendPushNotification(
-                    user.deviceToken,
-                    'EmotionLock activated',
-                    `You've reached your daily loss limit of ${limitText}. Trading apps are now blocked.`
+                await sendLockPush(
+                    user,
+                    `You've reached your daily loss limit of ${limitText}. ${LOCK_PUSH_SUFFIX}`
                 );
             }
         }
@@ -1936,6 +2023,7 @@ async function pollOneUser(userId) {
         console.error(`[poll] subscription check failed for ${userId}:`, e.message);
     }
     await checkUserTrades(userId);
+    await maybeSendLockReminder(userId, userStates[userId]).catch(() => {});
 }
 
 setInterval(async () => {
@@ -2907,6 +2995,98 @@ app.delete('/connect-mt5/:userId', async (req, res) => {
 
 // PUBLIC ROUTE: status polling — called by the iOS app every 5s. UserId is the Keychain UUID
 //               (non-guessable). Returns only non-sensitive trade state.
+// Loads a user's persisted state from Supabase into the in-memory state.
+// Used by /status on first contact and by the startup restore, so both paths
+// stay identical.
+async function restoreUserFromSupabase(userId, user, localDate) {
+    // Two separate queries so a missing column never blocks MT5 restoration.
+    const { data: purchase, error: purchaseErr } = await supabase
+        .from('purchases')
+        .select('meta_api_account_id, mt5_server, mt5_login, max_trades, emergency_tokens_remaining, count_winning_trades, first_setup_complete, last_token_reset, device_token')
+        .eq('user_id', userId)
+        .maybeSingle();
+
+    if (purchaseErr) {
+        console.error(`[status] Supabase query failed for ${userId}:`, purchaseErr.message);
+    }
+
+    // No row exists yet, but we no longer auto-create one here.
+    // /purchase is now the authoritative path that inserts a purchases
+    // row when a real Apple IAP transaction is recorded. Auto-creating
+    // from /status was abused by scanners polling random UUIDs, which
+    // polluted the purchases table with thousands of empty rows
+    // indistinguishable from real users in the Command Center.
+    // If purchase is null, the in-memory defaults from initUser stand;
+    // they will persist correctly once /purchase or /connect-mt5 runs.
+
+    // The push token used to live in memory only, so after every restart
+    // lock pushes silently failed ("No device token") until the app
+    // happened to register again.
+    if (purchase?.device_token && !user.deviceToken) user.deviceToken = purchase.device_token;
+
+    if (purchase?.emergency_tokens_remaining != null) {
+        user.emergencyTokens = purchase.emergency_tokens_remaining;
+    }
+
+    if (purchase?.meta_api_account_id) {
+        user.metaApiAccountId = purchase.meta_api_account_id;
+        if (purchase.mt5_server) {
+            user.mt5Server = purchase.mt5_server;
+            user.mt5Login = purchase.mt5_login;
+            user.mt5Connected = true;
+            // Connecting is the honest state: account is restored but
+            // we don't yet know its live MetaAPI status. First poll
+            // overwrites with the real value within 15s.
+            user.mt5SyncStatus = 'connecting';
+            user.mt5SyncStatusAt = new Date().toISOString();
+            console.log(`[status] Restored MT5 connection for ${userId}`);
+            // Only redeploy for users who still have access. This used
+            // to deploy unconditionally, so after every server restart
+            // an expired user opening the app got their account
+            // redeployed, and the cleanup sweep never undeployed it
+            // again because meta_api_undeployed_at was already stamped.
+            redeployOnRestoreIfActive(userId, purchase.meta_api_account_id);
+        }
+    }
+    if (purchase?.max_trades) user.maxTrades = purchase.max_trades;
+    // F4: Restore countWinningTrades preference from Supabase
+    if (purchase?.count_winning_trades != null) user.countWinningTrades = purchase.count_winning_trades;
+    // One-shot latch for the initial-setup loophole — survives restarts.
+    if (purchase?.first_setup_complete === true) user.firstSetupComplete = true;
+    // Restore last_token_reset so the on-activity check has the right
+    // anchor and doesn't fire a spurious extra reset after a restart.
+    if (purchase?.last_token_reset) user.lastTokenReset = purchase.last_token_reset;
+    // Loss-limit mode state (own query, tolerant of missing columns).
+    await restoreLossLimitState(userId, user, localDate || getAmsterdamDateStr());
+
+    // Restore today's trade count (separate query — daily_trades columns added later).
+    // Amsterdam fallback so the comparison against daily_trades_date is
+    // consistent with the polling loop's reset boundary.
+    const todayISO = localDate || getAmsterdamDateStr();
+    const { data: tradeData } = await supabase
+        .from('purchases')
+        .select('daily_trades_count, daily_trades_date')
+        .eq('user_id', userId)
+        .maybeSingle();
+
+    await restoreUnlockCredits(userId, user, todayISO);
+
+    if (tradeData?.daily_trades_date === todayISO && tradeData?.daily_trades_count > 0) {
+        user.tradesCount = tradeData.daily_trades_count;
+        user.lastReset = todayISO;
+        if (!isLossMode(user) && user.tradesCount >= user.maxTrades) {
+            user.isLocked = true;
+            user.wasLockedToday = true;
+        }
+        console.log(`[status] Restored ${tradeData.daily_trades_count} trades for ${userId} (date: ${todayISO})`);
+    }
+    if (isLossMode(user) && !user.lossUnlockPending
+        && lossLimit.isLossLimitReached(user.dailyNetPnl, user.maxDailyLoss)) {
+        user.isLocked = true;
+        user.wasLockedToday = true;
+    }
+}
+
 app.get('/status/:userId', statusLimiter, async (req, res) => {
     // Live poll endpoint (iOS hits this every 5s) — never let a client, proxy
     // or CDN cache a response here. No Cache-Control was set before, which
@@ -2917,7 +3097,10 @@ app.get('/status/:userId', statusLimiter, async (req, res) => {
     try {
         const { userId } = req.params;
         const localDate = req.headers['x-local-date'] || null;
-        const isNewUser = !userStates[userId];
+        // "New" means no state under any spelling: initUser adopts a state
+        // that the startup restore stored in upper case.
+        const isNewUser = !userStates[userId]
+            && !(typeof userId === 'string' && (userStates[userId.toUpperCase()] || userStates[userId.toLowerCase()]));
         initUser(userId);
         const user = userStates[userId];
         checkDailyReset(user, localDate);
@@ -2926,7 +3109,13 @@ app.get('/status/:userId', statusLimiter, async (req, res) => {
         // /status wordt elke 5s gepolld, dus we schrijven last_seen hooguit eens
         // per 5 min, en tellen een nieuwe sessie (app-open) pas na een gat van
         // 30 min zonder polls. UUID-guard houdt scanner-probes uit de log.
-        if (UUID_V4_RE.test(userId)) {
+        // Any /status call after a lock push means the app is running and will
+        // apply the shield itself.
+        if (user.lockPushAt && !user.lockAckAt) user.lockAckAt = Date.now();
+        // A background wake from a lock push is not a user session: keep it
+        // out of last_seen and the app_active log.
+        const isBackgroundWake = req.headers['x-background-fetch'] === '1';
+        if (UUID_V4_RE.test(userId) && !isBackgroundWake) {
             const _nowMs = Date.now();
             if (!user._lastSeenPersistMs || _nowMs - user._lastSeenPersistMs > 5 * 60 * 1000) {
                 user._lastSeenPersistMs = _nowMs;
@@ -2942,91 +3131,18 @@ app.get('/status/:userId', statusLimiter, async (req, res) => {
         // checkWeeklyTokenReset runs AFTER this block so it sees the correct
         // persisted token count, not the default value from initUser.
         if (isNewUser) {
-            // Two separate queries so a missing column never blocks MT5 restoration.
-            const { data: purchase, error: purchaseErr } = await supabase
-                .from('purchases')
-                .select('meta_api_account_id, mt5_server, mt5_login, max_trades, emergency_tokens_remaining, count_winning_trades, first_setup_complete, last_token_reset')
-                .eq('user_id', userId)
-                .maybeSingle();
-
-            if (purchaseErr) {
-                console.error(`[status] Supabase query failed for ${userId}:`, purchaseErr.message);
-            }
-
-            // Reject obviously malformed userIds before any work, even when we
-            // are only reading. This keeps the rate limiter accounting honest
-            // and avoids hitting Supabase for every scanner probe.
+            // Reject obviously malformed userIds before any work. This keeps
+            // the rate limiter accounting honest and avoids hitting Supabase
+            // for every scanner probe.
             if (!UUID_V4_RE.test(userId)) {
                 return res.status(400).json({ error: 'Invalid userId format.' });
             }
-            // No row exists yet, but we no longer auto-create one here.
-            // /purchase is now the authoritative path that inserts a purchases
-            // row when a real Apple IAP transaction is recorded. Auto-creating
-            // from /status was abused by scanners polling random UUIDs, which
-            // polluted the purchases table with thousands of empty rows
-            // indistinguishable from real users in the Command Center.
-            // If purchase is null, the in-memory defaults from initUser stand;
-            // they will persist correctly once /purchase or /connect-mt5 runs.
-
-            if (purchase?.emergency_tokens_remaining != null) {
-                user.emergencyTokens = purchase.emergency_tokens_remaining;
-            }
-
-            if (purchase?.meta_api_account_id) {
-                user.metaApiAccountId = purchase.meta_api_account_id;
-                if (purchase.mt5_server) {
-                    user.mt5Server = purchase.mt5_server;
-                    user.mt5Login = purchase.mt5_login;
-                    user.mt5Connected = true;
-                    // Connecting is the honest state: account is restored but
-                    // we don't yet know its live MetaAPI status. First poll
-                    // overwrites with the real value within 15s.
-                    user.mt5SyncStatus = 'connecting';
-                    user.mt5SyncStatusAt = new Date().toISOString();
-                    console.log(`[status] Restored MT5 connection for ${userId}`);
-                    // Only redeploy for users who still have access. This used
-                    // to deploy unconditionally, so after every server restart
-                    // an expired user opening the app got their account
-                    // redeployed, and the cleanup sweep never undeployed it
-                    // again because meta_api_undeployed_at was already stamped.
-                    redeployOnRestoreIfActive(userId, purchase.meta_api_account_id);
-                }
-            }
-            if (purchase?.max_trades) user.maxTrades = purchase.max_trades;
-            // F4: Restore countWinningTrades preference from Supabase
-            if (purchase?.count_winning_trades != null) user.countWinningTrades = purchase.count_winning_trades;
-            // One-shot latch for the initial-setup loophole — survives restarts.
-            if (purchase?.first_setup_complete === true) user.firstSetupComplete = true;
-            // Restore last_token_reset so the on-activity check has the right
-            // anchor and doesn't fire a spurious extra reset after a restart.
-            if (purchase?.last_token_reset) user.lastTokenReset = purchase.last_token_reset;
-            // Loss-limit mode state (own query, tolerant of missing columns).
-            await restoreLossLimitState(userId, user, localDate || getAmsterdamDateStr());
-
-            // Restore today's trade count (separate query — daily_trades columns added later).
-            // Amsterdam fallback so the comparison against daily_trades_date is
-            // consistent with the polling loop's reset boundary.
-            const todayISO = localDate || getAmsterdamDateStr();
-            const { data: tradeData } = await supabase
-                .from('purchases')
-                .select('daily_trades_count, daily_trades_date')
-                .eq('user_id', userId)
-                .maybeSingle();
-
-            if (tradeData?.daily_trades_date === todayISO && tradeData?.daily_trades_count > 0) {
-                user.tradesCount = tradeData.daily_trades_count;
-                user.lastReset = todayISO;
-                if (!isLossMode(user) && user.tradesCount >= user.maxTrades) {
-                    user.isLocked = true;
-                    user.wasLockedToday = true;
-                }
-                console.log(`[status] Restored ${tradeData.daily_trades_count} trades for ${userId} (date: ${todayISO})`);
-            }
-            if (isLossMode(user) && !user.lossUnlockPending
-                && lossLimit.isLossLimitReached(user.dailyNetPnl, user.maxDailyLoss)) {
-                user.isLocked = true;
-                user.wasLockedToday = true;
-            }
+            user._restoring = restoreUserFromSupabase(userId, user, localDate);
+            try { await user._restoring; } finally { user._restoring = null; }
+        } else if (user._restoring) {
+            // Startup restore is still loading this user: wait, so the app
+            // never sees factory defaults.
+            await user._restoring.catch(() => {});
         }
 
         // Run weekly reset after Supabase restore so we compare against the real
@@ -3431,6 +3547,10 @@ app.post('/unlock/:userId', unlockLimiter, async (req, res) => {
             saveDailyPnl(userId, user).catch(() => {});
         } else {
             user.tradesCount = Math.max(0, user.tradesCount - 1);
+            user.unlockCredits = (user.unlockCredits || 0) + 1;
+            // Persist both, so a restart does not bring the lock back.
+            saveDailyTrades(userId, user.tradesCount, user.lastReset).catch(() => {});
+            saveUnlockCredits(userId, user.unlockCredits, user.lastReset).catch(() => {});
         }
         user.isLocked = false;
         user.emergencyTokens -= 1;
@@ -5170,8 +5290,58 @@ app.delete('/delete-account/:userId', deleteAccountLimiter, async (req, res) => 
 });
 
 const PORT = process.env.PORT || 3000;
+// After a restart the trade poller only knew users whose app had called
+// /status since. A user who traded with the app closed was not tracked and got
+// no lock push until he opened the app. Restore recently active users with a
+// connected, deployed MT5 account right away. Keys use upper case, the spelling
+// the iOS app sends (initUser adopts the state if a caller spells it otherwise).
+const STARTUP_RESTORE_DAYS = 7;
+const STARTUP_RESTORE_MAX = 300;
+
+async function restoreActiveUsersOnStartup() {
+    try {
+        const since = new Date(Date.now() - STARTUP_RESTORE_DAYS * 24 * 3600 * 1000).toISOString();
+        const { data: rows, error } = await supabase
+            .from('purchases')
+            .select('user_id')
+            .not('meta_api_account_id', 'is', null)
+            .not('mt5_server', 'is', null)
+            .is('meta_api_undeployed_at', null)
+            .gte('last_seen_at', since)
+            .order('last_seen_at', { ascending: false })
+            .limit(STARTUP_RESTORE_MAX);
+        if (error) {
+            console.error('[startup-restore] Supabase query failed:', error.message);
+            return;
+        }
+        let restored = 0;
+        for (const row of (rows ?? [])) {
+            const userId = String(row.user_id || '').toUpperCase();
+            if (!UUID_V4_RE.test(userId)) continue;
+            if (userStates[userId] || userStates[userId.toLowerCase()]) continue; // app got there first
+            try {
+                if (!(await isSubscriptionActive(userId))) continue;
+                if (userStates[userId] || userStates[userId.toLowerCase()]) continue;
+                initUser(userId);
+                const restoredUser = userStates[userId];
+                restoredUser._restoring = restoreUserFromSupabase(userId, restoredUser, null);
+                try { await restoredUser._restoring; } finally { restoredUser._restoring = null; }
+                restored++;
+            } catch (e) {
+                console.error(`[startup-restore] ${userId.slice(0,8)} failed:`, e.message);
+            }
+            // Spread the MetaAPI deploy calls that a restore triggers.
+            await new Promise(r => setTimeout(r, 500));
+        }
+        console.log(`[startup-restore] restored ${restored} of ${(rows ?? []).length} recently active user(s)`);
+    } catch (e) {
+        console.error('[startup-restore] failed:', e.message);
+    }
+}
+
 app.listen(PORT, () => {
     console.log(`EmotionLock backend running on port ${PORT}`);
+    restoreActiveUsersOnStartup();
 });
 
 // =====================
