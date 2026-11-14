@@ -972,6 +972,60 @@ async function getDeals(accountId, region, fromTime, toTime) {
     }
 }
 
+// Clock skew between MetaAPI's "UTC" deal timestamps and real UTC.
+// Seen on SharkFunded-live (Nov 2026): MetaAPI stamped deals about 11 to 13
+// hours in the past, so a trade made at 02:22 UTC landed before Amsterdam
+// midnight and fell outside our "today" fetch window. Nothing was counted and
+// the user was never locked. We measure the skew from MetaAPI's own
+// server-time (same conversion as the deals) and shift the fetch window by it.
+// Cached per user for 10 minutes. Small skews (under 30 min) are ignored.
+const TIME_SKEW_TTL_MS = 10 * 60 * 1000;
+const TIME_SKEW_MIN_MS = 30 * 60 * 1000;
+
+async function getServerTime(accountId, region) {
+    const url = `https://mt-client-api-v1.${region}.agiliumtrade.ai/users/current/accounts/${accountId}/server-time`;
+    try {
+        const response = await fetch(url, { headers: { 'auth-token': METAAPI_TOKEN } });
+        if (!response.ok) return null;
+        const data = await response.json();
+        return data && data.time ? data : null;
+    } catch {
+        return null;
+    }
+}
+
+async function getMetaTimeSkewMs(userId, user) {
+    if (user.timeSkewCheckedAt && (Date.now() - user.timeSkewCheckedAt) < TIME_SKEW_TTL_MS) {
+        return user.timeSkewMs || 0;
+    }
+    const st = await getServerTime(user.metaApiAccountId, user.mt5Region);
+    if (!st) return user.timeSkewMs || 0; // keep last known value, retry next poll
+    user.timeSkewCheckedAt = Date.now();
+    const raw = Date.now() - new Date(st.time).getTime();
+    // Round to 15 minutes: real broker offsets are whole or quarter hours,
+    // and this keeps network latency from moving the window around.
+    const QUARTER = 15 * 60 * 1000;
+    const skew = Math.abs(raw) < TIME_SKEW_MIN_MS ? 0 : Math.round(raw / QUARTER) * QUARTER;
+    if (skew !== (user.timeSkewMs || 0)) {
+        console.log(`[time-skew] ${userId.slice(0,8)}: MetaAPI time=${st.time} brokerTime=${st.brokerTime} now=${new Date().toISOString()} skew=${(skew / 3600000).toFixed(2)}h (was ${((user.timeSkewMs || 0) / 3600000).toFixed(2)}h)`);
+        if (skew !== 0) {
+            notifyAdmin({
+                subject: `[EmotionLock] MetaAPI clock skew ${(skew / 3600000).toFixed(2)}h for user ${userId.slice(0,8)}`,
+                lines: [
+                    `User: ${userId}`,
+                    `Server: ${user.mt5Server}`,
+                    `MetaAPI server-time: ${st.time} (broker ${st.brokerTime})`,
+                    `Real now: ${new Date().toISOString()}`,
+                    `The trade poller now shifts its fetch window by this skew.`,
+                    `Time (Europe/Amsterdam): ${adminNotifyTimestamp()}`,
+                ],
+            }).catch(() => {});
+        }
+    }
+    user.timeSkewMs = skew;
+    return skew;
+}
+
 // Fetch the account's currently OPEN positions. Used to decide whether a
 // position is fully closed: if a positionId that had a close deal no longer
 // appears here, the whole position is closed (so the trade can be counted).
@@ -1492,7 +1546,8 @@ async function checkUserTrades(userId) {
             //    added to processedDealIds and silently swallowed.
             //    Fix: count valid closes in the seed and bump tradesCount
             //    to max(tradesCount, seedCloseCount). Never decrement.
-            const seedDeals = await getDeals(user.metaApiAccountId, user.mt5Region, todayMidnight.toISOString(), now.toISOString());
+            const seedSkew = await getMetaTimeSkewMs(userId, user);
+            const seedDeals = await getDeals(user.metaApiAccountId, user.mt5Region, new Date(todayMidnight.getTime() - seedSkew).toISOString(), (seedSkew ? new Date(now.getTime() - seedSkew + 5 * 60 * 1000) : now).toISOString());
             if (seedDeals === null) {
                 console.log(`[trades] ${userId.slice(0,8)}: seed fetch failed (account not ready yet?), retrying next poll`);
                 return;
@@ -1576,8 +1631,11 @@ async function checkUserTrades(userId) {
         // re-reading earlier deals never double counts.
         fromDate = todayMidnight;
 
-        const fromTime = fromDate.toISOString();
-        const toTime = now.toISOString();
+        // Shift the window into MetaAPI's clock when its timestamps are skewed
+        // (see getMetaTimeSkewMs). skew is 0 for every normal account.
+        const skew = await getMetaTimeSkewMs(userId, user);
+        const fromTime = new Date(fromDate.getTime() - skew).toISOString();
+        const toTime = (skew ? new Date(now.getTime() - skew + 5 * 60 * 1000) : now).toISOString();
 
         const deals = await getDeals(user.metaApiAccountId, user.mt5Region, fromTime, toTime);
         if (deals === null) {
