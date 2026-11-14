@@ -994,6 +994,28 @@ async function getServerTime(accountId, region) {
     }
 }
 
+// One-time (per user, per process) production log of how MetaAPI stamps time
+// for this account: its server-time, and the newest deals of the last 4 days
+// with both their "UTC" time and the broker wall-clock time. Read-only, no
+// effect on counting. Lets support verify clock skew per broker from the logs.
+async function logTimeDiagnostics(userId, user) {
+    if (user.timeDiagLogged) return;
+    user.timeDiagLogged = true;
+    try {
+        const nowMs = Date.now();
+        const st = await getServerTime(user.metaApiAccountId, user.mt5Region);
+        const from = new Date(nowMs - 4 * 24 * 3600 * 1000).toISOString();
+        const to = new Date(nowMs + 24 * 3600 * 1000).toISOString();
+        const deals = await getDeals(user.metaApiAccountId, user.mt5Region, from, to);
+        const list = Array.isArray(deals) ? deals : [];
+        const future = list.filter(d => d.time && new Date(d.time).getTime() > nowMs).length;
+        const last = list.slice(-3).map(d => `${d.id}:${d.entryType}:time=${d.time}:broker=${d.brokerTime}`).join(' | ');
+        console.log(`[time-diag] ${userId.slice(0,8)} server=${user.mt5Server} now=${new Date(nowMs).toISOString()} serverTime=${st ? `${st.time}/broker=${st.brokerTime}` : 'unavailable'} deals4d=${deals === null ? 'fetch-failed' : list.length} future=${future} last=[${last}]`);
+    } catch (e) {
+        console.log(`[time-diag] ${userId.slice(0,8)} failed: ${e.message}`);
+    }
+}
+
 async function getMetaTimeSkewMs(userId, user) {
     if (user.timeSkewCheckedAt && (Date.now() - user.timeSkewCheckedAt) < TIME_SKEW_TTL_MS) {
         return user.timeSkewMs || 0;
@@ -1546,6 +1568,7 @@ async function checkUserTrades(userId) {
             //    added to processedDealIds and silently swallowed.
             //    Fix: count valid closes in the seed and bump tradesCount
             //    to max(tradesCount, seedCloseCount). Never decrement.
+            logTimeDiagnostics(userId, user).catch(() => {});
             const seedSkew = await getMetaTimeSkewMs(userId, user);
             const seedDeals = await getDeals(user.metaApiAccountId, user.mt5Region, new Date(todayMidnight.getTime() - seedSkew).toISOString(), (seedSkew ? new Date(now.getTime() - seedSkew + 5 * 60 * 1000) : now).toISOString());
             if (seedDeals === null) {
