@@ -953,7 +953,8 @@ async function getDeals(accountId, region, fromTime, toTime) {
     const url = `https://mt-client-api-v1.${region}.agiliumtrade.ai/users/current/accounts/${accountId}/history-deals/time/${fromTime}/${toTime}`;
     try {
         const response = await fetch(url, {
-            headers: { 'auth-token': METAAPI_TOKEN }
+            headers: { 'auth-token': METAAPI_TOKEN },
+            signal: AbortSignal.timeout(45000)
         });
         if (!response.ok) {
             const errText = await response.text();
@@ -985,7 +986,7 @@ const TIME_SKEW_MIN_MS = 30 * 60 * 1000;
 async function getServerTime(accountId, region) {
     const url = `https://mt-client-api-v1.${region}.agiliumtrade.ai/users/current/accounts/${accountId}/server-time`;
     try {
-        const response = await fetch(url, { headers: { 'auth-token': METAAPI_TOKEN } });
+        const response = await fetch(url, { headers: { 'auth-token': METAAPI_TOKEN }, signal: AbortSignal.timeout(20000) });
         if (!response.ok) return null;
         const data = await response.json();
         return data && data.time ? data : null;
@@ -1016,29 +1017,65 @@ async function logTimeDiagnostics(userId, user) {
     }
 }
 
+// MetaAPI converts broker wall-clock time to "UTC" with an offset it detects
+// per broker. server-time exposes that offset (brokerTime minus time). Real MT5
+// brokers run between UTC and UTC+3. On SharkFunded-live MetaAPI assumed +14h
+// while the broker really runs at +2h, so every deal was stamped 12 hours
+// early. When the assumed offset is implausible and exactly 12h away from a
+// plausible one, we treat it as that 12h mix-up and correct for it.
+// Returns the number of ms to ADD to a MetaAPI deal time to get real UTC
+// (0 for every normal account), or null when it could not be measured yet.
+function parseBrokerWallClock(str) {
+    if (typeof str !== 'string') return NaN;
+    return Date.parse(str.trim().replace(' ', 'T') + 'Z');
+}
+
 async function getMetaTimeSkewMs(userId, user) {
+    // A skew learned from a live trade (see selectTodayDeals) wins until the
+    // user switches account or the server restarts.
+    if (user.timeSkewLearnedFor && user.timeSkewLearnedFor === user.metaApiAccountId) {
+        return user.timeSkewMs || 0;
+    }
     if (user.timeSkewCheckedAt && (Date.now() - user.timeSkewCheckedAt) < TIME_SKEW_TTL_MS) {
         return user.timeSkewMs || 0;
     }
     const st = await getServerTime(user.metaApiAccountId, user.mt5Region);
-    if (!st) return user.timeSkewMs || 0; // keep last known value, retry next poll
-    user.timeSkewCheckedAt = Date.now();
-    const raw = Date.now() - new Date(st.time).getTime();
-    // Round to 15 minutes: real broker offsets are whole or quarter hours,
-    // and this keeps network latency from moving the window around.
+    if (!st) return user.timeSkewMs ?? null; // keep last known value, retry next poll
+    const HOUR = 3600000;
     const QUARTER = 15 * 60 * 1000;
-    const skew = Math.abs(raw) < TIME_SKEW_MIN_MS ? 0 : Math.round(raw / QUARTER) * QUARTER;
+    const round15 = (ms) => Math.round(ms / QUARTER) * QUARTER;
+    const metaNow = new Date(st.time).getTime();
+    if (!Number.isFinite(metaNow)) return user.timeSkewMs ?? null;
+    user.timeSkewCheckedAt = Date.now();
+
+    // Part 1: MetaAPI's own clock versus ours (normally 0).
+    const clockRaw = Date.now() - metaNow;
+    let skew = Math.abs(clockRaw) < TIME_SKEW_MIN_MS ? 0 : round15(clockRaw);
+
+    // Part 2: implausible broker offset that is a 12h mix-up.
+    const brokerNow = parseBrokerWallClock(st.brokerTime);
+    let assumed = null;
+    if (Number.isFinite(brokerNow)) {
+        assumed = round15(brokerNow - metaNow);
+        if (assumed > 4 * HOUR || assumed < -1 * HOUR) {
+            const candidate = [assumed - 12 * HOUR, assumed + 12 * HOUR].find(c => c >= 0 && c <= 3 * HOUR);
+            if (candidate !== undefined) skew += assumed - candidate;
+        }
+    }
+
     if (skew !== (user.timeSkewMs || 0)) {
-        console.log(`[time-skew] ${userId.slice(0,8)}: MetaAPI time=${st.time} brokerTime=${st.brokerTime} now=${new Date().toISOString()} skew=${(skew / 3600000).toFixed(2)}h (was ${((user.timeSkewMs || 0) / 3600000).toFixed(2)}h)`);
+        const h = (ms) => (ms / HOUR).toFixed(2);
+        console.log(`[time-skew] ${userId.slice(0,8)}: server=${user.mt5Server} MetaAPI time=${st.time} brokerTime=${st.brokerTime} assumedOffset=${assumed === null ? 'n/a' : h(assumed) + 'h'} now=${new Date().toISOString()} skew=${h(skew)}h (was ${h(user.timeSkewMs || 0)}h)`);
         if (skew !== 0) {
             notifyAdmin({
-                subject: `[EmotionLock] MetaAPI clock skew ${(skew / 3600000).toFixed(2)}h for user ${userId.slice(0,8)}`,
+                subject: `[EmotionLock] MetaAPI time offset corrected (${h(skew)}h) for user ${userId.slice(0,8)}`,
                 lines: [
                     `User: ${userId}`,
                     `Server: ${user.mt5Server}`,
                     `MetaAPI server-time: ${st.time} (broker ${st.brokerTime})`,
+                    `MetaAPI assumed broker offset: ${assumed === null ? 'n/a' : h(assumed) + 'h'}`,
                     `Real now: ${new Date().toISOString()}`,
-                    `The trade poller now shifts its fetch window by this skew.`,
+                    `The trade poller shifts its day window by ${h(skew)}h for this account.`,
                     `Time (Europe/Amsterdam): ${adminNotifyTimestamp()}`,
                 ],
             }).catch(() => {});
@@ -1046,6 +1083,67 @@ async function getMetaTimeSkewMs(userId, user) {
     }
     user.timeSkewMs = skew;
     return skew;
+}
+
+// Picks today's deals out of a wide fetch (the day window plus 14h on both
+// sides). Normal case: a deal is today's when its (skew-corrected) time falls
+// inside the day window. Safety net for brokers whose timestamps are off in a
+// way we do not know yet: while we are polling continuously, a close deal with
+// a ticket number higher than anything seen before can only have happened
+// since the previous poll. If its timestamp still falls outside the window,
+// the timestamp is wrong, not the trade: count it, learn the offset from it
+// and mail the admin. Never fires on the first poll, after a gap or after an
+// account switch, so late-synced old history cannot be mistaken for a trade.
+const DEAL_WINDOW_MARGIN_MS = 14 * 3600000;
+const DEAL_CONTINUOUS_MS = 2 * 60 * 1000;
+
+function selectTodayDeals(userId, user, wideDeals, fromMs, toMs) {
+    const nowMs = Date.now();
+    const base = (user.dealBaseline && user.dealBaseline.accountId === user.metaApiAccountId) ? user.dealBaseline : null;
+    const continuous = !!base && (nowMs - base.at) < DEAL_CONTINUOUS_MS;
+    const prevMax = base ? base.maxId : -1;
+    let maxId = prevMax;
+    const today = [];
+    for (const d of wideDeals) {
+        if (!d) continue;
+        const t = new Date(d.time).getTime();
+        const idNum = Number(d.id);
+        if (Number.isFinite(idNum) && idNum > maxId) maxId = idNum;
+        if (Number.isFinite(t) && t >= fromMs && t <= toMs) {
+            today.push(d);
+            continue;
+        }
+        const isClose = d.entryType === 'DEAL_ENTRY_OUT' || d.entryType === 'DEAL_ENTRY_INOUT';
+        if (continuous && isClose && d.type !== 'DEAL_TYPE_BALANCE'
+            && Number.isFinite(idNum) && idNum > prevMax && Number.isFinite(t)
+            // Only when the corrected timestamp is really off. A trade closed
+            // seconds before midnight and first seen just after it belongs to
+            // yesterday and must not be counted today.
+            && Math.abs(nowMs - (t + (user.timeSkewMs || 0))) >= TIME_SKEW_MIN_MS
+            && !user.processedDealIds.has(d.id)) {
+            today.push(d);
+            const QUARTER = 15 * 60 * 1000;
+            const learned = Math.round((nowMs - t) / QUARTER) * QUARTER;
+            const before = user.timeSkewMs || 0;
+            user.timeSkewMs = learned;
+            user.timeSkewLearnedFor = user.metaApiAccountId;
+            console.log(`[time-anomaly] ${userId.slice(0,8)}: new close deal ${d.id} stamped ${d.time} (broker ${d.brokerTime}) while now=${new Date(nowMs).toISOString()}. Counted as today, skew ${(before / 3600000).toFixed(2)}h -> ${(learned / 3600000).toFixed(2)}h`);
+            notifyAdmin({
+                subject: `[EmotionLock] Trade with wrong timestamp counted for user ${userId.slice(0,8)}`,
+                lines: [
+                    `User: ${userId}`,
+                    `Server: ${user.mt5Server}`,
+                    `Deal ${d.id} (${d.symbol || '?'}) stamped ${d.time}, broker time ${d.brokerTime}`,
+                    `Seen at: ${new Date(nowMs).toISOString()}`,
+                    `It is a new ticket seen during continuous polling, so it was counted as today's trade.`,
+                    `Learned time offset: ${(learned / 3600000).toFixed(2)}h (was ${(before / 3600000).toFixed(2)}h).`,
+                    `Time (Europe/Amsterdam): ${adminNotifyTimestamp()}`,
+                ],
+            }).catch(() => {});
+        }
+    }
+    user.dealBaseline = { accountId: user.metaApiAccountId, maxId, at: nowMs };
+    return today;
 }
 
 // Fetch the account's currently OPEN positions. Used to decide whether a
@@ -1058,7 +1156,8 @@ async function getOpenPositions(accountId, region) {
     const url = `https://mt-client-api-v1.${region}.agiliumtrade.ai/users/current/accounts/${accountId}/positions`;
     try {
         const response = await fetch(url, {
-            headers: { 'auth-token': METAAPI_TOKEN }
+            headers: { 'auth-token': METAAPI_TOKEN },
+            signal: AbortSignal.timeout(45000)
         });
         if (!response.ok) {
             const errText = await response.text();
@@ -1569,7 +1668,18 @@ async function checkUserTrades(userId) {
             //    Fix: count valid closes in the seed and bump tradesCount
             //    to max(tradesCount, seedCloseCount). Never decrement.
             logTimeDiagnostics(userId, user).catch(() => {});
-            const seedSkew = await getMetaTimeSkewMs(userId, user);
+            const seedSkewRaw = await getMetaTimeSkewMs(userId, user);
+            if (seedSkewRaw === null) {
+                // Without the offset the seed could classify yesterday's deals
+                // as today's. Retry a few polls before falling back to 0.
+                user.skewSeedRetries = (user.skewSeedRetries || 0) + 1;
+                if (user.skewSeedRetries <= 5) {
+                    console.log(`[trades] ${userId.slice(0,8)}: time offset not available yet, seed postponed (attempt ${user.skewSeedRetries}/5)`);
+                    return;
+                }
+            }
+            user.skewSeedRetries = 0;
+            const seedSkew = seedSkewRaw ?? 0;
             const seedDeals = await getDeals(user.metaApiAccountId, user.mt5Region, new Date(todayMidnight.getTime() - seedSkew).toISOString(), (seedSkew ? new Date(now.getTime() - seedSkew + 5 * 60 * 1000) : now).toISOString());
             if (seedDeals === null) {
                 console.log(`[trades] ${userId.slice(0,8)}: seed fetch failed (account not ready yet?), retrying next poll`);
@@ -1656,15 +1766,24 @@ async function checkUserTrades(userId) {
 
         // Shift the window into MetaAPI's clock when its timestamps are skewed
         // (see getMetaTimeSkewMs). skew is 0 for every normal account.
-        const skew = await getMetaTimeSkewMs(userId, user);
-        const fromTime = new Date(fromDate.getTime() - skew).toISOString();
-        const toTime = (skew ? new Date(now.getTime() - skew + 5 * 60 * 1000) : now).toISOString();
+        const skew = (await getMetaTimeSkewMs(userId, user)) ?? 0;
+        const fromMs = fromDate.getTime() - skew;
+        const toMs = now.getTime() - skew + 5 * 60 * 1000;
+        const fromTime = new Date(fromMs).toISOString();
+        const toTime = new Date(toMs).toISOString();
 
-        const deals = await getDeals(user.metaApiAccountId, user.mt5Region, fromTime, toTime);
-        if (deals === null) {
+        // Fetch wider than the day window so a deal with a wrong timestamp is
+        // still seen (selectTodayDeals decides what belongs to today).
+        const wideDeals = await getDeals(
+            user.metaApiAccountId, user.mt5Region,
+            new Date(fromMs - DEAL_WINDOW_MARGIN_MS).toISOString(),
+            new Date(toMs + DEAL_WINDOW_MARGIN_MS).toISOString()
+        );
+        if (wideDeals === null) {
             // Keep lastDealCheck where it is so this window is fetched again.
             return;
         }
+        const deals = selectTodayDeals(userId, user, wideDeals, fromMs, toMs);
 
         debugLog(`[trades] ${userId.slice(0,8)}: fetched ${deals.length} deals from ${fromTime} to ${toTime}`);
         if (deals.length !== user.lastDealsSeen) {
@@ -1800,17 +1919,46 @@ async function checkUserTrades(userId) {
 // MetaAPI account itself isn't undeployed yet — that happens in the periodic
 // cleanup job after the 48h grace — but there is no point polling deals for
 // a paywalled user who can't see them anyway.
+// Users are checked by a small pool of workers instead of one after another:
+// a single slow account (MetaAPI 504s can take a minute) used to delay every
+// user behind it, so a lock could arrive minutes late. A cycle never overlaps
+// the previous one, so the same user is never checked twice at the same time.
+const POLL_CONCURRENCY = 4;
+let pollCycleRunning = false;
+
+async function pollOneUser(userId) {
+    try {
+        const active = await isSubscriptionActive(userId);
+        if (!active) return;
+    } catch (e) {
+        // Fail open: a Supabase hiccup must never starve a paying user
+        // of trade tracking. Log and keep polling for this cycle.
+        console.error(`[poll] subscription check failed for ${userId}:`, e.message);
+    }
+    await checkUserTrades(userId);
+}
+
 setInterval(async () => {
-    for (const userId of Object.keys(userStates)) {
-        try {
-            const active = await isSubscriptionActive(userId);
-            if (!active) continue;
-        } catch (e) {
-            // Fail open: a Supabase hiccup must never starve a paying user
-            // of trade tracking. Log and keep polling for this cycle.
-            console.error(`[poll] subscription check failed for ${userId}:`, e.message);
-        }
-        await checkUserTrades(userId);
+    if (pollCycleRunning) return;
+    pollCycleRunning = true;
+    const startedAt = Date.now();
+    try {
+        const queue = Object.keys(userStates);
+        const worker = async () => {
+            while (queue.length > 0) {
+                const userId = queue.shift();
+                try {
+                    await pollOneUser(userId);
+                } catch (e) {
+                    console.error(`[poll] ${String(userId).slice(0,8)} failed:`, e.message);
+                }
+            }
+        };
+        await Promise.all(Array.from({ length: POLL_CONCURRENCY }, worker));
+    } finally {
+        pollCycleRunning = false;
+        const tookMs = Date.now() - startedAt;
+        if (tookMs > 60000) console.log(`[poll] slow cycle: ${Math.round(tookMs / 1000)}s`);
     }
 }, 15000);
 
