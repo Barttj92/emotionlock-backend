@@ -1136,7 +1136,9 @@ async function getMetaTimeSkewMs(userId, user) {
         const h = (ms) => (ms / HOUR).toFixed(2);
         console.log(`[time-skew] ${userId.slice(0,8)}: server=${user.mt5Server} MetaAPI time=${st.time} brokerTime=${st.brokerTime} assumedOffset=${assumed === null ? 'n/a' : h(assumed) + 'h'} now=${new Date().toISOString()} skew=${h(skew)}h (was ${h(user.timeSkewMs || 0)}h)`);
         if (skew !== 0) {
-            notifyAdmin({
+            // The skew lives in memory only, so it is measured again after
+            // every restart. Mail once per user and offset, not per restart.
+            notifyAdminOnce({
                 subject: `[EmotionLock] MetaAPI time offset corrected (${h(skew)}h) for user ${userId.slice(0,8)}`,
                 lines: [
                     `User: ${userId}`,
@@ -5452,6 +5454,30 @@ async function notifyAdmin({ subject, lines }) {
     } catch (err) {
         console.error('[notify] Error sending admin notification:', err?.message ?? err);
     }
+}
+
+// Same as notifyAdmin, but skips the mail when one with exactly this subject
+// was already sent (looked up in `email_sends`, so it survives restarts).
+// Put everything that should trigger a new mail in the subject. When the
+// lookup fails the mail is sent anyway: a duplicate beats a missed alert.
+async function notifyAdminOnce({ subject, lines }) {
+    try {
+        const { data, error } = await supabase
+            .from('email_sends')
+            .select('id')
+            .eq('template_key', 'admin_notify')
+            .eq('subject', subject)
+            .eq('status', 'sent')
+            .limit(1);
+        if (!error && Array.isArray(data) && data.length > 0) {
+            console.log('[notify] already sent earlier, skipped:', subject);
+            return;
+        }
+        if (error) console.warn('[notify] dedupe lookup failed, sending anyway:', error.message);
+    } catch (err) {
+        console.warn('[notify] dedupe lookup error, sending anyway:', err?.message ?? err);
+    }
+    return notifyAdmin({ subject, lines });
 }
 
 // Startup self-test: confirms send-email accepts this backend's key without
