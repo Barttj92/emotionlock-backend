@@ -830,8 +830,12 @@ async function getMetaApiAccountInfo(accountId) {
 // account is really gone from MetaAPI, anything else (5xx, timeout) may be
 // transient. The trade poller needs that difference.
 async function fetchMetaApiAccountInfo(accountId) {
+    // Bounded: a hanging lookup used to hold up a whole poll cycle for two
+    // minutes. A timeout throws, which both callers treat as "unknown, try
+    // again" (the poller) or a failed connect attempt (never a new account).
     const response = await fetch(`${PROVISIONING_API}/users/current/accounts/${accountId}`, {
-        headers: { 'auth-token': METAAPI_TOKEN }
+        headers: { 'auth-token': METAAPI_TOKEN },
+        signal: AbortSignal.timeout(30000)
     });
     if (!response.ok) {
         const errText = await response.text();
@@ -1716,12 +1720,26 @@ async function checkUserTrades(userId) {
                 redeployMetaApiAccount(user.metaApiAccountId).then(ok => {
                     console.log(`[trades] ${userId.slice(0,8)}: redeploy ${ok ? 'completed' : 'failed'}`);
                 });
-            } else if (canRetry && (accountInfo.state === 'UNDEPLOYED' || accountInfo.state === 'UNDEPLOYING')) {
+            } else if ((accountInfo.state === 'UNDEPLOYED' || accountInfo.state === 'UNDEPLOYING')
+                && (!user.lastRedeployAttempt || (nowMs - user.lastRedeployAttempt) > (user.autoDeployBackoffMs || REDEPLOY_THROTTLE_MS))) {
                 user.lastRedeployAttempt = nowMs;
                 console.log(`[trades] ${userId.slice(0,8)}: account ${accountInfo.state} but user is active, triggering deploy`);
-                deployMetaApiAccount(user.metaApiAccountId).catch(e =>
-                    console.error(`[trades] ${userId.slice(0,8)}: auto-deploy failed: ${e.message}`)
-                );
+                deployMetaApiAccount(user.metaApiAccountId).then(() => {
+                    user.autoDeployBackoffMs = null;
+                }).catch(e => {
+                    // An account whose broker login no longer works (wrong or
+                    // changed password, expired prop-firm account) fails every
+                    // time. Retrying it every 10 minutes forever burned the
+                    // deploy quota and drew MetaAPI 429s onto healthy users.
+                    // Back off: 20m, 40m, ... up to 6h. A reconnect in the app
+                    // goes through /connect-mt5 and is not affected.
+                    const rejected = /ValidationError/.test(e.message);
+                    if (rejected) {
+                        user.autoDeployBackoffMs = Math.min((user.autoDeployBackoffMs || REDEPLOY_THROTTLE_MS) * 2, 6 * 3600 * 1000);
+                        user.mt5SyncStatus = 'disconnected';
+                    }
+                    console.error(`[trades] ${userId.slice(0,8)}: auto-deploy failed${rejected ? ` (next try in ${Math.round(user.autoDeployBackoffMs / 60000)} min)` : ''}: ${e.message.slice(0, 300)}`);
+                });
             }
             return;
         }
