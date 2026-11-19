@@ -169,6 +169,62 @@ async function touchLastSeen(userId) {
     } catch (_) { /* best-effort */ }
 }
 
+// Blocking setup reported by the iOS app (X-Block-Setup header on /status):
+// "st=approved;apps=2;cats=0;mt5=1;shield=1". Lets support see whether a lock
+// can block anything on the user's iPhone. Counts only, no app identities.
+// Older app builds do not send it, then nothing is recorded.
+const blockSetupSchema = z.object({
+    st: z.enum(['approved', 'denied', 'notDetermined']),
+    apps: z.coerce.number().int().min(0).max(1000),
+    cats: z.coerce.number().int().min(0).max(1000),
+    mt5: z.coerce.number().int().min(0).max(1),
+    shield: z.coerce.number().int().min(0).max(1),
+});
+
+function parseBlockSetupHeader(raw) {
+    if (typeof raw !== 'string' || raw.length > 200) return null;
+    const fields = {};
+    for (const part of raw.split(';')) {
+        const [key, value] = part.split('=');
+        if (key && value !== undefined) fields[key.trim()] = value.trim();
+    }
+    const parsed = blockSetupSchema.safeParse(fields);
+    if (!parsed.success) return null;
+    const setup = parsed.data;
+    return {
+        ...setup,
+        mt5: setup.mt5 === 1,
+        shield: setup.shield === 1,
+        // Same rule as BlockingManager.canBlock in the app.
+        canBlock: setup.st === 'approved' && (setup.apps > 0 || setup.cats > 0 || setup.mt5 === 1),
+    };
+}
+
+// Stores the setup when it changes (not every 5s poll) and logs a warning,
+// once per day, when the user is locked while nothing can be blocked.
+function recordBlockSetup(userId, user, rawHeader) {
+    const setup = parseBlockSetupHeader(rawHeader);
+    if (!setup || !UUID_V4_RE.test(String(userId))) return;
+    const key = JSON.stringify(setup);
+    if (user.blockSetupKey !== key) {
+        const previous = user.blockSetup;
+        user.blockSetupKey = key;
+        user.blockSetup = setup;
+        console.log(`[block-setup] ${String(userId).slice(0, 8)}: st=${setup.st} apps=${setup.apps} cats=${setup.cats} mt5=${setup.mt5} shield=${setup.shield} canBlock=${setup.canBlock}${previous ? ` (was canBlock=${previous.canBlock} shield=${previous.shield})` : ''}`);
+        supabase.from('purchases')
+            .update({ block_setup: setup, block_setup_at: new Date().toISOString() })
+            .eq('user_id', String(userId).toLowerCase())
+            .then(({ error }) => {
+                if (error) console.error(`[block-setup] write failed for ${String(userId).slice(0, 8)}:`, error.message);
+            })
+            .catch(() => {});
+    }
+    if (user.isLocked && !setup.canBlock && user.unprotectedLockLoggedFor !== user.lastReset) {
+        user.unprotectedLockLoggedFor = user.lastReset;
+        console.log(`[lock-unprotected] ${String(userId).slice(0, 8)}: locked but nothing can be blocked on the device (st=${setup.st} apps=${setup.apps} cats=${setup.cats} mt5=${setup.mt5})`);
+    }
+}
+
 async function getStoredTokens(licenseCode) {
     const { data } = await supabase
         .from('purchases')
@@ -574,6 +630,136 @@ async function maybeSendLockReminder(userId, user) {
         'You reached your limit today. Open EmotionLock to lock your trading apps.',
         { type: 'lock' }
     );
+}
+
+// MT5 connection lost: tell the user (push + mail) and Bart (mail).
+// Without this a user whose MetaAPI account drops off the broker notices
+// nothing: no trades are counted and the lock never fires (994FB0B1, Bybit,
+// 19 Nov 2026). Reconnecting in the app pushes the new password to the same
+// MetaAPI account, so the user only has to reconnect once.
+// Counts as down: any poll where the account is not DEPLOYED + CONNECTED or
+// SYNCHRONIZING. Failed lookups (429/5xx/timeout) do not count. The clock
+// starts at the first down poll and stops at the first healthy one.
+const MT5_DOWN_NOTIFY_AFTER_MS = 20 * 60 * 1000;
+const MT5_DOWN_NOTIFY_EVERY_MS = 24 * 3600 * 1000;
+
+function trackMt5Down(userId, user, isReady, accountInfo) {
+    if (isReady) {
+        user.mt5DownSince = null;
+        return;
+    }
+    if (!user.mt5DownSince) user.mt5DownSince = Date.now();
+    if (Date.now() - user.mt5DownSince < MT5_DOWN_NOTIFY_AFTER_MS) return;
+    maybeNotifyMt5Down(userId, user, accountInfo).catch(err => {
+        console.error(`[mt5-down] ${String(userId).slice(0, 8)}: notify failed:`, err?.message ?? err);
+    });
+}
+
+async function lookupUserEmail(userId) {
+    const uid = String(userId).toLowerCase();
+    try {
+        const { data: c } = await supabase.from('email_contacts').select('email').eq('user_id', uid).not('email', 'is', null).limit(1).maybeSingle();
+        if (c?.email) return c.email;
+        const { data: p } = await supabase.from('purchases').select('email').eq('user_id', uid).not('email', 'is', null).limit(1).maybeSingle();
+        if (p?.email) return p.email;
+        const { data: pr } = await supabase.from('profiles').select('email').eq('user_id', uid).not('email', 'is', null).limit(1).maybeSingle();
+        return pr?.email || null;
+    } catch {
+        return null;
+    }
+}
+
+function mt5DownEmail(server, sinceText) {
+    const lines = [
+        'Hi,',
+        '',
+        `EmotionLock lost the connection to your MT5 account${server ? ` (${server})` : ''} at ${sinceText}.`,
+        'Until you reconnect, we cannot see your trades, so your trading apps will not lock when you reach your daily limit.',
+        '',
+        'It takes a minute to fix:',
+        '1. Open EmotionLock and go to Settings, then MT5 account.',
+        '2. Connect again with your account number, server and investor password. If you changed or reset your investor password, use the new one.',
+        '',
+        'Trades you already closed today are counted as soon as you are connected again.',
+        '',
+        'Questions? Just reply to this email.',
+        '',
+        'Bart',
+        'EmotionLock',
+    ];
+    const text = lines.join('\n');
+    const html = `<div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;font-size:15px;line-height:1.6;color:#1a1a1a;max-width:520px">`
+        + lines.map(l => l === '' ? '<br>' : `<div>${escapeHtml(l)}</div>`).join('')
+        + '</div>';
+    return { text, html };
+}
+
+async function maybeNotifyMt5Down(userId, user, accountInfo) {
+    const short = String(userId).slice(0, 8);
+    const now = Date.now();
+    if (user._mt5DownNotifyBusy) return;
+    if (user.mt5DownNotifiedAt && now - user.mt5DownNotifiedAt < MT5_DOWN_NOTIFY_EVERY_MS) return;
+    if (connectMt5InFlight.has(userId)) return;
+    user._mt5DownNotifyBusy = true;
+    try {
+        const uid = String(userId).toLowerCase();
+        // Survives restarts: skip when an earlier process already warned.
+        const { data: row, error: readErr } = await supabase
+            .from('purchases').select('mt5_disconnect_notified_at').eq('user_id', uid).limit(1).maybeSingle();
+        const storedAt = row?.mt5_disconnect_notified_at ? new Date(row.mt5_disconnect_notified_at).getTime() : 0;
+        if (storedAt && now - storedAt < MT5_DOWN_NOTIFY_EVERY_MS) {
+            user.mt5DownNotifiedAt = storedAt;
+            return;
+        }
+        // Claim first, so a second poll cannot send it twice.
+        user.mt5DownNotifiedAt = now;
+        if (!readErr) {
+            const { error: writeErr } = await supabase
+                .from('purchases').update({ mt5_disconnect_notified_at: new Date(now).toISOString() }).eq('user_id', uid);
+            if (writeErr) console.warn(`[mt5-down] ${short}: could not store notified_at: ${writeErr.message}`);
+        }
+
+        const sinceText = new Date(user.mt5DownSince || now).toLocaleString('en-GB', {
+            timeZone: 'Europe/Amsterdam', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit',
+        }) + ' (CET)';
+        const server = user.mt5Server || accountInfo?.server || '';
+        const stateText = accountInfo ? `${accountInfo.state}/${accountInfo.connectionStatus}` : 'unknown';
+
+        const push = user.deviceToken
+            ? await sendPushNotification(
+                user.deviceToken,
+                'MT5 connection lost',
+                'We cannot see your trades right now, so your limit cannot lock. Tap to reconnect your MT5 account.',
+                { type: 'mt5_reconnect', deepLink: 'mt5_connect' }
+            )
+            : { ok: false, error: 'no device token' };
+
+        const email = await lookupUserEmail(userId);
+        let mailResult = 'no email on file';
+        if (email) {
+            const { text, html } = mt5DownEmail(server, sinceText);
+            mailResult = await sendUserMail({ to: email, subject: 'Action needed: reconnect your MT5 account', text, html, templateKey: 'mt5_disconnected' });
+        }
+
+        console.log(`[mt5-down] ${short}: down since ${sinceText} (${stateText}), push=${push.ok ? 'sent' : push.error}, mail=${mailResult}`);
+        logActivity(userId, 'mt5_disconnect_notified', { server, state: stateText, push: !!push.ok, mail: mailResult === 'sent' });
+        notifyAdmin({
+            subject: `MT5 disconnected: ${short} (${server || 'unknown server'})`,
+            lines: [
+                'A user was told to reconnect MT5.',
+                '',
+                `User:       ${userId}`,
+                `Server:     ${server || 'unknown'}`,
+                `Login:      ${user.mt5Login || 'unknown'}`,
+                `State:      ${stateText}`,
+                `Down since: ${sinceText}`,
+                `Push:       ${push.ok ? 'sent' : `not sent (${push.error})`}`,
+                `Mail:       ${email ? `${mailResult} (${email})` : mailResult}`,
+            ],
+        }).catch(() => {});
+    } finally {
+        user._mt5DownNotifyBusy = false;
+    }
 }
 
 // True when the app polled /status in the last minute, i.e. it is open.
@@ -1672,6 +1858,7 @@ async function checkUserTrades(userId) {
             (accountInfo.connectionStatus === 'CONNECTED' || accountInfo.connectionStatus === 'SYNCHRONIZING');
         if (isReady) user.disconnectedSince = null;
         if (isReady && !user.accountCurrency) maybeFetchAccountCurrency(userId, user).catch(() => {});
+        trackMt5Down(userId, user, isReady, accountInfo);
 
         debugLog(`[trades] ${userId.slice(0,8)}: state=${accountInfo.state} status=${accountInfo.connectionStatus} region=${user.mt5Region} ready=${isReady}`);
 
@@ -3124,6 +3311,7 @@ app.get('/status/:userId', statusLimiter, async (req, res) => {
         initUser(userId);
         const user = userStates[userId];
         checkDailyReset(user, localDate);
+        recordBlockSetup(userId, user, req.headers['x-block-setup']);
 
         // Engagement (spoor 1): throttled "laatst gezien" + sessie-logging.
         // /status wordt elke 5s gepolld, dus we schrijven last_seen hooguit eens
@@ -5453,6 +5641,33 @@ async function notifyAdmin({ subject, lines }) {
         }
     } catch (err) {
         console.error('[notify] Error sending admin notification:', err?.message ?? err);
+    }
+}
+
+// Transactional mail to a user through the same send-email edge function.
+// Returns 'sent' or a short reason. Never throws.
+async function sendUserMail({ to, subject, text, html, templateKey }) {
+    const supabaseUrl = process.env.SUPABASE_URL;
+    const serviceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+    if (!supabaseUrl || !serviceKey) return 'mail not configured';
+    try {
+        const res = await fetch(`${supabaseUrl}/functions/v1/send-email`, {
+            method: 'POST',
+            headers: {
+                'apikey': serviceKey,
+                'Authorization': `Bearer ${serviceKey}`,
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({ to, subject, text, html, kind: 'transactional', templateKey, replyTo: 'support@emotionlock.app' }),
+            signal: AbortSignal.timeout(30000),
+        });
+        if (res.ok) {
+            const data = await res.json().catch(() => ({}));
+            return data?.skipped ? `skipped (${data.reason})` : 'sent';
+        }
+        return `failed (HTTP ${res.status})`;
+    } catch (err) {
+        return `failed (${err?.message ?? err})`;
     }
 }
 
