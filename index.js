@@ -643,6 +643,48 @@ async function maybeSendLockReminder(userId, user) {
 const MT5_DOWN_NOTIFY_AFTER_MS = 20 * 60 * 1000;
 const MT5_DOWN_NOTIFY_EVERY_MS = 24 * 3600 * 1000;
 
+// MetaAPI refuses every deploy with "please top up your account" once the
+// MetaAPI balance is empty (19 Nov 2026: all accounts undeployed for about
+// 9 hours). That is our problem, not the user's: alert Bart, at most once per
+// 3 hours, and do not tell users to reconnect MT5 while it lasts.
+const METAAPI_BALANCE_FLAG_MS = 30 * 60 * 1000;
+const METAAPI_BALANCE_ALERT_EVERY_MS = 3 * 3600 * 1000;
+let metaApiBalanceEmptyAt = 0;
+let metaApiBalanceAlertAt = 0;
+
+function isMetaApiBalanceEmpty() {
+    return metaApiBalanceEmptyAt > 0 && Date.now() - metaApiBalanceEmptyAt < METAAPI_BALANCE_FLAG_MS;
+}
+
+function isMetaApiTopUpError(message) {
+    return /top up your account/i.test(String(message || ''));
+}
+
+function markMetaApiBalanceEmpty(userId) {
+    const now = Date.now();
+    metaApiBalanceEmptyAt = now;
+    if (metaApiBalanceAlertAt && now - metaApiBalanceAlertAt < METAAPI_BALANCE_ALERT_EVERY_MS) return;
+    metaApiBalanceAlertAt = now;
+    console.error(`[metaapi-balance] deploy refused for ${String(userId).slice(0, 8)}: MetaAPI balance is empty, top up now`);
+    notifyAdmin({
+        subject: 'URGENT: MetaAPI balance empty, accounts cannot deploy',
+        lines: [
+            'MetaAPI refuses to deploy trading accounts: "please top up your account".',
+            'Until the balance is topped up, no trades are tracked and no limits lock.',
+            '',
+            'Top up in the MetaAPI dashboard (app.metaapi.cloud).',
+            'After the top-up the backend redeploys the accounts by itself within 10 minutes.',
+            'Users are not told to reconnect MT5 while this lasts.',
+        ],
+    }).catch(() => {});
+}
+
+function clearMetaApiBalanceEmpty() {
+    if (!metaApiBalanceEmptyAt) return;
+    console.log('[metaapi-balance] deploy works again, balance flag cleared');
+    metaApiBalanceEmptyAt = 0;
+}
+
 function trackMt5Down(userId, user, isReady, accountInfo) {
     if (isReady) {
         user.mt5DownSince = null;
@@ -698,6 +740,7 @@ async function maybeNotifyMt5Down(userId, user, accountInfo) {
     const short = String(userId).slice(0, 8);
     const now = Date.now();
     if (user._mt5DownNotifyBusy) return;
+    if (isMetaApiBalanceEmpty()) return;
     if (user.mt5DownNotifiedAt && now - user.mt5DownNotifiedAt < MT5_DOWN_NOTIFY_EVERY_MS) return;
     if (connectMt5InFlight.has(userId)) return;
     user._mt5DownNotifyBusy = true;
@@ -1915,7 +1958,9 @@ async function checkUserTrades(userId) {
                 console.log(`[trades] ${userId.slice(0,8)}: account ${accountInfo.state} but user is active, triggering deploy`);
                 deployMetaApiAccount(user.metaApiAccountId).then(() => {
                     user.autoDeployBackoffMs = null;
+                    clearMetaApiBalanceEmpty();
                 }).catch(e => {
+                    if (isMetaApiTopUpError(e.message)) markMetaApiBalanceEmpty(userId);
                     // An account whose broker login no longer works (wrong or
                     // changed password, expired prop-firm account) fails every
                     // time. Retrying it every 10 minutes forever burned the
