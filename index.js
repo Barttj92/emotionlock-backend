@@ -1899,7 +1899,10 @@ async function checkUserTrades(userId) {
 
         const isReady = accountInfo.state === 'DEPLOYED' &&
             (accountInfo.connectionStatus === 'CONNECTED' || accountInfo.connectionStatus === 'SYNCHRONIZING');
-        if (isReady) user.disconnectedSince = null;
+        if (isReady) {
+            user.disconnectedSince = null;
+            user.redeployCycles = 0;
+        }
         if (isReady && !user.accountCurrency) maybeFetchAccountCurrency(userId, user).catch(() => {});
         trackMt5Down(userId, user, isReady, accountInfo);
 
@@ -1942,13 +1945,19 @@ async function checkUserTrades(userId) {
             } else {
                 user.disconnectedSince = null;
             }
+            // Back off when redeploys do not help: 10, 20, 40, then 60 min.
+            // After the MetaAPI outage of 19-20 Nov 2026 every account needed
+            // more than 10 min to reach the broker, and a redeploy every
+            // 10 min restarted that attempt each time, so none ever connected.
+            const graceMs = Math.min(DISCONNECTED_GRACE_MS * 2 ** (user.redeployCycles || 0), 60 * 60 * 1000);
             const disconnectedLongEnough = isDisconnected &&
-                (nowMs - user.disconnectedSince) > DISCONNECTED_GRACE_MS;
+                (nowMs - user.disconnectedSince) > graceMs;
 
             if (canRetry && disconnectedLongEnough) {
                 user.lastRedeployAttempt = nowMs;
                 user.disconnectedSince = null; // fresh grace window after the redeploy
-                console.log(`[trades] ${userId.slice(0,8)}: account DEPLOYED+DISCONNECTED for over ${DISCONNECTED_GRACE_MS / 60000} min, triggering redeploy cycle`);
+                user.redeployCycles = (user.redeployCycles || 0) + 1;
+                console.log(`[trades] ${userId.slice(0,8)}: account DEPLOYED+DISCONNECTED for over ${Math.round(graceMs / 60000)} min, triggering redeploy cycle ${user.redeployCycles}`);
                 redeployMetaApiAccount(user.metaApiAccountId).then(ok => {
                     console.log(`[trades] ${userId.slice(0,8)}: redeploy ${ok ? 'completed' : 'failed'}`);
                 });
