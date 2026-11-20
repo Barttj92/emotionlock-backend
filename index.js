@@ -651,6 +651,7 @@ const METAAPI_BALANCE_FLAG_MS = 30 * 60 * 1000;
 const METAAPI_BALANCE_ALERT_EVERY_MS = 3 * 3600 * 1000;
 let metaApiBalanceEmptyAt = 0;
 let metaApiBalanceAlertAt = 0;
+let metaApiOutageAlertAt = 0;
 
 function isMetaApiBalanceEmpty() {
     return metaApiBalanceEmptyAt > 0 && Date.now() - metaApiBalanceEmptyAt < METAAPI_BALANCE_FLAG_MS;
@@ -677,6 +678,17 @@ function markMetaApiBalanceEmpty(userId) {
             'Users are not told to reconnect MT5 while this lasts.',
         ],
     }).catch(() => {});
+}
+
+// True when (almost) every tracked account is down at the same time. Then the
+// cause is MetaAPI or our billing, not the user's broker login, and telling
+// each user to reconnect is wrong (20 Nov 2026: 8 of 8 accounts down for
+// hours after the balance top-up, users got "reconnect" mails anyway).
+function isSystemWideMt5Outage() {
+    const tracked = Object.values(userStates).filter(u => u && u.metaApiAccountId);
+    if (tracked.length < 3) return false;
+    const down = tracked.filter(u => u.mt5DownSince).length;
+    return down / tracked.length >= 0.8;
 }
 
 function clearMetaApiBalanceEmpty() {
@@ -741,6 +753,23 @@ async function maybeNotifyMt5Down(userId, user, accountInfo) {
     const now = Date.now();
     if (user._mt5DownNotifyBusy) return;
     if (isMetaApiBalanceEmpty()) return;
+    if (isSystemWideMt5Outage()) {
+        const now = Date.now();
+        if (!metaApiOutageAlertAt || now - metaApiOutageAlertAt > METAAPI_BALANCE_ALERT_EVERY_MS) {
+            metaApiOutageAlertAt = now;
+            const tracked = Object.values(userStates).filter(u => u && u.metaApiAccountId);
+            console.error(`[mt5-down] system-wide: ${tracked.filter(u => u.mt5DownSince).length} of ${tracked.length} accounts down, users not notified`);
+            notifyAdmin({
+                subject: 'URGENT: almost all MT5 accounts down at once',
+                lines: [
+                    `${tracked.filter(u => u.mt5DownSince).length} of ${tracked.length} tracked MT5 accounts are not connected.`,
+                    'This points to MetaAPI or billing, not to user logins. Users are NOT told to reconnect while this lasts.',
+                    'Check the MetaAPI dashboard (accounts and billing) and the MetaAPI status.',
+                ],
+            }).catch(() => {});
+        }
+        return;
+    }
     if (user.mt5DownNotifiedAt && now - user.mt5DownNotifiedAt < MT5_DOWN_NOTIFY_EVERY_MS) return;
     if (connectMt5InFlight.has(userId)) return;
     user._mt5DownNotifyBusy = true;
