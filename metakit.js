@@ -219,8 +219,13 @@ function mapAccount(a) {
 const BROKER_CACHE_MS = 6 * 3600 * 1000;
 let brokerCache = { at: 0, byServer: null };
 
-async function loadBrokerIndex() {
-    if (brokerCache.byServer && Date.now() - brokerCache.at < BROKER_CACHE_MS) return brokerCache.byServer;
+// On a miss the list is reloaded, at most once per BROKER_MISS_RELOAD_MS, so a
+// server MetaKit adds during the day works within minutes instead of hours.
+const BROKER_MISS_RELOAD_MS = 5 * 60 * 1000;
+
+async function loadBrokerIndex(force = false) {
+    const age = Date.now() - brokerCache.at;
+    if (brokerCache.byServer && age < BROKER_CACHE_MS && !(force && age >= BROKER_MISS_RELOAD_MS)) return brokerCache.byServer;
     const r = await mkPaged('/v1/brokers');
     if (!r.ok) {
         if (brokerCache.byServer) return brokerCache.byServer; // keep a stale index rather than none
@@ -239,7 +244,13 @@ async function loadBrokerIndex() {
 async function findBrokerId(server) {
     const index = await loadBrokerIndex();
     if (!index) throw new MetaKitFallbackError('broker_lookup_failed', 'MetaKit broker list could not be read');
-    const id = index.get(String(server || '').trim().toLowerCase());
+    const key = String(server || '').trim().toLowerCase();
+    let id = index.get(key);
+    if (id === undefined) {
+        const fresh = await loadBrokerIndex(true);
+        if (fresh) id = fresh.get(key);
+    }
+    if (id !== undefined) unlistedFailedAt.delete(key); // now listed: drop any earlier block
     return id === undefined ? null : id;
 }
 
