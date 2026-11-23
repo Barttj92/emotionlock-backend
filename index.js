@@ -3495,7 +3495,11 @@ async function connectMt5Locked(res, userId, server, login, password) {
         userStates[userId].lastRedeployAttempt = null;
         // Only clear the processed-deal log when switching to a different account.
         // Keeping it for same-account reconnects prevents today's closes from being double-counted.
-        if (!isSameAccount) {
+        // Count from connect (D-052, D-056): also for a user moving from MetaAPI
+        // to MetaKit. MetaAPI was down, so their trades earlier today were never
+        // tracked and must not suddenly count. Counters already stored today stay
+        // (the seed never lowers tradesCount).
+        if (!isSameAccount || migrateToMetaKit) {
             const countFromMs = Date.now();
             userStates[userId].countFromMs = countFromMs;
             userStates[userId].countFromDate = getAmsterdamDateStr(new Date(countFromMs));
@@ -3504,6 +3508,8 @@ async function connectMt5Locked(res, userId, server, login, password) {
                 .eq('user_id', userId)
                 .then(({ error }) => { if (error) console.log(`[connect-mt5] count-from save failed for ${userId.slice(0,8)}: ${error.message}`); })
                 .catch(() => {});
+        }
+        if (!isSameAccount) {
             userStates[userId].processedDealIds = new Set();
             userStates[userId].processedPositionIds = new Set();
             userStates[userId].openPositions = {};
