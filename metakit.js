@@ -35,10 +35,10 @@ const cfg = {
     slotIdleDays: parseInt(process.env.METAKIT_SLOT_IDLE_DAYS || '7', 10),
     pollMs: parseInt(process.env.METAKIT_POLL_MS || '60000', 10),
     connectWaitMs: parseInt(process.env.METAKIT_CONNECT_WAIT_MS || '45000', 10),
-    // Servers that are not in MetaKit's broker list (most prop firms on 23 Nov
-    // 2026) are still tried once without broker_id. If MetaKit cannot connect,
-    // the server is skipped for 24h and the user goes to MetaAPI.
-    tryUnlistedServers: process.env.METAKIT_TRY_UNLISTED_SERVERS !== 'false',
+    // MetaKit support (23 Nov 2026): broker_id is required, a server that is
+    // not in their broker list cannot connect. So unlisted servers go straight
+    // to MetaAPI. METAKIT_TRY_UNLISTED_SERVERS=true tries them once anyway.
+    tryUnlistedServers: process.env.METAKIT_TRY_UNLISTED_SERVERS === 'true',
 };
 
 let deps = {
