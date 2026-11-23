@@ -25,8 +25,8 @@ const API = 'https://api.metakit.cloud';
 const PREFIX = 'mk:';
 
 const cfg = {
-    apiKey: process.env.METAKIT_API_KEY || '',
-    webhookSecret: process.env.METAKIT_WEBHOOK_SECRET || '',
+    apiKey: String(process.env.METAKIT_API_KEY || '').trim(),
+    webhookSecret: String(process.env.METAKIT_WEBHOOK_SECRET || '').trim(),
     provider: String(process.env.MT5_PROVIDER || 'metaapi').trim().toLowerCase(),
     testUserIds: new Set(
         (process.env.METAKIT_TEST_USER_IDS || '').split(',').map(s => s.trim().toLowerCase()).filter(Boolean)
@@ -534,17 +534,35 @@ async function quoteServerTime(prefixedId) {
 // ── Webhooks ──────────────────────────────────────────────────────────────
 const crypto = require('crypto');
 
-function verifySignature(rawBody, header, toleranceSec = 300) {
-    if (!cfg.webhookSecret || !header || !rawBody) return false;
-    const parts = Object.fromEntries(String(header).split(',').map(kv => kv.split('=').map(s => s.trim())));
+// Returns { ok, reason }. Tries the secret as shown by MetaKit (whsec_...)
+// and without its "whsec_" prefix, since the docs do not say which bytes
+// are the HMAC key. Both require knowing the secret.
+function checkSignature(rawBody, header, toleranceSec = 300) {
+    if (!cfg.webhookSecret) return { ok: false, reason: 'no_secret_configured' };
+    if (!header) return { ok: false, reason: 'missing_header' };
+    if (!rawBody) return { ok: false, reason: 'empty_body' };
+    const parts = {};
+    for (const kv of String(header).split(',')) {
+        const i = kv.indexOf('=');
+        if (i > 0) parts[kv.slice(0, i).trim()] = kv.slice(i + 1).trim();
+    }
     const t = parts.t;
     const v1 = parts.v1;
-    if (!t || !v1) return false;
-    if (Math.abs(Date.now() / 1000 - Number(t)) > toleranceSec) return false;
-    const expected = crypto.createHmac('sha256', cfg.webhookSecret).update(`${t}.${rawBody}`).digest('hex');
-    const a = Buffer.from(expected, 'utf8');
+    if (!t || !v1) return { ok: false, reason: 'malformed_header' };
+    if (Math.abs(Date.now() / 1000 - Number(t)) > toleranceSec) return { ok: false, reason: 'stale_timestamp' };
+    const keys = [cfg.webhookSecret];
+    if (cfg.webhookSecret.startsWith('whsec_')) keys.push(cfg.webhookSecret.slice('whsec_'.length));
     const b = Buffer.from(String(v1), 'utf8');
-    return a.length === b.length && crypto.timingSafeEqual(a, b);
+    for (const key of keys) {
+        const expected = crypto.createHmac('sha256', key).update(`${t}.${rawBody}`).digest('hex');
+        const a = Buffer.from(expected, 'utf8');
+        if (a.length === b.length && crypto.timingSafeEqual(a, b)) return { ok: true, reason: 'ok' };
+    }
+    return { ok: false, reason: 'signature_mismatch' };
+}
+
+function verifySignature(rawBody, header, toleranceSec = 300) {
+    return checkSignature(rawBody, header, toleranceSec).ok;
 }
 
 // account id of the event (trade events: account_id, account events: account.id)
@@ -663,6 +681,7 @@ module.exports = {
     quoteServerTime,
     // webhooks
     verifySignature,
+    checkSignature,
     webhookAccountId,
     // jobs
     runMaintenance,

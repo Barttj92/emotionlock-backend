@@ -1931,6 +1931,36 @@ function checkWeeklyTokenReset(user, userId) {
 // =====================
 // MetaApi trade polling
 // =====================
+// Count from the moment of connecting (Bart, 23 Nov 2026): when a user links
+// an MT5 account (first connect or a different account), trades closed
+// earlier that day on that account are not counted and do not move the daily
+// P&L. A reconnect of the same account keeps counting as before. The moment
+// is stored in purchases.mt5_count_from_at so a restart keeps it.
+// skewMs: the ms to add to a provider deal time to get real UTC.
+function excludePreConnectDeals(user, deals, skewMs) {
+    const from = user.countFromMs;
+    if (!from || user.countFromDate !== getAmsterdamDateStr() || !Array.isArray(deals)) {
+        return { countable: deals, excludedIds: [] };
+    }
+    const countable = [];
+    const excludedIds = [];
+    for (const d of deals) {
+        const t = Date.parse(d && d.time);
+        if (Number.isFinite(t) && t + (skewMs || 0) < from) excludedIds.push(d.id);
+        else countable.push(d);
+    }
+    return { countable, excludedIds };
+}
+
+function markExcludedDeals(user, excludedIds) {
+    if (!excludedIds.length) return;
+    if (!(user.pnlDealIds instanceof Set)) user.pnlDealIds = new Set();
+    for (const id of excludedIds) {
+        user.processedDealIds.add(id);
+        user.pnlDealIds.add(id);
+    }
+}
+
 async function checkUserTrades(userId) {
     const user = userStates[userId];
     if (!user) return;
@@ -2119,10 +2149,14 @@ async function checkUserTrades(userId) {
             }
             user.skewSeedRetries = 0;
             const seedSkew = seedSkewRaw ?? 0;
-            const seedDeals = await getDeals(user.metaApiAccountId, user.mt5Region, new Date(todayMidnight.getTime() - seedSkew).toISOString(), (seedSkew ? new Date(now.getTime() - seedSkew + 5 * 60 * 1000) : now).toISOString());
-            if (seedDeals === null) {
+            const seedDealsAll = await getDeals(user.metaApiAccountId, user.mt5Region, new Date(todayMidnight.getTime() - seedSkew).toISOString(), (seedSkew ? new Date(now.getTime() - seedSkew + 5 * 60 * 1000) : now).toISOString());
+            if (seedDealsAll === null) {
                 console.log(`[trades] ${userId.slice(0,8)}: seed fetch failed (account not ready yet?), retrying next poll`);
                 return;
+            }
+            const { countable: seedDeals, excludedIds: seedExcluded } = excludePreConnectDeals(user, seedDealsAll, seedSkew);
+            if (seedExcluded.length) {
+                console.log(`[trades] ${userId.slice(0,8)}: ${seedExcluded.length} deal(s) from before the MT5 connect today not counted`);
             }
             // Rebuild today's view from scratch since the seed represents the
             // full picture of today's deals as MetaAPI sees them.
@@ -2141,6 +2175,7 @@ async function checkUserTrades(userId) {
 
             // Today's realized net P&L, recomputed from the full seed.
             lossLimit.recomputePnl(user, seedDeals);
+            markExcludedDeals(user, seedExcluded);
 
             // Phase 2: count only positions that are fully closed (not in the
             // live positions list). Positions still partially open stay pending
@@ -2170,13 +2205,11 @@ async function checkUserTrades(userId) {
                     user.isLocked = true;
                     user.wasLockedToday = true;
                     debugLog(`User ${userId}: trade limit reached during seed reconcile`);
-                    // No push when the app is open: the next /status response
-                    // surfaces isLocked within seconds. Since the startup
-                    // restore a seed can also run with the app closed, and
-                    // then the push is the only signal.
-                    if (!appIsPolling(user)) {
-                        sendLockPush(user, `You've reached your limit of ${user.maxTrades} trade${user.maxTrades > 1 ? 's' : ''} today. ${LOCK_PUSH_SUFFIX}`).catch(() => {});
-                    }
+                    // Always push, also when the app is open (Bart, 23 Nov
+                    // 2026): the lock push is the moment the user is told,
+                    // same as a lock from a new trade. The app shows it as a
+                    // banner in the foreground too.
+                    sendLockPush(user, `You've reached your limit of ${user.maxTrades} trade${user.maxTrades > 1 ? 's' : ''} today. ${LOCK_PUSH_SUFFIX}`).catch(() => {});
                 }
             } else {
                 // Recomputed count is lower than the restored value (e.g. a
@@ -2186,13 +2219,10 @@ async function checkUserTrades(userId) {
 
             if (isLossMode(user) && !user.isLocked && !user.lossUnlockPending
                 && lossLimit.isLossLimitReached(user.dailyNetPnl, user.maxDailyLoss)) {
-                // Push only when the app is closed, same reasoning as the
-                // trade-mode seed path above.
+                // Always push, same as the trade-mode seed path above.
                 user.isLocked = true;
                 user.wasLockedToday = true;
-                if (!appIsPolling(user)) {
-                    sendLockPush(user, `You've reached your daily loss limit of ${lossLimit.formatMoney(user.maxDailyLoss, user.accountCurrency)}. ${LOCK_PUSH_SUFFIX}`).catch(() => {});
-                }
+                sendLockPush(user, `You've reached your daily loss limit of ${lossLimit.formatMoney(user.maxDailyLoss, user.accountCurrency)}. ${LOCK_PUSH_SUFFIX}`).catch(() => {});
                 debugLog(`User ${userId}: loss limit reached during seed reconcile`);
             }
             saveDailyPnl(userId, user).catch(() => {});
@@ -2231,7 +2261,8 @@ async function checkUserTrades(userId) {
             // Keep lastDealCheck where it is so this window is fetched again.
             return;
         }
-        const deals = selectTodayDeals(userId, user, wideDeals, fromMs, toMs);
+        const { countable: deals, excludedIds: lateExcluded } = excludePreConnectDeals(user, selectTodayDeals(userId, user, wideDeals, fromMs, toMs), skew);
+        markExcludedDeals(user, lateExcluded);
 
         debugLog(`[trades] ${userId.slice(0,8)}: fetched ${deals.length} deals from ${fromTime} to ${toTime}`);
         if (deals.length !== user.lastDealsSeen) {
@@ -2664,7 +2695,14 @@ async function findUserByMetaKitAccount(prefixedId) {
 const metakitWebhookLimiter = appWriteLimiter(3000);
 app.post('/webhooks/metakit', metakitWebhookLimiter, async (req, res) => {
     const raw = Buffer.isBuffer(req.body) ? req.body.toString('utf8') : '';
-    if (!metakit.verifySignature(raw, req.get('X-MetaKit-Signature'))) {
+    const sig = metakit.checkSignature(raw, req.get('X-MetaKit-Signature'));
+    if (!sig.ok) {
+        // Logged once per 10 minutes so a wrong secret is visible without
+        // flooding the logs (never logs the secret or the body).
+        if (!global.__mkSigWarnAt || Date.now() - global.__mkSigWarnAt > 10 * 60 * 1000) {
+            global.__mkSigWarnAt = Date.now();
+            console.error(`[metakit-webhook] rejected: ${sig.reason} (event=${req.get('X-MetaKit-Event') || '?'}, bodyBytes=${raw.length}, contentType=${req.get('content-type') || '?'})`);
+        }
         return res.status(400).json({ error: 'invalid_signature' });
     }
     let body;
@@ -3372,6 +3410,14 @@ async function connectMt5Locked(res, userId, server, login, password) {
         // Only clear the processed-deal log when switching to a different account.
         // Keeping it for same-account reconnects prevents today's closes from being double-counted.
         if (!isSameAccount) {
+            const countFromMs = Date.now();
+            userStates[userId].countFromMs = countFromMs;
+            userStates[userId].countFromDate = getAmsterdamDateStr(new Date(countFromMs));
+            supabase.from('purchases')
+                .update({ mt5_count_from_at: new Date(countFromMs).toISOString() })
+                .eq('user_id', userId)
+                .then(({ error }) => { if (error) console.log(`[connect-mt5] count-from save failed for ${userId.slice(0,8)}: ${error.message}`); })
+                .catch(() => {});
             userStates[userId].processedDealIds = new Set();
             userStates[userId].processedPositionIds = new Set();
             userStates[userId].openPositions = {};
@@ -3581,6 +3627,17 @@ async function restoreUserFromSupabase(userId, user, localDate) {
         .maybeSingle();
 
     await restoreUnlockCredits(userId, user, todayISO);
+    // Count-from moment of today's MT5 connect (own query, tolerant of a missing column).
+    try {
+        const { data: cf } = await supabase.from('purchases').select('mt5_count_from_at').eq('user_id', userId).maybeSingle();
+        if (cf?.mt5_count_from_at) {
+            const ms = Date.parse(cf.mt5_count_from_at);
+            if (Number.isFinite(ms) && getAmsterdamDateStr(new Date(ms)) === todayISO) {
+                user.countFromMs = ms;
+                user.countFromDate = todayISO;
+            }
+        }
+    } catch (_) { /* column missing: count the whole day as before */ }
 
     if (tradeData?.daily_trades_date === todayISO && tradeData?.daily_trades_count > 0) {
         user.tradesCount = tradeData.daily_trades_count;
