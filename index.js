@@ -1320,6 +1320,62 @@ async function createOrRecoverMetaApiAccount(server, login, password, userId) {
 // MetaKit unreachable) the connect falls back to MetaAPI through the existing
 // createOrRecoverMetaApiAccount safety net. A rejected login is never retried
 // at MetaAPI: wrong credentials are wrong there too.
+// Admin mail for every MT5 connect attempt (Bart, 23 Nov 2026): success
+// (first connect = trial started, later = reconnect) and failure, with who,
+// which server and login, which provider and what the user was shown. Never
+// the password. Failures for the same user are mailed at most every 5 minutes
+// (the app retries). Fire-and-forget.
+const connectFailNotifiedAt = new Map();
+async function notifyAdminConnect({ userId, ok, isFirst, server, login, accountId, error, userMessage }) {
+    try {
+        if (!ok) {
+            const last = connectFailNotifiedAt.get(userId);
+            if (last && Date.now() - last < 5 * 60 * 1000) return;
+            connectFailNotifiedAt.set(userId, Date.now());
+        }
+        const { data: prof } = await supabase
+            .from('profiles')
+            .select('first_name, last_name, email')
+            .ilike('user_id', userId)
+            .maybeSingle();
+        const fullName = prof ? `${prof.first_name ?? ''} ${prof.last_name ?? ''}`.trim() : '';
+        const who = fullName || 'A user';
+        const ctx = await adminUserContext(userId);
+        const provider = accountId ? (metakit.isMetaKitId(accountId) ? 'MetaKit' : 'MetaAPI') : (metakit.useMetaKitFor(userId) ? 'MetaKit' : 'MetaAPI');
+        const subject = ok
+            ? (isFirst ? `Trial started (MT5 connected): ${fullName || 'a user'}` : `MT5 reconnected: ${fullName || 'a user'} (${server})`)
+            : `MT5 connect FAILED: ${fullName || 'a user'} (${server})`;
+        const lines = ok
+            ? [
+                isFirst ? `${who} just connected MT5. Their 4-day free trial has started.` : `${who} connected MT5 again.`,
+            ]
+            : [
+                `${who} tried to connect MT5 and it did not work.`,
+                '',
+                `Shown in the app: ${userMessage}`,
+                `Error:            ${String(error?.code || '')} ${String(error?.message || '').slice(0, 400)}`.trim(),
+            ];
+        lines.push(
+            '',
+            `Server:   ${server}`,
+            `Login:    ${login}`,
+            `Provider: ${provider}${accountId ? ` (${accountId})` : ''}`,
+            '',
+            `Country:   ${ctx.country}`,
+            `Heard via: ${ctx.heardVia}`,
+            '',
+            `Email:   ${prof?.email ?? 'unknown'}`,
+            `User ID: ${userId}`,
+            `Time:    ${adminNotifyTimestamp()} (Europe/Amsterdam)`,
+            '',
+            'View in Command Center: https://emotionlock.app/command',
+        );
+        await notifyAdmin({ subject, lines });
+    } catch (e) {
+        console.error(`[connect-notify] ${String(userId).slice(0,8)}: ${e.message}`);
+    }
+}
+
 // Mail Bart once per server per 6 hours when a user tries a server MetaKit
 // cannot connect yet, so it can be passed on to MetaKit support.
 const unsupportedServerNotifiedAt = new Map();
@@ -1355,7 +1411,6 @@ async function createOrRecoverMt5Account(server, login, password, userId) {
                 console.log(`[connect-mt5] ${String(userId).slice(0,8)}: MetaKit could not connect ${server} (${reason}: ${e?.message}), no MetaAPI fallback`);
                 logActivity(userId, 'mt5_connect_failed', { server, reason, provider: 'metakit' });
                 const unsupported = /^broker_/.test(String(reason));
-                if (unsupported) notifyUnsupportedServer(server, userId);
                 const err = new Error(`MetaKit ${reason}`);
                 err.code = unsupported ? 'MT5_BROKER_NOT_SUPPORTED' : 'MT5_PROVIDER_BUSY';
                 throw err;
@@ -3497,6 +3552,7 @@ async function connectMt5Locked(res, userId, server, login, password) {
             // (bij een nieuwe poging wordt hetzelfde account hergebruikt via de naam-lookup).
             undeployMetaApiAccount(accountId).catch(() => {});
             logActivity(userId, 'mt5_connect_failed', { reason: 'db_persist_failed' });
+            notifyAdminConnect({ userId, ok: false, server, login: String(login), accountId, error: new Error(`db persist failed: ${mt5SaveErr.message}`), userMessage: 'Connecting failed. Please try again.' });
             return res.status(500).json({ error: 'connect_failed', message: 'Connecting failed. Please try again.' });
         }
         logActivity(userId, 'mt5_connected', { server, login: String(login) });
@@ -3511,51 +3567,28 @@ async function connectMt5Locked(res, userId, server, login, password) {
             message: 'Connecting... it may take a few minutes to fully sync.'
         });
 
-        // Fire-and-forget admin notification: a user just connected MT5 for the
-        // first time, which starts their 4-day free trial. Only on the FIRST
-        // connect (isFirstMt5Connect) so reconnects never re-notify. Best-effort
-        // profile lookup so the email carries a name/email, not just a user_id.
-        if (isFirstMt5Connect) {
-            supabase
-                .from('profiles')
-                .select('first_name, last_name, email')
-                .ilike('user_id', userId)
-                .maybeSingle()
-                .then(async ({ data: prof }) => {
-                    const fullName = prof ? `${prof.first_name ?? ''} ${prof.last_name ?? ''}`.trim() : '';
-                    const customerEmail = prof?.email ?? 'unknown';
-                    const ctx = await adminUserContext(userId);
-                    notifyAdmin({
-                        subject: `Trial started (MT5 connected): ${fullName || 'a user'}`,
-                        lines: [
-                            `${fullName || 'A user'} just connected MT5. Their 4-day free trial has started.`,
-                            '',
-                            `Country: ${ctx.country}`,
-                            `Heard via: ${ctx.heardVia}`,
-                            '',
-                            `Email:   ${customerEmail}`,
-                            `User ID: ${userId}`,
-                            `Time:    ${adminNotifyTimestamp()} (Europe/Amsterdam)`,
-                            '',
-                            'View in Command Center: https://emotionlock.app/command',
-                        ],
-                    }).catch(() => {});
-                })
-                .catch(() => {});
-        }
+        // Fire-and-forget admin mail for every successful connect: first
+        // connect (trial started) and reconnects alike.
+        notifyAdminConnect({ userId, ok: true, isFirst: isFirstMt5Connect, server, login: String(login), accountId });
 
     } catch (err) {
+        let status = 500;
+        let message;
         if (err?.code === 'METAAPI_CREATE_LIMIT') {
-            return res.status(503).json({ error: 'Connecting is temporarily busy. Please try again in a few minutes.' });
+            status = 503;
+            message = 'Connecting is temporarily busy. Please try again in a few minutes.';
+        } else if (err?.code === 'MT5_BROKER_NOT_SUPPORTED') {
+            status = 503;
+            message = "We can't connect to this broker server yet. We're adding it now and will let you know as soon as it works.";
+        } else if (err?.code === 'MT5_PROVIDER_BUSY') {
+            status = 503;
+            message = 'The broker connection service is temporarily busy. Please try again in a few minutes.';
+        } else {
+            console.error(`MT5 connect error for ${userId}:`, err.message);
+            message = friendlyMt5ConnectError(err);
         }
-        if (err?.code === 'MT5_BROKER_NOT_SUPPORTED') {
-            return res.status(503).json({ error: "We can't connect to this broker server yet. We're adding it now and will let you know as soon as it works." });
-        }
-        if (err?.code === 'MT5_PROVIDER_BUSY') {
-            return res.status(503).json({ error: 'The broker connection service is temporarily busy. Please try again in a few minutes.' });
-        }
-        console.error(`MT5 connect error for ${userId}:`, err.message);
-        res.status(500).json({ error: friendlyMt5ConnectError(err) });
+        notifyAdminConnect({ userId, ok: false, server, login: String(login), error: err, userMessage: message });
+        res.status(status).json({ error: message });
     }
 }
 
