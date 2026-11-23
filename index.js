@@ -1320,6 +1320,28 @@ async function createOrRecoverMetaApiAccount(server, login, password, userId) {
 // MetaKit unreachable) the connect falls back to MetaAPI through the existing
 // createOrRecoverMetaApiAccount safety net. A rejected login is never retried
 // at MetaAPI: wrong credentials are wrong there too.
+// Mail Bart once per server per 6 hours when a user tries a server MetaKit
+// cannot connect yet, so it can be passed on to MetaKit support.
+const unsupportedServerNotifiedAt = new Map();
+function notifyUnsupportedServer(server, userId) {
+    const key = String(server).trim().toLowerCase();
+    const last = unsupportedServerNotifiedAt.get(key);
+    if (last && Date.now() - last < 6 * 3600 * 1000) return;
+    unsupportedServerNotifiedAt.set(key, Date.now());
+    notifyAdmin({
+        subject: `[EmotionLock] MetaKit cannot connect server ${server}`,
+        lines: [
+            `A user tried to connect MT5 on ${server}. MetaKit does not support this server yet, so the connect failed (no MetaAPI fallback).`,
+            '',
+            `User: ${userId}`,
+            `Server: ${server}`,
+            '',
+            'Ask MetaKit support to add this server (they need the server name or a servers.dat).',
+            `Time (Europe/Amsterdam): ${adminNotifyTimestamp()}`,
+        ],
+    }).catch(() => {});
+}
+
 async function createOrRecoverMt5Account(server, login, password, userId) {
     if (metakit.useMetaKitFor(userId)) {
         try {
@@ -1329,6 +1351,15 @@ async function createOrRecoverMt5Account(server, login, password, userId) {
         } catch (e) {
             if (/ValidationError/.test(String(e?.message))) throw e;
             const reason = e?.reason || e?.name || 'error';
+            if (!metakit.cfg.fallbackToMetaApi) {
+                console.log(`[connect-mt5] ${String(userId).slice(0,8)}: MetaKit could not connect ${server} (${reason}: ${e?.message}), no MetaAPI fallback`);
+                logActivity(userId, 'mt5_connect_failed', { server, reason, provider: 'metakit' });
+                const unsupported = /^broker_/.test(String(reason));
+                if (unsupported) notifyUnsupportedServer(server, userId);
+                const err = new Error(`MetaKit ${reason}`);
+                err.code = unsupported ? 'MT5_BROKER_NOT_SUPPORTED' : 'MT5_PROVIDER_BUSY';
+                throw err;
+            }
             console.log(`[connect-mt5] ${String(userId).slice(0,8)}: MetaKit unavailable for ${server} (${reason}: ${e?.message}), falling back to MetaAPI`);
             logActivity(userId, 'mt5_provider_fallback', { server, reason });
         }
@@ -3516,6 +3547,12 @@ async function connectMt5Locked(res, userId, server, login, password) {
     } catch (err) {
         if (err?.code === 'METAAPI_CREATE_LIMIT') {
             return res.status(503).json({ error: 'Connecting is temporarily busy. Please try again in a few minutes.' });
+        }
+        if (err?.code === 'MT5_BROKER_NOT_SUPPORTED') {
+            return res.status(503).json({ error: "We can't connect to this broker server yet. We're adding it now and will let you know as soon as it works." });
+        }
+        if (err?.code === 'MT5_PROVIDER_BUSY') {
+            return res.status(503).json({ error: 'The broker connection service is temporarily busy. Please try again in a few minutes.' });
         }
         console.error(`MT5 connect error for ${userId}:`, err.message);
         res.status(500).json({ error: friendlyMt5ConnectError(err) });

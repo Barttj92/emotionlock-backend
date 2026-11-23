@@ -35,10 +35,15 @@ const cfg = {
     slotIdleDays: parseInt(process.env.METAKIT_SLOT_IDLE_DAYS || '7', 10),
     pollMs: parseInt(process.env.METAKIT_POLL_MS || '60000', 10),
     connectWaitMs: parseInt(process.env.METAKIT_CONNECT_WAIT_MS || '45000', 10),
-    // MetaKit support (23 Nov 2026): broker_id is required, a server that is
-    // not in their broker list cannot connect. So unlisted servers go straight
-    // to MetaAPI. METAKIT_TRY_UNLISTED_SERVERS=true tries them once anyway.
-    tryUnlistedServers: process.env.METAKIT_TRY_UNLISTED_SERVERS === 'true',
+    // A server that is not in MetaKit's broker list is still tried once
+    // without broker_id (MetaKit says it supports more brokers than its list
+    // shows). A failed try is remembered for 24h. METAKIT_TRY_UNLISTED_SERVERS=false
+    // skips the try.
+    tryUnlistedServers: process.env.METAKIT_TRY_UNLISTED_SERVERS !== 'false',
+    // MetaKit-only (Bart, 23 Nov 2026): when MetaKit cannot connect a user,
+    // the connect fails with a clear message instead of moving the user to
+    // MetaAPI. MT5_FALLBACK_TO_METAAPI=true brings the fallback back.
+    fallbackToMetaApi: process.env.MT5_FALLBACK_TO_METAAPI === 'true',
 };
 
 let deps = {
