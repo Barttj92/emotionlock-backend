@@ -1031,6 +1031,67 @@ async function createOrRecoverMt5Account(server, login, password, userId) {
 }
 
 // =====================
+// Reconnect nudge after a late purchase (D-059)
+// =====================
+// A trial without a purchase frees its MetaKit account (and slot) one day
+// after the trial ends. Someone who buys after that has no MT5 account any
+// more and must connect again with the investor password. The app shows the
+// "Connect MT5" button, but we also tell the user right away by push and mail.
+// Called after a recorded purchase and after an Apple resubscribe. Sends at
+// most once per user per 24 hours. Fire-and-forget.
+const reconnectNudgeSentAt = new Map();
+async function nudgeReconnectIfAccountGone(userId, reason) {
+    const uid = String(userId).toLowerCase();
+    try {
+        const last = reconnectNudgeSentAt.get(uid);
+        if (last && Date.now() - last < 24 * 3600 * 1000) return;
+        const { data: row } = await supabase
+            .from('purchases')
+            .select('meta_api_account_id, mt5_server, device_token')
+            .eq('user_id', uid)
+            .limit(1)
+            .maybeSingle();
+        if (!row?.mt5_server) return; // never connected: the normal connect flow covers it
+        let gone = !row.meta_api_account_id || isLegacyMt5AccountId(row.meta_api_account_id);
+        if (!gone) {
+            const { status } = await fetchMetaApiAccountInfo(row.meta_api_account_id);
+            gone = status === 404;
+        }
+        if (!gone) return;
+        reconnectNudgeSentAt.set(uid, Date.now());
+
+        const push = row.device_token
+            ? await sendPushNotification(row.device_token, 'One step left: connect MT5',
+                'Thanks for your purchase. Connect your MT5 account again so EmotionLock can protect your limit.',
+                { type: 'mt5_reconnect', deepLink: 'mt5_connect' })
+            : { ok: false, error: 'no device token' };
+        const email = await lookupUserEmail(userId);
+        let mail = 'no email on file';
+        if (email) {
+            const { text, html } = renderPlainMail([
+                'Hi,',
+                '',
+                'Thanks for your purchase, your EmotionLock access is active.',
+                '',
+                `One step left: connect your MT5 account again${row.mt5_server ? ` (${row.mt5_server})` : ''}. We disconnected it while you had no active access, so EmotionLock cannot see your trades yet.`,
+                '',
+                'Open EmotionLock, tap Connect MT5 and enter your server, login number and investor (read-only) password. It takes about a minute.',
+                '',
+                'Questions? Just reply to this email.',
+                '',
+                'Bart',
+                'EmotionLock',
+            ]);
+            mail = await sendUserMail({ to: email, subject: 'One step left: connect your MT5 account', text, html, templateKey: 'mt5_reconnect_after_purchase' });
+        }
+        console.log(`[reconnect-nudge] ${uid.slice(0, 8)} (${reason}): account gone, push=${push.ok ? 'sent' : push.error}, mail=${mail}`);
+        logActivity(userId, 'mt5_reconnect_nudged', { reason, push: !!push.ok, mail: mail === 'sent' });
+    } catch (e) {
+        console.error(`[reconnect-nudge] ${uid.slice(0, 8)}: ${e.message}`);
+    }
+}
+
+// =====================
 // Broker server requests (D-058)
 // =====================
 // A user tries a server MetaKit does not list yet. We remember the request,
@@ -4860,6 +4921,9 @@ app.post('/purchase/:userId', async (req, res) => {
         console.log(`[purchase] Recorded ${type} for user ${userId.slice(0,8)}: product=${productId} tx=${transactionId}`);
         res.json({ success: true });
 
+        // Bought after the trial account was freed: ask the user to connect again (D-059).
+        nudgeReconnectIfAccountGone(userId, `purchase_${type}`).catch(() => {});
+
         // Fire-and-forget admin notification on the FIRST license purchase
         // for this user. We detect first-purchase by checking that the
         // existing row had a null license_code before this UPSERT, which
@@ -5109,6 +5173,9 @@ async function handleAppleNotification(notification) {
                 console.error(`[apple-notify] Redeploy failed for ${userId}:`, e.message);
             }
         }
+        // MetaKit account deleted while the subscription was lapsed: ask the
+        // user to connect again (D-059).
+        nudgeReconnectIfAccountGone(userId, `apple_${notificationType}`).catch(() => {});
     }
 
     console.log(`[apple-notify] Applied ${notificationType}${subtype ? '/' + subtype : ''} → ${newStatus ?? 'no-status-change'} for ${userId.slice(0,8)}`);
