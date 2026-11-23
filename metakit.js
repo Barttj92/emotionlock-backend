@@ -296,6 +296,21 @@ async function ensureFreeSlotLocked(userId) {
     if (!slots.ok) throw new MetaKitFallbackError('slots_unavailable', `MetaKit slots HTTP ${slots.status}`);
     const dayStart = amsterdamDayStartMs();
     const boughtToday = slots.data.filter(s => Date.parse(s.created_at) >= dayStart).length;
+
+    // A slot whose charge has not settled (bank asks for 3-D Secure, or the
+    // card was declined) cannot be used. Buying another one would only stack
+    // up unpaid slots, so stop and ask Bart to approve it in the dashboard.
+    const stuck = slots.data.filter(s => s.status === 'incomplete' || s.status === 'past_due');
+    if (stuck.length > 0) {
+        alertSlots('[EmotionLock] ACTION: MetaKit slot payment needs your approval', [
+            `${stuck.length} MetaKit slot(s) are not paid yet (${stuck.map(s => `${s.id}: ${s.status}`).join(', ')}).`,
+            'Your bank probably asks for a 3-D Secure confirmation, or the card was declined.',
+            'Until this is fixed no new slots are bought, so new MT5 connects fail with "temporarily busy".',
+            'Fix: app.metakit.cloud > Settings > Billing (confirm the payment or update the card).',
+            `Last user waiting: ${userId}`,
+        ]);
+        throw new MetaKitFallbackError('slot_payment_pending', 'a MetaKit slot payment is not settled');
+    }
     if (boughtToday >= cfg.maxSlotPurchasesPerDay) {
         alertSlots('[EmotionLock] MetaKit slot brake reached, new connects are refused', [
             `${boughtToday} MetaKit slots were bought today (limit ${cfg.maxSlotPurchasesPerDay} per day, D-050).`,
@@ -321,10 +336,18 @@ async function ensureFreeSlotLocked(userId) {
     if (slot && slot.status !== 'active') {
         // 3-D Secure or a slow charge: give it a few seconds, then let the
         // connect find out (POST /v1/accounts answers 402 if still unusable).
+        let usable = false;
         for (let i = 0; i < 5; i++) {
             await new Promise(r => setTimeout(r, 2000));
             const u = await mk('GET', '/v1/usage');
-            if (u.ok && Number(u.json?.readonly_accounts?.available ?? 0) > 0) break;
+            if (u.ok && Number(u.json?.readonly_accounts?.available ?? 0) > 0) { usable = true; break; }
+        }
+        if (!usable) {
+            alertSlots('[EmotionLock] ACTION: MetaKit slot payment needs your approval', [
+                `A new MetaKit slot (${slot.id}) was bought for user ${userId} but is still "${slot.status}".`,
+                'Your bank probably asks for a 3-D Secure confirmation. Until then this user cannot connect.',
+                'Fix: app.metakit.cloud > Settings > Billing (confirm the payment). The user can then simply connect again.',
+            ]);
         }
     }
     return { bought: true };
@@ -634,6 +657,19 @@ async function runMaintenance({ linkedIds, inFlightUserIds }) {
                     `Time (Europe/Amsterdam): ${deps.adminNotifyTimestamp()}`,
                 ],
             }).catch(() => {});
+        }
+    }
+
+    // Unpaid slots (3-D Secure pending, declined renewal): tell Bart.
+    const unpaid = await mkPaged('/v1/slots');
+    if (unpaid.ok) {
+        const stuck = unpaid.data.filter(s => s.status === 'incomplete' || s.status === 'past_due');
+        if (stuck.length > 0) {
+            alertSlots('[EmotionLock] ACTION: MetaKit slot payment needs your approval', [
+                `${stuck.length} MetaKit slot(s) are not paid (${stuck.map(s => `${s.id}: ${s.status}`).join(', ')}).`,
+                'A past_due slot can disconnect a paying user. No new slots are bought while this lasts.',
+                'Fix: app.metakit.cloud > Settings > Billing (confirm the payment or update the card).',
+            ]);
         }
     }
 
