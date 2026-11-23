@@ -1,15 +1,14 @@
 'use strict';
 
-// MetaKit (metakit.cloud) as a second MT5 provider next to MetaAPI (D-048, D-050).
+// MetaKit (metakit.cloud), the only MT5 provider since D-058 (was a second
+// provider next to MetaAPI in D-048, D-050).
 //
-// How it plugs in: a MetaKit account is stored in the same place as a MetaAPI
-// account (purchases.meta_api_account_id, userStates[].metaApiAccountId) with
-// the prefix "mk:", e.g. "mk:56". The low-level MetaAPI helpers in index.js
-// check isMetaKitId() first and hand the call to this module, so every
-// existing flow (connect, cleanup, refund, delete-account, restore, poller)
-// works unchanged for both providers. This module returns data in the shape
-// the MetaAPI REST API returns, so the trade counting and loss-limit code is
-// shared and identical.
+// How it plugs in: a MetaKit account is stored in purchases.meta_api_account_id
+// and userStates[].metaApiAccountId (historic names) with the prefix "mk:",
+// e.g. "mk:56". The provider helpers in index.js hand every call to this
+// module; an id without the prefix is a legacy MetaAPI id and is treated as
+// gone. This module returns data in the shape the trade counting and
+// loss-limit code in index.js was written for (the former MetaAPI shape).
 //
 // Semantics that differ on purpose:
 //   - "undeploy" deletes the MetaKit account. A stopped MetaKit account keeps
@@ -27,7 +26,7 @@ const PREFIX = 'mk:';
 const cfg = {
     apiKey: String(process.env.METAKIT_API_KEY || '').trim(),
     webhookSecret: String(process.env.METAKIT_WEBHOOK_SECRET || '').trim(),
-    provider: String(process.env.MT5_PROVIDER || 'metaapi').trim().toLowerCase(),
+    provider: 'metakit',
     testUserIds: new Set(
         (process.env.METAKIT_TEST_USER_IDS || '').split(',').map(s => s.trim().toLowerCase()).filter(Boolean)
     ),
@@ -40,10 +39,6 @@ const cfg = {
     // shows). A failed try is remembered for 24h. METAKIT_TRY_UNLISTED_SERVERS=false
     // skips the try.
     tryUnlistedServers: process.env.METAKIT_TRY_UNLISTED_SERVERS !== 'false',
-    // MetaKit-only (Bart, 23 Nov 2026): when MetaKit cannot connect a user,
-    // the connect fails with a clear message instead of moving the user to
-    // MetaAPI. MT5_FALLBACK_TO_METAAPI=true brings the fallback back.
-    fallbackToMetaApi: process.env.MT5_FALLBACK_TO_METAAPI === 'true',
 };
 
 let deps = {
@@ -54,8 +49,8 @@ let deps = {
 
 function init(injected) {
     deps = { ...deps, ...injected };
-    if (cfg.provider === 'metakit' && !cfg.apiKey) {
-        console.error('[metakit] MT5_PROVIDER=metakit but METAKIT_API_KEY is not set: new connects stay on MetaAPI');
+    if (!cfg.apiKey) {
+        console.error('[metakit] METAKIT_API_KEY is not set: MT5 connects will fail');
     }
     console.log(`[metakit] provider=${cfg.provider} configured=${isConfigured()} testUsers=${cfg.testUserIds.size} webhookSecret=${cfg.webhookSecret ? 'set' : 'missing'}`);
 }
@@ -77,15 +72,13 @@ function toPrefixedId(rawId) {
 }
 
 // New connects go to MetaKit when the global trigger is on, or for test users.
-function useMetaKitFor(userId) {
-    if (!isConfigured()) return false;
-    if (cfg.provider === 'metakit') return true;
-    return !!userId && cfg.testUserIds.has(String(userId).toLowerCase());
+function useMetaKitFor() {
+    return true;
 }
 
-// Errors where the connect may fall back to MetaAPI (MetaKit cannot serve
-// this user right now). Credential errors are NOT in this group: a wrong
-// investor password is wrong at MetaAPI too.
+// Errors where MetaKit cannot serve this user right now (unknown server, slot
+// brake, payment, MetaKit unreachable). index.js turns them into a clear
+// message for the app. Credential errors are NOT in this group.
 class MetaKitFallbackError extends Error {
     constructor(reason, message) {
         super(message || reason);
@@ -254,6 +247,16 @@ async function findBrokerId(server) {
     return id === undefined ? null : id;
 }
 
+// True when MetaKit's broker list (reloaded at most every 5 minutes on a miss)
+// contains this server. Used by the hourly server-request check (D-058).
+async function isServerListed(server) {
+    try {
+        return (await findBrokerId(server)) !== null;
+    } catch {
+        return false;
+    }
+}
+
 // ── Slot pool ─────────────────────────────────────────────────────────────
 function amsterdamDayStartMs(nowMs = Date.now()) {
     const ymd = new Intl.DateTimeFormat('en-CA', { timeZone: 'Europe/Amsterdam', year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date(nowMs));
@@ -294,9 +297,9 @@ async function ensureFreeSlotLocked(userId) {
     const dayStart = amsterdamDayStartMs();
     const boughtToday = slots.data.filter(s => Date.parse(s.created_at) >= dayStart).length;
     if (boughtToday >= cfg.maxSlotPurchasesPerDay) {
-        alertSlots('[EmotionLock] MetaKit slot brake reached, new connects go to MetaAPI', [
+        alertSlots('[EmotionLock] MetaKit slot brake reached, new connects are refused', [
             `${boughtToday} MetaKit slots were bought today (limit ${cfg.maxSlotPurchasesPerDay} per day, D-050).`,
-            'No more slots are bought today. New MT5 connects fall back to MetaAPI until tomorrow.',
+            'No more slots are bought today. New MT5 connects fail with "temporarily busy" until tomorrow, unless a slot frees up.',
             `Last user: ${userId}`,
             'Raise METAKIT_MAX_SLOT_PURCHASES_PER_DAY on Railway if this is real growth.',
         ]);
@@ -307,7 +310,7 @@ async function ensureFreeSlotLocked(userId) {
     if (bought.status === 402) {
         alertSlots('[EmotionLock] MetaKit slot purchase refused (payment)', [
             'MetaKit refused to buy a slot: no valid card on file or the payment failed.',
-            'New MT5 connects fall back to MetaAPI. Check Settings > Billing in MetaKit.',
+            'New MT5 connects fail until this is fixed. Check Settings > Billing in MetaKit.',
             `Response: ${bought.text.slice(0, 300)}`,
         ]);
         throw new MetaKitFallbackError('payment_required', 'MetaKit slot purchase needs a payment method');
@@ -395,14 +398,14 @@ function credentialError() {
     return new Error('MetaKit connect failed: {"error":"ValidationError","message":"MetaKit could not log in to the broker"}');
 }
 
-// Counterpart of createOrRecoverMetaApiAccount, with the same safety net:
+// Creates the user's MetaKit account, with a safety net:
 // look for an account named EmotionLock-<userId> before creating one.
 const unlistedFailedAt = new Map(); // server (lower case) -> ms of the failed try
 const UNLISTED_RETRY_MS = 24 * 3600 * 1000;
 
 function markUnlistedFailed(server, why) {
     unlistedFailedAt.set(String(server).trim().toLowerCase(), Date.now());
-    console.log(`[metakit] unlisted server ${server} did not work (${why}), MetaAPI for the next 24h`);
+    console.log(`[metakit] unlisted server ${server} did not work (${why}), not retried for 24h`);
 }
 
 async function createOrRecoverAccount(server, login, password, userId) {
@@ -467,13 +470,13 @@ async function createOrRecoverAccount(server, login, password, userId) {
     const rawId = created.json.id;
     console.log(`[metakit] created account ${rawId} for user ${userId} on ${server}`);
     // Shorter wait for an unlisted server: if MetaKit cannot connect, the
-    // MetaAPI fallback still has to fit in the app's 90s connect timeout.
+    // answer still has to fit in the app's 90s connect timeout.
     const outcome = await waitForConnect(rawId, unlisted ? Math.min(cfg.connectWaitMs, 30000) : cfg.connectWaitMs);
     if (outcome === 'error') {
         await releaseAccount(toPrefixedId(rawId)).catch(() => {});
         if (unlisted) {
             // Could be the password, could be MetaKit not knowing this broker.
-            // MetaAPI tells the user which one it is.
+            // Treated as an unsupported server: the user gets the request flow.
             markUnlistedFailed(server, 'connect error');
             throw new MetaKitFallbackError('broker_unsupported', `MetaKit could not connect to unlisted server ${server}`);
         }
@@ -695,6 +698,7 @@ module.exports = {
     getOpenPositions,
     getCurrency,
     quoteServerTime,
+    isServerListed,
     // webhooks
     verifySignature,
     checkSignature,

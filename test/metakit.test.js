@@ -87,10 +87,8 @@ test('webhookAccountId: trade and account events', () => {
     assert.strictEqual(metakit.webhookAccountId({}), null);
 });
 
-test('useMetaKitFor: off by default (MT5_PROVIDER unset), on for test users only', () => {
-    assert.strictEqual(metakit.cfg.provider, 'metaapi');
-    assert.strictEqual(metakit.useMetaKitFor('ABC'), false);
-    metakit.cfg.testUserIds.add('abc');
+test('useMetaKitFor: MetaKit is the only provider (D-058)', () => {
+    assert.strictEqual(metakit.cfg.provider, 'metakit');
     assert.strictEqual(metakit.useMetaKitFor('ABC'), true);
-    metakit.cfg.testUserIds.delete('abc');
+    assert.strictEqual('fallbackToMetaApi' in metakit.cfg, false);
 });

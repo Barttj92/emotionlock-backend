@@ -369,7 +369,7 @@ async function restoreLossLimitState(userId, user, todayISO) {
 // it). Fire-and-forget, throttled to one attempt per 10 minutes per user.
 // Read-only call on the existing account: no new MetaAPI account, no cost.
 async function maybeFetchAccountCurrency(userId, user) {
-    if (user.accountCurrency || !user.metaApiAccountId || !user.mt5Region) return;
+    if (user.accountCurrency || !user.metaApiAccountId) return;
     const nowMs = Date.now();
     if (user.lastCurrencyFetchAttempt && nowMs - user.lastCurrencyFetchAttempt < 10 * 60 * 1000) return;
     user.lastCurrencyFetchAttempt = nowMs;
@@ -386,22 +386,7 @@ async function maybeFetchAccountCurrency(userId, user) {
         }
         return;
     }
-    const url = `https://mt-client-api-v1.${user.mt5Region}.agiliumtrade.ai/users/current/accounts/${user.metaApiAccountId}/account-information`;
-    try {
-        const response = await fetch(url, { headers: { 'auth-token': METAAPI_TOKEN } });
-        if (!response.ok) {
-            debugLog(`[currency] HTTP ${response.status} for ${userId.slice(0, 8)}`);
-            return;
-        }
-        const info = await response.json();
-        const currency = typeof info?.currency === 'string' ? info.currency.trim().toUpperCase().slice(0, 8) : null;
-        if (!currency) return;
-        user.accountCurrency = currency;
-        saveAccountCurrency(userId, currency).catch(() => {});
-        console.log(`[currency] ${userId.slice(0, 8)}: account currency ${currency}`);
-    } catch (e) {
-        debugLog(`[currency] fetch error for ${userId.slice(0, 8)}: ${e.message}`);
-    }
+    // Legacy MetaAPI id (D-058): MetaAPI is no longer used, nothing to fetch.
 }
 
 // Clears today's loss-mode counters (account switch, onboarding reset).
@@ -665,42 +650,9 @@ async function maybeSendLockReminder(userId, user) {
 const MT5_DOWN_NOTIFY_AFTER_MS = 20 * 60 * 1000;
 const MT5_DOWN_NOTIFY_EVERY_MS = 24 * 3600 * 1000;
 
-// MetaAPI refuses every deploy with "please top up your account" once the
-// MetaAPI balance is empty (19 Nov 2026: all accounts undeployed for about
-// 9 hours). That is our problem, not the user's: alert Bart, at most once per
-// 3 hours, and do not tell users to reconnect MT5 while it lasts.
-const METAAPI_BALANCE_FLAG_MS = 30 * 60 * 1000;
-const METAAPI_BALANCE_ALERT_EVERY_MS = 3 * 3600 * 1000;
-let metaApiBalanceEmptyAt = 0;
-let metaApiBalanceAlertAt = 0;
-let metaApiOutageAlertAt = 0;
-
-function isMetaApiBalanceEmpty() {
-    return metaApiBalanceEmptyAt > 0 && Date.now() - metaApiBalanceEmptyAt < METAAPI_BALANCE_FLAG_MS;
-}
-
-function isMetaApiTopUpError(message) {
-    return /top up your account/i.test(String(message || ''));
-}
-
-function markMetaApiBalanceEmpty(userId) {
-    const now = Date.now();
-    metaApiBalanceEmptyAt = now;
-    if (metaApiBalanceAlertAt && now - metaApiBalanceAlertAt < METAAPI_BALANCE_ALERT_EVERY_MS) return;
-    metaApiBalanceAlertAt = now;
-    console.error(`[metaapi-balance] deploy refused for ${String(userId).slice(0, 8)}: MetaAPI balance is empty, top up now`);
-    notifyAdmin({
-        subject: 'URGENT: MetaAPI balance empty, accounts cannot deploy',
-        lines: [
-            'MetaAPI refuses to deploy trading accounts: "please top up your account".',
-            'Until the balance is topped up, no trades are tracked and no limits lock.',
-            '',
-            'Top up in the MetaAPI dashboard (app.metaapi.cloud).',
-            'After the top-up the backend redeploys the accounts by itself within 10 minutes.',
-            'Users are not told to reconnect MT5 while this lasts.',
-        ],
-    }).catch(() => {});
-}
+// System-wide outage alert: at most once per 3 hours.
+const MT5_OUTAGE_ALERT_EVERY_MS = 3 * 3600 * 1000;
+let mt5OutageAlertAt = 0;
 
 // True when (almost) every tracked account is down at the same time. Then the
 // cause is MetaAPI or our billing, not the user's broker login, and telling
@@ -711,12 +663,6 @@ function isSystemWideMt5Outage() {
     if (tracked.length < 3) return false;
     const down = tracked.filter(u => u.mt5DownSince).length;
     return down / tracked.length >= 0.8;
-}
-
-function clearMetaApiBalanceEmpty() {
-    if (!metaApiBalanceEmptyAt) return;
-    console.log('[metaapi-balance] deploy works again, balance flag cleared');
-    metaApiBalanceEmptyAt = 0;
 }
 
 function trackMt5Down(userId, user, isReady, accountInfo) {
@@ -774,19 +720,18 @@ async function maybeNotifyMt5Down(userId, user, accountInfo) {
     const short = String(userId).slice(0, 8);
     const now = Date.now();
     if (user._mt5DownNotifyBusy) return;
-    if (isMetaApiBalanceEmpty()) return;
     if (isSystemWideMt5Outage()) {
         const now = Date.now();
-        if (!metaApiOutageAlertAt || now - metaApiOutageAlertAt > METAAPI_BALANCE_ALERT_EVERY_MS) {
-            metaApiOutageAlertAt = now;
+        if (!mt5OutageAlertAt || now - mt5OutageAlertAt > MT5_OUTAGE_ALERT_EVERY_MS) {
+            mt5OutageAlertAt = now;
             const tracked = Object.values(userStates).filter(u => u && u.metaApiAccountId);
             console.error(`[mt5-down] system-wide: ${tracked.filter(u => u.mt5DownSince).length} of ${tracked.length} accounts down, users not notified`);
             notifyAdmin({
                 subject: 'URGENT: almost all MT5 accounts down at once',
                 lines: [
                     `${tracked.filter(u => u.mt5DownSince).length} of ${tracked.length} tracked MT5 accounts are not connected.`,
-                    'This points to MetaAPI or billing, not to user logins. Users are NOT told to reconnect while this lasts.',
-                    'Check the MetaAPI dashboard (accounts and billing) and the MetaAPI status.',
+                    'This points to MetaKit or billing, not to user logins. Users are NOT told to reconnect while this lasts.',
+                    'Check the MetaKit dashboard (app.metakit.cloud: accounts, slots, payment method) and their status.',
                 ],
             }).catch(() => {});
         }
@@ -862,75 +807,23 @@ function appIsPolling(user) {
 }
 
 // =====================
-// MetaApi setup
+// MT5 provider: MetaKit only (D-058)
 // =====================
-const METAAPI_TOKEN = process.env.METAAPI_TOKEN;
-const PROVISIONING_API = 'https://mt-provisioning-api-v1.agiliumtrade.agiliumtrade.ai';
-
-// MetaAPI answers 202 Accepted (not 201) while it is still validating the
-// connection to the broker ("Account connection validation is in progress,
-// please retry in 60 seconds"). The 202 body is NOT an account: it is a
-// message envelope with a numeric "id". We used to treat that as the account
-// id and then fail on deploy with "Trading account with id 3747 not found".
-//
-// We do NOT retry inside this request. The create POST itself already takes
-// 30-40s and MetaAPI asks for a 60s pause, which does not fit in the 90s the
-// iOS app waits for /connect-mt5. Retrying earlier than MetaAPI asks (we did
-// that at first, every 10s) only pushes its recommendedRetryTime further out.
-// So: report "pending" and let the user try again after a minute; a 202 means
-// nothing was created, so the next attempt cannot produce a duplicate.
-async function createMetaApiAccount(server, login, password, name) {
-    const response = await postCreateMetaApiAccount(server, login, password, name);
-    if (response.status === 202) {
-        const body = await response.text().catch(() => '');
-        console.log(`[metaapi] Create for "${name}" accepted (202), broker connection validation in progress. ${body}`);
-        throw new Error(`MetaApi create account pending: {"error":"BrokerSettingsDetection","message":"Broker connection validation in progress"}`);
-    }
-    return parseCreatedMetaApiAccount(response, name);
+// MetaAPI is no longer used anywhere. The provider helpers below keep their
+// historic names (deployMetaApiAccount, fetchMetaApiAccountInfo, ...) and the
+// purchases column keeps its name (meta_api_account_id) so call sites and the
+// Command Center stay unchanged. Every id stored there is either a MetaKit id
+// ("mk:<id>") or a legacy MetaAPI id. A legacy id is treated as an account that
+// no longer exists: the user is shown as not connected and reconnects in the
+// app, which creates a MetaKit account. MetaAPI itself is never called.
+function isLegacyMt5AccountId(accountId) {
+    return !!accountId && !metakit.isMetaKitId(accountId);
 }
 
-async function parseCreatedMetaApiAccount(response, name) {
-    if (!response.ok) {
-        const err = await response.text();
-        throw new Error(`MetaApi create account failed: ${err}`);
-    }
-    const account = await response.json();
-    // A real account id is a string (UUID-like). Anything else means MetaAPI
-    // sent a message envelope we do not understand; never deploy on it.
-    if (typeof account?.id !== 'string' || account.id.length < 10) {
-        throw new Error(`MetaApi create account failed: unexpected response ${JSON.stringify(account)}`);
-    }
-    // We explicitly request reliability:'regular' (see postCreateMetaApiAccount), but the
-    // MetaAPI dashboard has been observed showing "high reliability" for
-    // accounts created this way. Log what MetaAPI actually confirms back so
-    // we can see per account, straight from Railway logs, whether our request
-    // is honored or silently overridden server-side — no dashboard click needed.
-    console.log(`[metaapi] Created account ${account.id} for "${name}": reliability=${account.reliability ?? 'not present in response'}`);
-    return account;
-}
-
-function postCreateMetaApiAccount(server, login, password, name) {
-    return fetch(`${PROVISIONING_API}/users/current/accounts`, {
-        method: 'POST',
-        headers: {
-            'auth-token': METAAPI_TOKEN,
-            'Content-Type': 'application/json'
-        },
-        body: JSON.stringify({
-            login: String(login),
-            password,
-            name,
-            server,
-            platform: 'mt5',
-            type: 'cloud',
-            magic: 0,
-            application: 'MetaApi',
-            // Explicit G1 tier (regular reliability). Never use 'high' — doubles hourly cost.
-            reliability: 'regular',
-            copyFactoryRoles: [],
-            tags: ['emotionlock']
-        })
-    });
+function legacyAccountError(accountId) {
+    const err = new Error(`Legacy MetaAPI account ${accountId} is no longer supported: NotFoundError`);
+    err.code = 'MT5_LEGACY_ACCOUNT';
+    return err;
 }
 
 // Turns a raw MetaAPI error into a message the iOS app can show the user
@@ -976,76 +869,26 @@ function friendlyMt5ConnectError(err) {
     return fallback;
 }
 
+// Starts the MetaKit account (it reconnects to the broker).
 async function deployMetaApiAccount(accountId) {
-    if (metakit.isMetaKitId(accountId)) return void (await metakit.startAccount(accountId));
-    const response = await fetch(`${PROVISIONING_API}/users/current/accounts/${accountId}/deploy`, {
-        method: 'POST',
-        headers: { 'auth-token': METAAPI_TOKEN }
-    });
-    if (!response.ok) {
-        const err = await response.text();
-        throw new Error(`MetaApi deploy failed: ${err}`);
-    }
+    if (isLegacyMt5AccountId(accountId)) throw legacyAccountError(accountId);
+    await metakit.startAccount(accountId);
 }
 
-// MetaAPI's own infra needs a moment to propagate a freshly created account
-// before /deploy can see it — deploying immediately after create can 404
-// with a NotFoundError even though the account genuinely exists. Retries
-// only on that specific error (not on real failures like bad auth) with a
-// short backoff, so a slow propagation window doesn't fail the whole
-// connect attempt and doesn't cause createOrRecoverMetaApiAccount to spin
-// up a second, duplicate account on the user's next retry.
-async function deployMetaApiAccountWithRetry(accountId, attempts = 4, delayMs = 3000) {
-    for (let i = 0; i < attempts; i++) {
-        try {
-            await deployMetaApiAccount(accountId);
-            return;
-        } catch (e) {
-            const isPropagationLag = /NotFoundError/i.test(e.message);
-            if (!isPropagationLag || i === attempts - 1) throw e;
-            console.log(`[metaapi] Deploy not-found for ${accountId} (propagation lag), retrying in ${delayMs}ms (attempt ${i + 1}/${attempts})`);
-            await new Promise(r => setTimeout(r, delayMs));
-        }
-    }
+// Pushes a new password (and server) to an existing MetaKit account. Used when
+// a user reconnects the SAME server + login but the account never reached the
+// broker, so a user who first typed a wrong password can fix it in the app.
+async function updateMetaApiAccountPassword(accountId, { server, password }) {
+    if (isLegacyMt5AccountId(accountId)) throw legacyAccountError(accountId);
+    return metakit.updateConnection(accountId, { server, password });
 }
 
-// Pushes a new password to an existing MetaAPI account. Used when a user
-// reconnects the SAME server + login (so we reuse the account, no duplicate)
-// but the account never reached the broker: before this, the reconnect
-// ignored the password the user just typed, so a user who first entered a
-// wrong password could never fix it from the app. MetaAPI requires name,
-// server and password on PUT and a redeploy before the change takes effect.
-async function updateMetaApiAccountPassword(accountId, { name, server, password }) {
-    if (metakit.isMetaKitId(accountId)) return metakit.updateConnection(accountId, { server, password });
-    const response = await fetch(`${PROVISIONING_API}/users/current/accounts/${accountId}`, {
-        method: 'PUT',
-        headers: {
-            'auth-token': METAAPI_TOKEN,
-            'Content-Type': 'application/json'
-        },
-        body: JSON.stringify({ name, server, password })
-    });
-    if (!response.ok) {
-        const err = await response.text();
-        throw new Error(`MetaApi update account failed: ${err}`);
-    }
-}
-
+// "Undeploy" deletes the MetaKit account so its paid slot is free for the next
+// user (a stopped MetaKit account keeps its slot and keeps costing). A legacy
+// MetaAPI id is a no-op: Bart removes those accounts at MetaAPI himself.
 async function undeployMetaApiAccount(accountId) {
-    // MetaKit: "undeploy" deletes the account so its paid slot is free for the
-    // next user (a stopped MetaKit account keeps its slot and keeps costing).
-    if (metakit.isMetaKitId(accountId)) {
-        try { await metakit.releaseAccount(accountId); } catch (e) { console.log('Undeploy warning (metakit):', e.message); }
-        return;
-    }
-    try {
-        await fetch(`${PROVISIONING_API}/users/current/accounts/${accountId}/undeploy`, {
-            method: 'POST',
-            headers: { 'auth-token': METAAPI_TOKEN }
-        });
-    } catch (e) {
-        console.log('Undeploy warning:', e.message);
-    }
+    if (isLegacyMt5AccountId(accountId)) return;
+    try { await metakit.releaseAccount(accountId); } catch (e) { console.log('Undeploy warning (metakit):', e.message); }
 }
 
 // Fire-and-forget redeploy used when /status restores a user from Supabase.
@@ -1076,42 +919,17 @@ async function redeployOnRestoreIfActive(userId, accountId) {
 }
 
 async function undeployAndDeleteMetaApiAccount(accountId) {
-    if (metakit.isMetaKitId(accountId)) return void (await metakit.releaseAccount(accountId));
-    await undeployMetaApiAccount(accountId);
-    await new Promise(r => setTimeout(r, 3000));
-    const response = await fetch(`${PROVISIONING_API}/users/current/accounts/${accountId}`, {
-        method: 'DELETE',
-        headers: { 'auth-token': METAAPI_TOKEN }
-    });
-    if (!response.ok) {
-        const err = await response.text();
-        throw new Error(`MetaApi delete failed: ${err}`);
-    }
+    if (isLegacyMt5AccountId(accountId)) return;
+    await metakit.releaseAccount(accountId);
 }
 
-// Forces a MetaAPI account to reconnect to the broker by cycling deploy state.
-// Used by the polling auto-recovery path when an account is DEPLOYED but
-// connectionStatus is DISCONNECTED — calling /deploy alone on an already
-// deployed account is a no-op and won't kick the broker connection. The
-// undeploy-then-deploy cycle is the documented way to force a fresh sync.
-// Returns true on success, false on any failure (logged, never throws to
-// caller so the polling loop can stay healthy).
+// Asks MetaKit to reconnect the account to the broker. Used by the polling
+// auto-recovery path when an account stays disconnected. Returns true on
+// success, false on any failure (logged, never throws to the polling loop).
 async function redeployMetaApiAccount(accountId) {
-    if (metakit.isMetaKitId(accountId)) {
-        try { await metakit.startAccount(accountId); return true; }
-        catch (e) { console.error(`[redeploy] MetaKit start failed for ${accountId}: ${e.message}`); return false; }
-    }
-    try {
-        await undeployMetaApiAccount(accountId);
-        // Short wait so MetaAPI registers the undeploy before we redeploy.
-        // Empirically 3-5s is enough; we use 5s to be safe on a slow region.
-        await new Promise(r => setTimeout(r, 5000));
-        await deployMetaApiAccountWithRetry(accountId);
-        return true;
-    } catch (e) {
-        console.error(`[redeploy] Failed for ${accountId}: ${e.message}`);
-        return false;
-    }
+    if (isLegacyMt5AccountId(accountId)) return false;
+    try { await metakit.startAccount(accountId); return true; }
+    catch (e) { console.error(`[redeploy] MetaKit start failed for ${accountId}: ${e.message}`); return false; }
 }
 
 async function getMetaApiAccountInfo(accountId) {
@@ -1119,96 +937,12 @@ async function getMetaApiAccountInfo(accountId) {
     return account;
 }
 
-// Same lookup, but tells the caller WHY there is no account: a 404 means the
-// account is really gone from MetaAPI, anything else (5xx, timeout) may be
-// transient. The trade poller needs that difference.
+// Account lookup that tells the caller WHY there is no account: a 404 means
+// the account is really gone (or a legacy MetaAPI id), anything else (5xx,
+// timeout) may be transient. The trade poller needs that difference.
 async function fetchMetaApiAccountInfo(accountId) {
-    if (metakit.isMetaKitId(accountId)) return metakit.fetchAccountInfo(accountId);
-    // Bounded: a hanging lookup used to hold up a whole poll cycle for two
-    // minutes. A timeout throws, which both callers treat as "unknown, try
-    // again" (the poller) or a failed connect attempt (never a new account).
-    const response = await fetch(`${PROVISIONING_API}/users/current/accounts/${accountId}`, {
-        headers: { 'auth-token': METAAPI_TOKEN },
-        signal: AbortSignal.timeout(30000)
-    });
-    if (!response.ok) {
-        const errText = await response.text();
-        console.log(`[metaapi] getAccountInfo HTTP ${response.status} for ${accountId}: ${errText.slice(0, 200)}`);
-        // An account that belongs to another MetaAPI user answers 403 "You do
-        // not have access to ... resources". For this token it does not exist,
-        // so report it as 404: the poller then shows "Connect MT5" and the
-        // connect flow creates a fresh account. Needed after the switch to a
-        // new MetaAPI account on 21 Nov 2026 (old ids stay in Supabase).
-        if (response.status === 403 && /do not have access/i.test(errText)) {
-            return { account: null, status: 404 };
-        }
-        return { account: null, status: response.status };
-    }
-    return { account: await response.json(), status: response.status };
-}
-
-// Safety net against duplicate accounts: if Supabase row and in-memory state are
-// both missing (server restart with stale data, lost rows, etc.) we still need to
-// find any pre-existing MetaAPI account tied to this user before creating a new one.
-// Every account we create is named `EmotionLock-${userId}` and tagged 'emotionlock'
-// so we can recover by listing accounts and matching on name.
-//
-// MetaAPI has answered the list endpoint with a plain array, but newer API
-// versions wrap a page as { items, count }. The old lookup only accepted an
-// array and returned null without a log line for anything else, which made the
-// safety net a silent no-op: between 1 and 9 Nov 2026 it never matched once,
-// while duplicates were being created. Both shapes are accepted now, and an
-// unknown shape is logged.
-function extractMetaApiAccountsPage(body) {
-    if (Array.isArray(body)) return body;
-    if (body && Array.isArray(body.items)) return body.items;
-    return null;
-}
-
-// Lists every MetaAPI account on our token, walking pages so the safety net
-// keeps working past 100 accounts. Returns null (logged) when the lookup
-// itself failed, so callers can tell "no accounts" apart from "unknown".
-async function listAllMetaApiAccounts() {
-    const PAGE_LIMIT = 100;
-    const MAX_PAGES = 50; // Hard ceiling: 5000 accounts. Plenty for years of growth.
-    const all = [];
-    try {
-        for (let page = 0; page < MAX_PAGES; page++) {
-            const offset = page * PAGE_LIMIT;
-            const url = `${PROVISIONING_API}/users/current/accounts?limit=${PAGE_LIMIT}&offset=${offset}`;
-            const response = await fetch(url, {
-                headers: { 'auth-token': METAAPI_TOKEN }
-            });
-            if (!response.ok) {
-                console.log(`[metaapi] list accounts HTTP ${response.status} (page ${page})`);
-                return null;
-            }
-            const body = await response.json();
-            const accounts = extractMetaApiAccountsPage(body);
-            if (!accounts) {
-                console.log(`[metaapi] list accounts: unexpected response shape (page ${page}): ${JSON.stringify(body).slice(0, 200)}`);
-                return null;
-            }
-            all.push(...accounts.filter(Boolean));
-            // Last page: fewer results than limit means we have seen everything.
-            if (accounts.length < PAGE_LIMIT) return all;
-        }
-        console.log(`[metaapi] list accounts stopped after ${MAX_PAGES} pages, result may be incomplete`);
-        return all;
-    } catch (err) {
-        console.log(`[metaapi] list accounts error: ${err.message}`);
-        return null;
-    }
-}
-
-// Every account named `name` (case-insensitive, the iOS app sends upper-case
-// UUIDs while Supabase stores lower-case). [] when none, null when the lookup
-// failed.
-async function findMetaApiAccountsByName(name) {
-    const accounts = await listAllMetaApiAccounts();
-    if (!accounts) return null;
-    const wanted = String(name).toLowerCase();
-    return accounts.filter(a => String(a.name || '').toLowerCase() === wanted);
+    if (isLegacyMt5AccountId(accountId)) return { account: null, status: 404 };
+    return metakit.fetchAccountInfo(accountId);
 }
 
 // MT5 server names are case-insensitive for the broker and MetaAPI stores its
@@ -1219,107 +953,6 @@ function sameMt5Server(a, b) {
     return String(a ?? '').trim().toLowerCase() === String(b ?? '').trim().toLowerCase();
 }
 
-// Wraps createMetaApiAccount with the safety-net check. Always called instead of
-// createMetaApiAccount directly from the connect-mt5 flow. Behavior:
-//   1. List MetaAPI accounts and look for one named `EmotionLock-${userId}`
-//   2. If found AND credentials match: redeploy and reuse (no new account)
-//   3. If found but credentials are stale: delete it, then create fresh
-//   4. If not found: create fresh
-// Returns { id, region, recovered }.
-// Global cap on FRESH MetaAPI account creations. Each account is billed per
-// hour, and /connect-mt5 can be called by anyone holding a UUID, so without a
-// global ceiling a script rotating IPs could create accounts at our expense.
-// Normal volume is a few new connects per day, so the default of 20/hour is
-// far above real usage. Reuse and orphan recovery never count against it.
-// The window is in-memory, so a restart resets it, which is acceptable here.
-const METAAPI_CREATE_MAX_PER_HOUR = parseInt(process.env.METAAPI_CREATE_MAX_PER_HOUR || '20', 10);
-const metaApiCreateTimestamps = [];
-let metaApiCreateAlertSentAt = 0;
-
-function reserveMetaApiCreateSlot(userId) {
-    const now = Date.now();
-    const hourAgo = now - 60 * 60 * 1000;
-    while (metaApiCreateTimestamps.length && metaApiCreateTimestamps[0] < hourAgo) {
-        metaApiCreateTimestamps.shift();
-    }
-    if (metaApiCreateTimestamps.length >= METAAPI_CREATE_MAX_PER_HOUR) {
-        if (now - metaApiCreateAlertSentAt > 60 * 60 * 1000) {
-            metaApiCreateAlertSentAt = now;
-            notifyAdmin({
-                subject: '[EmotionLock] MetaAPI create limit reached',
-                lines: [
-                    `${METAAPI_CREATE_MAX_PER_HOUR} new MetaAPI accounts were created in the last hour, new creates are paused until the window clears.`,
-                    'This is either a real spike in signups or someone scripting /connect-mt5. Check GET /admin/metaapi-accounts.',
-                    `Last blocked user ID: ${userId}`,
-                    `Raise the cap with the METAAPI_CREATE_MAX_PER_HOUR env var on Railway if the traffic is legitimate.`,
-                ],
-            }).catch(() => {});
-        }
-        return false;
-    }
-    metaApiCreateTimestamps.push(now);
-    return true;
-}
-
-async function createOrRecoverMetaApiAccount(server, login, password, userId) {
-    const name = `EmotionLock-${userId}`;
-    const matches = await findMetaApiAccountsByName(name);
-    if (matches === null) {
-        // Fail open on purpose: refusing to connect would lock new users out
-        // whenever the list call hiccups. The hourly orphan sweep catches a
-        // duplicate that slips through here.
-        console.log(`[metaapi] Name lookup failed for ${name}, continuing with create`);
-    }
-    const found = matches || [];
-    if (found.length > 1) {
-        console.log(`[metaapi] ${found.length} accounts named ${name}: ${found.map(a => `${a.id}(${a.state})`).join(', ')}`);
-    }
-    const reusable = found.filter(a => sameMt5Server(a.server, server) && String(a.login || '') === String(login));
-    const stale = found.filter(a => !reusable.includes(a));
-
-    for (const old of stale) {
-        console.log(`[metaapi] Stale orphan account ${old.id} for user ${userId}, deleting before create`);
-        try {
-            await undeployAndDeleteMetaApiAccount(old.id);
-        } catch (e) {
-            console.log('Orphan cleanup warning:', e.message);
-        }
-    }
-
-    if (reusable.length > 0) {
-        // Prefer the one that is already running, so the user keeps syncing.
-        const keep = reusable.find(a => a.state === 'DEPLOYED') || reusable[0];
-        for (const extra of reusable) {
-            if (extra.id === keep.id) continue;
-            // Same user, same credentials: a pure duplicate. Undeploy only
-            // (reversible) so billing stops; deleting is left to the admin.
-            console.log(`[metaapi] Undeploying duplicate account ${extra.id} for user ${userId} (keeping ${keep.id})`);
-            await undeployMetaApiAccount(extra.id);
-        }
-        console.log(`[metaapi] Recovered orphan account ${keep.id} by name for user ${userId}`);
-        await deployMetaApiAccountWithRetry(keep.id);
-        return { id: keep.id, region: keep.region || null, recovered: true };
-    }
-
-    if (!reserveMetaApiCreateSlot(userId)) {
-        const limitErr = new Error('metaapi_create_limit');
-        limitErr.code = 'METAAPI_CREATE_LIMIT';
-        throw limitErr;
-    }
-    const account = await createMetaApiAccount(server, String(login), password, name);
-    // Short wait before the first deploy attempt — see
-    // deployMetaApiAccountWithRetry for why this matters right after create.
-    await new Promise(r => setTimeout(r, 3000));
-    await deployMetaApiAccountWithRetry(account.id);
-    return { id: account.id, region: account.region || null, recovered: false };
-}
-
-// Provider choice for a NEW account (D-050). MT5_PROVIDER=metakit (or a user in
-// METAKIT_TEST_USER_IDS) creates the account at MetaKit first. When MetaKit
-// cannot serve this user (broker not in its list, daily slot brake, payment,
-// MetaKit unreachable) the connect falls back to MetaAPI through the existing
-// createOrRecoverMetaApiAccount safety net. A rejected login is never retried
-// at MetaAPI: wrong credentials are wrong there too.
 // Admin mail for every MT5 connect attempt (Bart, 23 Nov 2026): success
 // (first connect = trial started, later = reconnect) and failure, with who,
 // which server and login, which provider and what the user was shown. Never
@@ -1341,7 +974,7 @@ async function notifyAdminConnect({ userId, ok, isFirst, server, login, accountI
         const fullName = prof ? `${prof.first_name ?? ''} ${prof.last_name ?? ''}`.trim() : '';
         const who = fullName || 'A user';
         const ctx = await adminUserContext(userId);
-        const provider = accountId ? (metakit.isMetaKitId(accountId) ? 'MetaKit' : 'MetaAPI') : (metakit.useMetaKitFor(userId) ? 'MetaKit' : 'MetaAPI');
+        const provider = 'MetaKit';
         const subject = ok
             ? (isFirst ? `Trial started (MT5 connected): ${fullName || 'a user'}` : `MT5 reconnected: ${fullName || 'a user'} (${server})`)
             : `MT5 connect FAILED: ${fullName || 'a user'} (${server})`;
@@ -1376,51 +1009,176 @@ async function notifyAdminConnect({ userId, ok, isFirst, server, login, accountI
     }
 }
 
-// Mail Bart once per server per 6 hours when a user tries a server MetaKit
-// cannot connect yet, so it can be passed on to MetaKit support.
-const unsupportedServerNotifiedAt = new Map();
-function notifyUnsupportedServer(server, userId) {
-    const key = String(server).trim().toLowerCase();
-    const last = unsupportedServerNotifiedAt.get(key);
-    if (last && Date.now() - last < 6 * 3600 * 1000) return;
-    unsupportedServerNotifiedAt.set(key, Date.now());
-    notifyAdmin({
-        subject: `[EmotionLock] MetaKit cannot connect server ${server}`,
-        lines: [
-            `A user tried to connect MT5 on ${server}. MetaKit does not support this server yet, so the connect failed (no MetaAPI fallback).`,
-            '',
-            `User: ${userId}`,
-            `Server: ${server}`,
-            '',
-            'Ask MetaKit support to add this server (they need the server name or a servers.dat).',
-            `Time (Europe/Amsterdam): ${adminNotifyTimestamp()}`,
-        ],
-    }).catch(() => {});
+// Creates (or recovers by name) the user's MetaKit account. MetaKit is the
+// only MT5 provider (D-058): there is no fallback. A rejected login is thrown
+// as is; a server MetaKit does not know yet becomes MT5_BROKER_NOT_SUPPORTED,
+// anything else (slot brake, payment, MetaKit unreachable) MT5_PROVIDER_BUSY.
+async function createOrRecoverMt5Account(server, login, password, userId) {
+    try {
+        const result = await metakit.createOrRecoverAccount(server, String(login), password, userId);
+        console.log(`[connect-mt5] ${String(userId).slice(0,8)}: connected via MetaKit (${result.id}, recovered=${result.recovered})`);
+        return result;
+    } catch (e) {
+        if (/ValidationError/.test(String(e?.message))) throw e;
+        const reason = e?.reason || e?.name || 'error';
+        console.log(`[connect-mt5] ${String(userId).slice(0,8)}: MetaKit could not connect ${server} (${reason}: ${e?.message})`);
+        logActivity(userId, 'mt5_connect_failed', { server, reason, provider: 'metakit' });
+        const unsupported = /^broker_/.test(String(reason));
+        const err = new Error(`MetaKit ${reason}`);
+        err.code = unsupported ? 'MT5_BROKER_NOT_SUPPORTED' : 'MT5_PROVIDER_BUSY';
+        throw err;
+    }
 }
 
-async function createOrRecoverMt5Account(server, login, password, userId) {
-    if (metakit.useMetaKitFor(userId)) {
-        try {
-            const result = await metakit.createOrRecoverAccount(server, String(login), password, userId);
-            console.log(`[connect-mt5] ${String(userId).slice(0,8)}: connected via MetaKit (${result.id}, recovered=${result.recovered})`);
-            return result;
-        } catch (e) {
-            if (/ValidationError/.test(String(e?.message))) throw e;
-            const reason = e?.reason || e?.name || 'error';
-            if (!metakit.cfg.fallbackToMetaApi) {
-                console.log(`[connect-mt5] ${String(userId).slice(0,8)}: MetaKit could not connect ${server} (${reason}: ${e?.message}), no MetaAPI fallback`);
-                logActivity(userId, 'mt5_connect_failed', { server, reason, provider: 'metakit' });
-                const unsupported = /^broker_/.test(String(reason));
-                const err = new Error(`MetaKit ${reason}`);
-                err.code = unsupported ? 'MT5_BROKER_NOT_SUPPORTED' : 'MT5_PROVIDER_BUSY';
-                throw err;
-            }
-            console.log(`[connect-mt5] ${String(userId).slice(0,8)}: MetaKit unavailable for ${server} (${reason}: ${e?.message}), falling back to MetaAPI`);
-            logActivity(userId, 'mt5_provider_fallback', { server, reason });
-        }
-    }
-    return createOrRecoverMetaApiAccount(server, String(login), password, userId);
+// =====================
+// Broker server requests (D-058)
+// =====================
+// A user tries a server MetaKit does not list yet. We remember the request,
+// mail the user once that we are adding it (Bart gets the "connect FAILED"
+// mail with the server), and check MetaKit's broker list every hour. As soon
+// as the server is listed, the user gets a mail and a push to connect again.
+// Stored in public.mt5_server_requests (migration 023).
+function serverRequestEmail(server) {
+    const lines = [
+        'Hi,',
+        '',
+        `You tried to connect your MT5 account on the server ${server}. Our MT5 connection provider does not support this server yet, so the connection did not go through.`,
+        '',
+        'We are adding it now. As soon as it works, we will send you an email and a notification, so you can connect with one tap.',
+        '',
+        'Is the server name not exactly right? You can find it in your MT5 app under Settings, then Server. Just try again with that name.',
+        '',
+        'Questions? Just reply to this email.',
+        '',
+        'Bart',
+        'EmotionLock',
+    ];
+    return renderPlainMail(lines);
 }
+
+function serverReadyEmail(server) {
+    const lines = [
+        'Hi,',
+        '',
+        `Good news: your broker server ${server} now works with EmotionLock.`,
+        '',
+        'Open EmotionLock and connect your MT5 account again with your server, login number and investor (read-only) password. It takes about a minute.',
+        '',
+        'Questions? Just reply to this email.',
+        '',
+        'Bart',
+        'EmotionLock',
+    ];
+    return renderPlainMail(lines);
+}
+
+function renderPlainMail(lines) {
+    const text = lines.join('\n');
+    const html = `<div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;font-size:15px;line-height:1.6;color:#1a1a1a;max-width:520px">`
+        + lines.map(l => l === '' ? '<br>' : `<div>${escapeHtml(l)}</div>`).join('')
+        + '</div>';
+    return { text, html };
+}
+
+// Records the request and mails the user once per user and server.
+// Fire-and-forget from the connect handler.
+async function handleUnsupportedServer(userId, server, login) {
+    const uid = String(userId).toLowerCase();
+    const serverKey = String(server).trim();
+    try {
+        const { data: existing, error: readErr } = await supabase
+            .from('mt5_server_requests')
+            .select('id, user_mailed_at')
+            .eq('user_id', uid)
+            .ilike('server', serverKey)
+            .eq('status', 'pending')
+            .limit(1)
+            .maybeSingle();
+        if (readErr) throw new Error(readErr.message);
+        let requestId = existing?.id;
+        if (!requestId) {
+            const { data: inserted, error: insErr } = await supabase
+                .from('mt5_server_requests')
+                .insert({ user_id: uid, server: serverKey, login: String(login || '') || null, status: 'pending' })
+                .select('id')
+                .single();
+            if (insErr) throw new Error(insErr.message);
+            requestId = inserted.id;
+        }
+        if (existing?.user_mailed_at) return;
+        const email = await lookupUserEmail(userId);
+        if (!email) {
+            console.log(`[server-request] ${uid.slice(0,8)}: ${serverKey} recorded, no email on file`);
+            return;
+        }
+        const { text, html } = serverRequestEmail(serverKey);
+        const mail = await sendUserMail({ to: email, subject: `We're adding your broker server ${serverKey}`, text, html, templateKey: 'mt5_server_request' });
+        await supabase.from('mt5_server_requests').update({ user_mailed_at: new Date().toISOString() }).eq('id', requestId);
+        console.log(`[server-request] ${uid.slice(0,8)}: ${serverKey} recorded, user mail ${mail}`);
+    } catch (e) {
+        console.error(`[server-request] ${uid.slice(0,8)}: ${serverKey}: ${e.message}`);
+    }
+}
+
+// Hourly: for every pending request whose server MetaKit now lists, mail and
+// push the user and mark the request as notified. One admin summary per run.
+async function checkPendingServerRequests() {
+    try {
+        // A request nobody can fulfil (typo in the server name, broker without
+        // MT5) stops being checked after 30 days.
+        await supabase.from('mt5_server_requests')
+            .update({ status: 'expired' })
+            .eq('status', 'pending')
+            .lt('created_at', new Date(Date.now() - 30 * 24 * 3600 * 1000).toISOString());
+        const { data: pending, error } = await supabase
+            .from('mt5_server_requests')
+            .select('id, user_id, server')
+            .eq('status', 'pending')
+            .limit(200);
+        if (error) throw new Error(error.message);
+        if (!pending || pending.length === 0) return;
+        const ready = [];
+        for (const req of pending) {
+            if (await metakit.isServerListed(req.server)) ready.push(req);
+        }
+        if (ready.length === 0) return;
+        const done = [];
+        for (const req of ready) {
+            const email = await lookupUserEmail(req.user_id);
+            let mail = 'no email on file';
+            if (email) {
+                const { text, html } = serverReadyEmail(req.server);
+                mail = await sendUserMail({ to: email, subject: `Your broker server ${req.server} now works with EmotionLock`, text, html, templateKey: 'mt5_server_ready' });
+            }
+            const { data: p } = await supabase.from('purchases').select('device_token').eq('user_id', req.user_id).limit(1).maybeSingle();
+            const push = p?.device_token
+                ? await sendPushNotification(p.device_token, 'Your broker works now', `${req.server} is supported. Tap to connect your MT5 account.`, { type: 'mt5_reconnect', deepLink: 'mt5_connect' })
+                : { ok: false, error: 'no device token' };
+            await supabase.from('mt5_server_requests')
+                .update({ status: 'notified', notified_at: new Date().toISOString() })
+                .eq('id', req.id);
+            done.push(`  - ${req.server}  user ${String(req.user_id).slice(0, 8)}  mail=${mail}  push=${push.ok ? 'sent' : push.error}`);
+        }
+        console.log(`[server-request] ${done.length} request(s) now supported by MetaKit, users notified`);
+        notifyAdmin({
+            subject: `[EmotionLock] ${done.length} broker server(s) now supported, users notified`,
+            lines: [
+                'MetaKit now lists these servers. The users who asked for them got a mail and a push to connect:',
+                '',
+                ...done,
+                '',
+                `Time (Europe/Amsterdam): ${adminNotifyTimestamp()}`,
+            ],
+        }).catch(() => {});
+    } catch (e) {
+        console.error('[server-request] hourly check failed:', e.message);
+    }
+}
+
+setTimeout(() => {
+    checkPendingServerRequests().catch(() => {});
+    setInterval(() => checkPendingServerRequests().catch(() => {}), 60 * 60 * 1000);
+}, 7 * 60 * 1000);
 
 // Returns the deals array, or null when the fetch failed. null must never be
 // treated as "no deals": the caller then skips this cycle WITHOUT moving
@@ -1429,28 +1187,8 @@ async function createOrRecoverMt5Account(server, login, password, userId) {
 // deals while MetaAPI was still connecting (HTTP 504 "not connected to broker
 // yet"), which silently and permanently dropped every trade closed before it.
 async function getDeals(accountId, region, fromTime, toTime) {
-    if (metakit.isMetaKitId(accountId)) return metakit.getDeals(accountId, fromTime, toTime);
-    const url = `https://mt-client-api-v1.${region}.agiliumtrade.ai/users/current/accounts/${accountId}/history-deals/time/${fromTime}/${toTime}`;
-    try {
-        const response = await fetch(url, {
-            headers: { 'auth-token': METAAPI_TOKEN },
-            signal: AbortSignal.timeout(45000)
-        });
-        if (!response.ok) {
-            const errText = await response.text();
-            console.log(`[getDeals] HTTP ${response.status} for account ${accountId} region ${region}: ${errText.slice(0, 200)}`);
-            return null;
-        }
-        const data = await response.json();
-        if (!Array.isArray(data)) {
-            console.log(`[getDeals] Unexpected response format for account ${accountId}:`, JSON.stringify(data).slice(0, 200));
-            return null;
-        }
-        return data;
-    } catch (e) {
-        console.log(`[getDeals] Fetch error for account ${accountId}: ${e.message}`);
-        return null;
-    }
+    if (isLegacyMt5AccountId(accountId)) return null;
+    return metakit.getDeals(accountId, fromTime, toTime);
 }
 
 // Clock skew between MetaAPI's "UTC" deal timestamps and real UTC.
@@ -1464,16 +1202,8 @@ const TIME_SKEW_TTL_MS = 10 * 60 * 1000;
 const TIME_SKEW_MIN_MS = 30 * 60 * 1000;
 
 async function getServerTime(accountId, region) {
-    if (metakit.isMetaKitId(accountId)) return metakit.quoteServerTime(accountId);
-    const url = `https://mt-client-api-v1.${region}.agiliumtrade.ai/users/current/accounts/${accountId}/server-time`;
-    try {
-        const response = await fetch(url, { headers: { 'auth-token': METAAPI_TOKEN }, signal: AbortSignal.timeout(20000) });
-        if (!response.ok) return null;
-        const data = await response.json();
-        return data && data.time ? data : null;
-    } catch {
-        return null;
-    }
+    if (isLegacyMt5AccountId(accountId)) return null;
+    return metakit.quoteServerTime(accountId);
 }
 
 // One-time (per user, per process) production log of how MetaAPI stamps time
@@ -1546,17 +1276,17 @@ async function getMetaTimeSkewMs(userId, user) {
 
     if (skew !== (user.timeSkewMs || 0)) {
         const h = (ms) => (ms / HOUR).toFixed(2);
-        console.log(`[time-skew] ${userId.slice(0,8)}: server=${user.mt5Server} MetaAPI time=${st.time} brokerTime=${st.brokerTime} assumedOffset=${assumed === null ? 'n/a' : h(assumed) + 'h'} now=${new Date().toISOString()} skew=${h(skew)}h (was ${h(user.timeSkewMs || 0)}h)`);
+        console.log(`[time-skew] ${userId.slice(0,8)}: server=${user.mt5Server} MetaKit time=${st.time} brokerTime=${st.brokerTime} assumedOffset=${assumed === null ? 'n/a' : h(assumed) + 'h'} now=${new Date().toISOString()} skew=${h(skew)}h (was ${h(user.timeSkewMs || 0)}h)`);
         if (skew !== 0) {
             // The skew lives in memory only, so it is measured again after
             // every restart. Mail once per user and offset, not per restart.
             notifyAdminOnce({
-                subject: `[EmotionLock] MetaAPI time offset corrected (${h(skew)}h) for user ${userId.slice(0,8)}`,
+                subject: `[EmotionLock] MetaKit time offset corrected (${h(skew)}h) for user ${userId.slice(0,8)}`,
                 lines: [
                     `User: ${userId}`,
                     `Server: ${user.mt5Server}`,
-                    `MetaAPI server-time: ${st.time} (broker ${st.brokerTime})`,
-                    `MetaAPI assumed broker offset: ${assumed === null ? 'n/a' : h(assumed) + 'h'}`,
+                    `MetaKit server-time: ${st.time} (broker ${st.brokerTime})`,
+                    `MetaKit assumed broker offset: ${assumed === null ? 'n/a' : h(assumed) + 'h'}`,
                     `Real now: ${new Date().toISOString()}`,
                     `The trade poller shifts its day window by ${h(skew)}h for this account.`,
                     `Time (Europe/Amsterdam): ${adminNotifyTimestamp()}`,
@@ -1636,28 +1366,8 @@ function selectTodayDeals(userId, user, wideDeals, fromMs, toMs) {
 // fails. null means "unknown" so callers can degrade safely instead of
 // mistaking a failed lookup for "no open positions".
 async function getOpenPositions(accountId, region) {
-    if (metakit.isMetaKitId(accountId)) return metakit.getOpenPositions(accountId);
-    const url = `https://mt-client-api-v1.${region}.agiliumtrade.ai/users/current/accounts/${accountId}/positions`;
-    try {
-        const response = await fetch(url, {
-            headers: { 'auth-token': METAAPI_TOKEN },
-            signal: AbortSignal.timeout(45000)
-        });
-        if (!response.ok) {
-            const errText = await response.text();
-            console.log(`[getOpenPositions] HTTP ${response.status} for account ${accountId} region ${region}: ${errText.slice(0, 200)}`);
-            return null;
-        }
-        const data = await response.json();
-        if (!Array.isArray(data)) {
-            console.log(`[getOpenPositions] Unexpected response format for account ${accountId}:`, JSON.stringify(data).slice(0, 200));
-            return null;
-        }
-        return data;
-    } catch (e) {
-        console.log(`[getOpenPositions] Fetch error for account ${accountId}: ${e.message}`);
-        return null;
-    }
+    if (isLegacyMt5AccountId(accountId)) return null;
+    return metakit.getOpenPositions(accountId);
 }
 
 // Aggregate a subsequent partial close into the already-recorded trade.
@@ -2073,18 +1783,16 @@ async function checkUserTrades(userId) {
         }
         if (!accountInfo) {
             if (infoStatus === 404) {
-                // The account no longer exists in MetaAPI (deleted manually or
-                // by an admin cleanup). Polling it again every cycle only spams
-                // the logs and burns API calls. Stop polling and show the user
-                // as not connected, so the app offers "Connect MT5" again.
-                // In memory only: the Supabase row is left untouched, and the
-                // connect flow already handles a stale meta_api_account_id
-                // (getMetaApiAccountInfo -> null -> createOrRecoverMetaApiAccount).
-                console.log(`[trades] ${userId.slice(0,8)}: MetaApi account ${user.metaApiAccountId} no longer exists (404). Marking MT5 as disconnected, polling stopped.`);
+                // The account no longer exists at MetaKit (deleted manually or
+                // by a cleanup), or it is a legacy MetaAPI id (D-058). Stop
+                // polling and show the user as not connected, so the app
+                // offers "Connect MT5" again. In memory only: the Supabase row
+                // is left untouched and the connect flow handles the stale id.
+                console.log(`[trades] ${userId.slice(0,8)}: MT5 account ${user.metaApiAccountId} no longer exists (404). Marking MT5 as disconnected, polling stopped.`);
                 user.mt5Connected = false;
                 user.mt5SyncStatus = 'not_connected';
             } else {
-                console.log(`[trades] ${userId.slice(0,8)}: MetaApi account lookup failed (HTTP ${infoStatus}), will retry (id: ${user.metaApiAccountId})`);
+                console.log(`[trades] ${userId.slice(0,8)}: MetaKit account lookup failed (HTTP ${infoStatus}), will retry (id: ${user.metaApiAccountId})`);
                 user.mt5SyncStatus = 'unknown';
             }
             user.mt5SyncStatusAt = new Date().toISOString();
@@ -2181,9 +1889,7 @@ async function checkUserTrades(userId) {
                 console.log(`[trades] ${userId.slice(0,8)}: account ${accountInfo.state} but user is active, triggering deploy`);
                 deployMetaApiAccount(user.metaApiAccountId).then(() => {
                     user.autoDeployBackoffMs = null;
-                    clearMetaApiBalanceEmpty();
                 }).catch(e => {
-                    if (isMetaApiTopUpError(e.message)) markMetaApiBalanceEmpty(userId);
                     // An account whose broker login no longer works (wrong or
                     // changed password, expired prop-firm account) fails every
                     // time. Retrying it every 10 minutes forever burned the
@@ -2284,7 +1990,7 @@ async function checkUserTrades(userId) {
 
             if (seedCloseCount >= restoredCount) {
                 if (seedCloseCount !== restoredCount) {
-                    console.log(`[trades] ${userId.slice(0,8)}: seed reconciled tradesCount ${restoredCount} -> ${seedCloseCount} (MetaAPI shows ${seedCloseCount} fully-closed positions today)`);
+                    console.log(`[trades] ${userId.slice(0,8)}: seed reconciled tradesCount ${restoredCount} -> ${seedCloseCount} (MetaKit shows ${seedCloseCount} fully-closed positions today)`);
                     saveDailyTrades(userId, user.tradesCount, user.lastReset).catch(() => {});
                 }
                 if (!isLossMode(user) && user.tradesCount >= user.maxTrades && !user.isLocked) {
@@ -2612,7 +2318,7 @@ async function cleanupExpiredMetaApiAccounts() {
                 }
                 invalidateSubscriptionCache(row.user_id);
 
-                console.log(`[cleanup] Undeployed MetaAPI ${row.meta_api_account_id} for expired user ${row.user_id.slice(0,8)}`);
+                console.log(`[cleanup] Undeployed MetaKit ${row.meta_api_account_id} for expired user ${row.user_id.slice(0,8)}`);
                 undeployed++;
             } catch (e) {
                 console.error(`[cleanup] Undeploy failed for ${row.user_id}:`, e.message);
@@ -2620,7 +2326,7 @@ async function cleanupExpiredMetaApiAccounts() {
         }
 
         if (undeployed > 0) {
-            console.log(`[cleanup] Hourly sweep undeployed ${undeployed} MetaAPI account(s).`);
+            console.log(`[cleanup] Hourly sweep undeployed ${undeployed} MetaKit account(s).`);
         }
     } catch (err) {
         console.error('[cleanup] Unexpected error:', err.message);
@@ -2635,115 +2341,7 @@ setTimeout(() => {
     setInterval(() => cleanupExpiredMetaApiAccounts().catch(() => {}), 60 * 60 * 1000);
 }, 5 * 60 * 1000);
 
-// =====================
-// MetaAPI orphan sweep, runs hourly
-// =====================
-// An orphan is a deployed EmotionLock MetaAPI account that no user points to:
-// not in purchases.meta_api_account_id and not in memory. Nothing else ever
-// undeploys those (the expiry cleanup above only knows linked ids), so they
-// bill until someone spots them in the dashboard. This sweep undeploys them.
-// Safety rails, so a real user is never touched:
-//   - only accounts named EmotionLock-*, only DEPLOYED/DEPLOYING
-//   - skipped entirely when MetaAPI or Supabase could not be read, or when
-//     Supabase returns no linked ids at all
-//   - an account must be seen as orphan on two runs at least 50 min apart
-//     (covers a connect that has created but not yet persisted)
-//   - never while that user has a /connect-mt5 in flight
-//   - undeploy only, never delete (reversible), max 10 per run, admin mailed
-const ORPHAN_CONFIRM_MS = 50 * 60 * 1000;
-const ORPHAN_MAX_PER_RUN = 10;
-const orphanFirstSeenAt = new Map(); // accountId -> ms
-
-async function loadLinkedMetaApiAccountIds() {
-    const linked = new Set();
-    const PAGE = 1000;
-    for (let from = 0; ; from += PAGE) {
-        const { data, error } = await supabase
-            .from('purchases')
-            .select('meta_api_account_id')
-            .not('meta_api_account_id', 'is', null)
-            .range(from, from + PAGE - 1);
-        if (error) throw new Error(error.message);
-        for (const row of data ?? []) linked.add(row.meta_api_account_id);
-        if (!data || data.length < PAGE) break;
-    }
-    for (const state of Object.values(userStates)) {
-        if (state?.metaApiAccountId) linked.add(state.metaApiAccountId);
-    }
-    return linked;
-}
-
-async function sweepOrphanMetaApiAccounts() {
-    try {
-        const accounts = await listAllMetaApiAccounts();
-        if (!accounts) return;
-        let linked;
-        try {
-            linked = await loadLinkedMetaApiAccountIds();
-        } catch (e) {
-            console.error('[orphan-sweep] Supabase read failed, skipping run:', e.message);
-            return;
-        }
-        if (linked.size === 0) {
-            console.log('[orphan-sweep] No linked accounts found, skipping run as a precaution');
-            return;
-        }
-
-        const now = Date.now();
-        const inFlightUsers = new Set([...connectMt5InFlight.keys()].map(u => String(u).toLowerCase()));
-        const orphans = accounts.filter(a =>
-            a.id &&
-            /^EmotionLock-/i.test(String(a.name || '')) &&
-            (a.state === 'DEPLOYED' || a.state === 'DEPLOYING') &&
-            !linked.has(a.id)
-        );
-        const orphanIds = new Set(orphans.map(a => a.id));
-        for (const id of [...orphanFirstSeenAt.keys()]) {
-            if (!orphanIds.has(id)) orphanFirstSeenAt.delete(id);
-        }
-
-        const confirmed = [];
-        for (const a of orphans) {
-            const ownerId = String(a.name).slice('EmotionLock-'.length).toLowerCase();
-            if (inFlightUsers.has(ownerId)) continue;
-            if (!orphanFirstSeenAt.has(a.id)) {
-                orphanFirstSeenAt.set(a.id, now);
-                console.log(`[orphan-sweep] Candidate ${a.id} (${a.name}, ${a.state}), will undeploy if still unlinked next run`);
-                continue;
-            }
-            if (now - orphanFirstSeenAt.get(a.id) >= ORPHAN_CONFIRM_MS) confirmed.push(a);
-        }
-        if (confirmed.length === 0) return;
-
-        const toUndeploy = confirmed.slice(0, ORPHAN_MAX_PER_RUN);
-        for (const a of toUndeploy) {
-            await undeployMetaApiAccount(a.id);
-            orphanFirstSeenAt.delete(a.id);
-            console.log(`[orphan-sweep] Undeployed orphan ${a.id} (${a.name}, ${a.server}/${a.login})`);
-        }
-        notifyAdmin({
-            subject: `[EmotionLock] ${toUndeploy.length} orphan MetaAPI account(s) undeployed`,
-            lines: [
-                'These deployed MetaAPI accounts were not linked to any user and were undeployed (not deleted):',
-                '',
-                ...toUndeploy.map(a => `  - ${a.id}  ${a.name}  ${a.server}/${a.login}`),
-                '',
-                confirmed.length > toUndeploy.length
-                    ? `${confirmed.length - toUndeploy.length} more are waiting for the next run (cap ${ORPHAN_MAX_PER_RUN} per run).`
-                    : 'Delete them via DELETE /admin/metaapi-accounts/{id} once checked.',
-                '',
-                `Time (Europe/Amsterdam): ${adminNotifyTimestamp()}`,
-            ],
-        }).catch(() => {});
-    } catch (err) {
-        console.error('[orphan-sweep] Unexpected error:', err.message);
-    }
-}
-
-setTimeout(() => {
-    sweepOrphanMetaApiAccounts().catch(() => {});
-    setInterval(() => sweepOrphanMetaApiAccounts().catch(() => {}), 60 * 60 * 1000);
-}, 10 * 60 * 1000);
+// Orphan MetaKit accounts are handled by runMetaKitMaintenance below (D-050).
 
 // =====================
 // MetaKit (D-048, D-050): webhooks, hourly maintenance, admin view
@@ -3085,7 +2683,7 @@ async function runTrialNotificationScheduler() {
                         userStates[row.user_id].mt5Connected = false;
                     }
                     invalidateSubscriptionCache(row.user_id);
-                    console.log(`[trial-push] Undeployed abandoned trial MetaAPI for ${row.user_id.slice(0,8)}`);
+                    console.log(`[trial-push] Undeployed abandoned trial MetaKit for ${row.user_id.slice(0,8)}`);
                 } catch (e) {
                     console.error(`[trial-push] Undeploy failed for ${row.user_id}:`, e.message);
                 }
@@ -3252,7 +2850,7 @@ app.post('/activate', activateLimiter, async (req, res) => {
         .eq('license_code', key)
         .maybeSingle();
 
-    if (purchase?.meta_api_account_id) {
+    if (purchase?.meta_api_account_id && !isLegacyMt5AccountId(purchase.meta_api_account_id)) {
         userStates[key].metaApiAccountId = purchase.meta_api_account_id;
         if (purchase?.mt5_server) {
             userStates[key].mt5Server = purchase.mt5_server;
@@ -3297,7 +2895,7 @@ app.post('/connect-mt5/:userId', mt5Limiter, async (req, res) => {
 
     // Per-user mutex. A second concurrent /connect-mt5 call for the same user
     // (e.g. flaky network retry, double-tap, foregrounding race) must NOT
-    // race the first call through createOrRecoverMetaApiAccount — both calls
+    // race the first call through createOrRecoverMt5Account — both calls
     // would see an empty Supabase row, both would invoke create, and we
     // would end up with two MetaAPI accounts named EmotionLock-${userId},
     // each billed hourly. Returning 409 keeps the client side simple: the
@@ -3384,7 +2982,7 @@ async function connectMt5Locked(res, userId, server, login, password) {
                         `MT5 server: ${server}`,
                         `MT5 login: ${login}`,
                         ``,
-                        `Likely cause: Keychain reset, restore-from-backup, or Apple ID switch by the same person. The old MetaAPI account(s) are now orphaned and still billing hourly.`,
+                        `Likely cause: Keychain reset, restore-from-backup, or Apple ID switch by the same person. The old MetaKit account(s) are now orphaned and still billing hourly.`,
                         ``,
                         `Existing users with same MT5 creds:`,
                         ...dupes.map(d => `  - user_id=${d.user_id} metaApiAccountId=${d.meta_api_account_id} sub=${d.subscription_status} trial_ends=${d.app_trial_ends_at} created=${d.created_at}`),
@@ -3419,9 +3017,7 @@ async function connectMt5Locked(res, userId, server, login, password) {
         // moment we have their password). Same MT5 account, so today's
         // counters stay: deal tickets are the broker's and identical at both
         // providers. The old MetaAPI account is removed by the branch below.
-        const migrateToMetaKit = isSameAccount
-            && metakit.useMetaKitFor(userId)
-            && !metakit.isMetaKitId(existingMetaApiId);
+        const migrateToMetaKit = isSameAccount && isLegacyMt5AccountId(existingMetaApiId);
         if (migrateToMetaKit) {
             console.log(`[connect-mt5] ${userId.slice(0,8)}: moving from MetaAPI ${existingMetaApiId} to MetaKit`);
         }
@@ -3433,7 +3029,7 @@ async function connectMt5Locked(res, userId, server, login, password) {
             // If the account was manually deleted in MetaAPI, fall through and create a fresh one.
             const { account: info, status: infoStatus } = await fetchMetaApiAccountInfo(existingMetaApiId);
             if (info) {
-                console.log(`Reusing existing MetaAPI account for user ${userId}`);
+                console.log(`Reusing existing MetaKit account for user ${userId}`);
                 accountId = existingMetaApiId;
                 if (info.connectionStatus === 'CONNECTED') {
                     // Healthy account: keep the working credentials untouched.
@@ -3449,16 +3045,16 @@ async function connectMt5Locked(res, userId, server, login, password) {
                         password,
                     });
                     const ok = await redeployMetaApiAccount(accountId);
-                    if (!ok) throw new Error(`MetaApi redeploy after password update failed for ${accountId}`);
+                    if (!ok) throw new Error(`MetaKit redeploy after password update failed for ${accountId}`);
                 }
                 if (info.region) accountRegion = info.region;
             } else if (infoStatus !== 404) {
                 // 429/5xx: MetaAPI could not tell us whether the account still
                 // exists. Creating now would duplicate a live account, so fail
                 // this attempt and let the user retry.
-                throw new Error(`MetaApi account lookup failed (HTTP ${infoStatus}) for ${existingMetaApiId}, not creating a new account`);
+                throw new Error(`MetaKit account lookup failed (HTTP ${infoStatus}) for ${existingMetaApiId}, not creating a new account`);
             } else {
-                console.log(`Existing MetaAPI account not found, creating or recovering for user ${userId}`);
+                console.log(`Existing MetaKit account not found, creating or recovering for user ${userId}`);
                 const result = await createOrRecoverMt5Account(server, String(login), password, userId);
                 accountId = result.id;
                 accountRegion = result.region;
@@ -3474,7 +3070,7 @@ async function connectMt5Locked(res, userId, server, login, password) {
                     console.log('Cleanup old account warning:', e.message);
                 }
             }
-            console.log(`Creating or recovering MetaAPI account for user ${userId} on ${server}...`);
+            console.log(`Creating or recovering MetaKit account for user ${userId} on ${server}...`);
             const result = await createOrRecoverMt5Account(server, String(login), password, userId);
             accountId = result.id;
             accountRegion = result.region;
@@ -3576,16 +3172,20 @@ async function connectMt5Locked(res, userId, server, login, password) {
         // Fire-and-forget admin mail for every successful connect: first
         // connect (trial started) and reconnects alike.
         notifyAdminConnect({ userId, ok: true, isFirst: isFirstMt5Connect, server, login: String(login), accountId });
+        // Connected: any broker server request this user still had open is done.
+        supabase.from('mt5_server_requests')
+            .update({ status: 'resolved', notified_at: new Date().toISOString() })
+            .eq('user_id', userId.toLowerCase())
+            .eq('status', 'pending')
+            .then(() => {}, () => {});
 
     } catch (err) {
         let status = 500;
         let message;
-        if (err?.code === 'METAAPI_CREATE_LIMIT') {
-            status = 503;
-            message = 'Connecting is temporarily busy. Please try again in a few minutes.';
-        } else if (err?.code === 'MT5_BROKER_NOT_SUPPORTED') {
+        if (err?.code === 'MT5_BROKER_NOT_SUPPORTED') {
             status = 503;
             message = "We can't connect to this broker server yet. We're adding it now and will let you know as soon as it works.";
+            handleUnsupportedServer(userId, server, login).catch(() => {});
         } else if (err?.code === 'MT5_PROVIDER_BUSY') {
             status = 503;
             message = 'The broker connection service is temporarily busy. Please try again in a few minutes.';
@@ -3661,7 +3261,11 @@ async function restoreUserFromSupabase(userId, user, localDate) {
         user.emergencyTokens = purchase.emergency_tokens_remaining;
     }
 
-    if (purchase?.meta_api_account_id) {
+    // A legacy MetaAPI id (D-058) is not restored: the user shows as not
+    // connected and the app offers "Connect MT5", which creates a MetaKit
+    // account. The id stays in Supabase so the connect flow recognises the
+    // same MT5 account and Bart can still look it up.
+    if (purchase?.meta_api_account_id && !isLegacyMt5AccountId(purchase.meta_api_account_id)) {
         user.metaApiAccountId = purchase.meta_api_account_id;
         if (purchase.mt5_server) {
             user.mt5Server = purchase.mt5_server;
@@ -4311,47 +3915,6 @@ app.post('/admin/check-trades/:userId', async (req, res) => {
     res.json({ tradesCount: user.tradesCount, isLocked: user.isLocked, lastDealCheck: user.lastDealCheck });
 });
 
-// Admin: list all MetaAPI accounts for cleanup inspection
-app.get('/admin/metaapi-accounts', async (req, res) => {
-    const adminKey = req.headers['x-admin-key'];
-    if (!isValidAdminKey(adminKey)) return res.status(401).json({ error: 'Unauthorized' });
-
-    try {
-        const accounts = await listAllMetaApiAccounts();
-        if (!accounts) return res.status(500).json({ error: 'MetaAPI request failed' });
-        res.json(accounts.map(a => ({
-            id: a.id,
-            name: a.name,
-            login: a.login,
-            server: a.server,
-            state: a.state,
-            connectionStatus: a.connectionStatus,
-            region: a.region,
-            // Surfacing the raw fields MetaAPI actually persisted for this
-            // account, straight from their own account object, no dashboard
-            // badge or invoice needed to confirm what tier we're really on.
-            reliability: a.reliability,
-            regions: a.regions,
-        })));
-    } catch (err) {
-        res.status(500).json({ error: err.message });
-    }
-});
-
-// Admin: delete a specific MetaAPI account by id
-app.delete('/admin/metaapi-accounts/:accountId', async (req, res) => {
-    const adminKey = req.headers['x-admin-key'];
-    if (!isValidAdminKey(adminKey)) return res.status(401).json({ error: 'Unauthorized' });
-
-    const { accountId } = req.params;
-    try {
-        await undeployAndDeleteMetaApiAccount(accountId);
-        res.json({ success: true, deleted: accountId });
-    } catch (err) {
-        res.status(500).json({ error: err.message });
-    }
-});
-
 // Admin: generate (or register) license code (called by website after purchase)
 // Note: license codes are stored in Supabase purchases table — this endpoint is kept
 // for backward compatibility but the website handles Supabase insertion directly.
@@ -4752,7 +4315,7 @@ app.post('/reset-after-onboarding/:userId', async (req, res) => {
         if (oldMetaApiId) {
             try {
                 await undeployAndDeleteMetaApiAccount(oldMetaApiId);
-                console.log(`[reset] Deleted MetaAPI account ${oldMetaApiId} for ${userId.slice(0, 8)}`);
+                console.log(`[reset] Deleted MetaKit account ${oldMetaApiId} for ${userId.slice(0, 8)}`);
             } catch (e) {
                 // The hourly orphan sweep undeploys it if it is still running.
                 console.log(`MT5 cleanup on reset for ${userId}:`, e.message);
@@ -5541,7 +5104,7 @@ async function handleAppleNotification(notification) {
                     .update({ meta_api_undeployed_at: null })
                     .eq('user_id', userId);
                 if (userStates[userId]) userStates[userId].mt5Connected = true;
-                console.log(`[apple-notify] Redeployed MetaAPI ${row.meta_api_account_id} after resubscribe`);
+                console.log(`[apple-notify] Redeployed MetaKit ${row.meta_api_account_id} after resubscribe`);
             } catch (e) {
                 console.error(`[apple-notify] Redeploy failed for ${userId}:`, e.message);
             }
@@ -5882,7 +5445,7 @@ app.delete('/delete-account/:userId', deleteAccountLimiter, async (req, res) => 
             try {
                 await undeployAndDeleteMetaApiAccount(metaApiAccountId);
             } catch (e) {
-                console.log(`[delete-account] MetaAPI cleanup warning for ${userId}:`, e.message);
+                console.log(`[delete-account] MetaKit cleanup warning for ${userId}:`, e.message);
             }
         }
 
